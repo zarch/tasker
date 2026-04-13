@@ -1,0 +1,946 @@
+"""QA↔Dev orchestrator — the core feedback loop."""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .goose import GooseRunResult, run_goose
+from .log import IterationLog
+from .models import (
+    Actor,
+    DevRequest,
+    DevResponse,
+    IterationEntry,
+    Phase,
+    QAResponse,
+    QARequest,
+    RecoveryStage,
+    Task,
+    TaskStatus,
+    UserChatRequest,
+)
+from .parser import find_next_task, mark_task_done, parse_task_file, update_markdown
+from .ui import TaskerUI
+from . import jj as jj_mod
+
+
+def _generate_session_id(prefix: str) -> str:
+    """Create a persistent, human-readable session ID."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    uid = uuid.uuid4().hex[:6]
+    return f"{prefix}_{ts}_{uid}"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_dev_response(raw: str, parsed: dict | None) -> DevResponse | None:
+    """Extract DevResponse from goose output. Returns None if unparseable."""
+    if parsed and "status" in parsed:
+        status = parsed["status"]
+        if status not in ("done", "blocked"):
+            return None  # unknown status — treat as malformed
+        return DevResponse(
+            status=status,
+            summary=parsed.get("summary", ""),
+            files_modified=parsed.get("files_modified", []),
+            notes=parsed.get("notes", ""),
+            blocker_description=parsed.get("blocker_description", ""),
+            blocker_suggestion=parsed.get("blocker_suggestion", ""),
+        )
+    return None
+
+
+def _parse_qa_response(raw: str, parsed: dict | None) -> QAResponse | None:
+    """Extract QAResponse from goose output. Returns None if unparseable."""
+    if parsed and "decision" in parsed:
+        decision = parsed["decision"]
+        if decision not in ("approve", "reject", "needs_user_input"):
+            return None  # unknown decision — treat as malformed
+        return QAResponse(
+            decision=decision,
+            feedback=parsed.get("feedback", ""),
+            concerns=parsed.get("concerns", []),
+            user_question=parsed.get("user_question", ""),
+        )
+    return None
+
+
+# ── Recovery instructions for graceful degradation ────────────────
+
+_RECOVERY_CONTINUE = (
+    "Your previous response did not include the required JSON block. "
+    "Continue from exactly where you left off and finish the task. "
+    "You MUST end your response with the JSON block in the exact format specified."
+)
+
+_RECOVERY_SUBTASK = (
+    "Your previous responses did not include the required JSON block. "
+    "The task may be too large. Break it into smaller subtasks. "
+    "Implement just the FIRST subtask now, then respond with the JSON block. "
+    "In your summary, list all subtasks you identified and which one you completed."
+)
+
+_RECOVERY_SUMMARIZE = (
+    "Your previous responses have not produced the required JSON block. "
+    "STOP implementing. Instead, write a brief summary of: "
+    "1) What progress you have made so far, "
+    "2) What difficulties you are encountering, "
+    "3) What still needs to be done. "
+    "Then respond with the JSON block using status 'blocked'."
+)
+
+
+def _timeout_feedback(actor: str, timeout_secs: int) -> str:
+    """Build a feedback message to send when an agent was killed for timing out."""
+    timeout_minutes = timeout_secs / 60
+    return (
+        f"## ⚠️ {actor} Process Killed — Timeout\n\n"
+        f"Your previous run was **killed** because it was stuck for more than "
+        f"{timeout_minutes:.0f} minutes ({timeout_secs} seconds) without completing.\n\n"
+        f"**What happened:** The process was running for too long and was "
+        f"automatically terminated.\n\n"
+        f"**What to do now:**\n"
+        f"1. Review where you left off in your previous session (you still have context).\n"
+        f"2. Finish the task as quickly and efficiently as possible.\n"
+        f"3. You MUST end your response with the required JSON block.\n\n"
+        f"Do NOT redo work you have already completed. Continue from where you "
+        f"were interrupted and wrap up promptly.\n"
+    )
+
+
+
+class Orchestrator:
+    """Drives the QA → Dev → QA loop for all tasks in the task file."""
+
+    def __init__(
+        self,
+        task_file: str | Path,
+        dev_recipe: str | Path,
+        qa_recipe: str | Path,
+        log_file: str | Path,
+        max_iterations_per_task: int = 10,
+        max_turns: int = 80,
+        timeout_secs: int = 600,
+        model: str | None = None,
+        provider: str | None = None,
+        cwd: str | Path | None = None,
+        start_phase: int | None = None,
+        enable_jj: bool = False,
+    ) -> None:
+        self.task_file = Path(task_file)
+        self.dev_recipe = Path(dev_recipe)
+        self.qa_recipe = Path(qa_recipe)
+        self.log = IterationLog(log_file)
+        self.ui = TaskerUI()
+        self.max_iterations = max_iterations_per_task
+        self.max_turns = max_turns
+        self.timeout_secs = timeout_secs
+        self.model = model
+        self.provider = provider
+        self.cwd = Path(cwd) if cwd else None
+        self.start_phase = start_phase
+
+        # JJ (Jujutsu) integration
+        self.enable_jj = enable_jj
+        self._last_committed_change_id: str | None = None  # tracks the last committed task's change ID — generated once, reused across all tasks.
+        # goose run uses --name for session persistence and auto-resumes
+        # when the same name is used again.
+        self.dev_session_name = _generate_session_id("dev")
+        self.qa_session_name = _generate_session_id("qa")
+
+        # State
+        self.phases: list[Phase] = []
+        self.current_phase: Phase | None = None
+        self.global_iteration = 0
+
+    def run(self) -> None:
+        """Main entry point — run all tasks."""
+        self.ui.print_info(f"Developer session: {self.dev_session_name}")
+        self.ui.print_info(f"QA session:       {self.qa_session_name}")
+        self.ui.print_info(f"Iteration log:    {self.log._path}")
+        self.ui.print_info("")
+
+        # Initialize JJ integration
+        if self.enable_jj:
+            if not jj_mod.jj_is_available():
+                self.ui.print_error("jj (Jujutsu) not found in PATH. Disabling jj integration.")
+                self.enable_jj = False
+            else:
+                # Capture the current change as the starting base
+                current = jj_mod.jj_get_current_change_id(cwd=self.cwd)
+                if current:
+                    self._last_committed_change_id = current
+                    self.ui.print_info(f"JJ integration: ON (base change: {current[:12]})")
+                else:
+                    self.ui.print_error("Could not determine current jj change. Disabling jj integration.")
+                    self.enable_jj = False
+
+        # Parse tasks
+        self.phases = parse_task_file(self.task_file)
+
+        if not self.phases:
+            self.ui.print_error("No phases found in task file. Nothing to do.")
+            return
+
+        # If start_phase is specified, mark all earlier tasks as done
+        if self.start_phase is not None:
+            for phase in self.phases:
+                if phase.index < self.start_phase:
+                    for task in phase.tasks:
+                        task.done = True
+
+        total_tasks = sum(p.total for p in self.phases)
+        done_tasks = sum(p.completed for p in self.phases)
+        self.ui.print_info(
+            f"Loaded {len(self.phases)} phases, {total_tasks} tasks "
+            f"({done_tasks} already done, {total_tasks - done_tasks} remaining)"
+        )
+        self.ui.print_info("")
+
+        # Start live UI
+        self.ui.init_progress()
+        self.ui.start()
+        self.ui.update_project(self.phases, self.phases[0])
+
+        try:
+            self._run_loop()
+        finally:
+            self.ui.stop()
+
+        # Final summary
+        total_tasks = sum(p.total for p in self.phases)
+        done_tasks = sum(p.completed for p in self.phases)
+        self.ui.print_success(
+            f"Done! {done_tasks}/{total_tasks} tasks completed. "
+            f"Log: {self.log._path}"
+        )
+
+    def _run_loop(self) -> None:
+        """Process tasks one by one until all are done."""
+        while True:
+            pair = find_next_task(self.phases)
+            if pair is None:
+                self.ui.update_actor(Actor.QA, "—", "All tasks complete! 🎉")
+                time.sleep(1)
+                break
+
+            phase, task = pair
+            self.current_phase = phase
+            self.ui.update_project(self.phases, phase)
+            self.ui.update_phase(phase)
+
+            self.ui.print_info(
+                f"\n{'='*60}\n"
+                f"Starting task {task.label}: {task.text}\n"
+                f"Phase: {phase.title} ({phase.completed}/{phase.total})\n"
+                f"{'='*60}"
+            )
+
+            # Run the QA→Dev loop for this task
+            self._process_task(phase, task)
+
+    def _interactive_chat_loop(
+        self,
+        task: Task,
+        phase: Phase,
+        qa_response: QAResponse,
+        blocker_description: str = "",
+    ) -> bool:
+        """Run interactive chat loop between user and QA agent.
+
+        Pauses the Live UI, shows QA's question, accepts user input,
+        feeds it to QA for processing, and loops until QA says resolved
+        or the user types /done or /skip.
+
+        Returns True if resolved (continue pipeline), False if skipped.
+        """
+        # Pause Live so input() works without interference
+        self.ui.pause()
+
+        self.ui.print_chat_header(task.label, qa_response.user_question or qa_response.feedback)
+
+        conversation_history = ""
+        chat_turn = 0
+        max_chat_turns = 20  # safety limit
+
+        while chat_turn < max_chat_turns:
+            chat_turn += 1
+            self.global_iteration += 1
+
+            # Get user input
+            user_input = self.ui.prompt_user_input()
+
+            if user_input is None:
+                # /skip — user wants to move on
+                self.ui.print_chat_skipped()
+                self.ui.resume()
+                return False
+
+            if user_input == "":
+                # /done — user believes issue is resolved
+                self.ui.print_chat_resolved()
+                self.ui.resume()
+                return True
+
+            # Build conversation history
+            conversation_history += f"👤 User: {user_input}\n\n"
+
+            # Send user's response to QA for processing
+            self.ui.print_info(f"[{task.label}] Sending your response to QA...")
+
+            chat_request = UserChatRequest(
+                task_label=task.label,
+                task_text=task.text,
+                blocker_description=blocker_description,
+                user_message=user_input,
+                conversation_history=conversation_history,
+                qa_session_id=self.qa_session_name,
+                dev_session_id=self.dev_session_name,
+            )
+
+            chat_result = run_goose(
+                recipe_path=self.qa_recipe,
+                session_name=self.qa_session_name,
+                params=chat_request.to_params(),
+                max_turns=self.max_turns,
+                timeout_secs=self.timeout_secs,
+                model=self.model,
+                provider=self.provider,
+                cwd=self.cwd,
+            )
+
+            chat_qa_response = _parse_qa_response(chat_result.raw_stdout, chat_result.parsed_json)
+
+            # Log the chat exchange
+            self.log.append(IterationEntry(
+                timestamp=_now_iso(),
+                iteration=self.global_iteration,
+                actor=Actor.QA,
+                task_label=task.label,
+                status=TaskStatus.NEEDS_USER_INPUT,
+                payload={
+                    "chat_turn": chat_turn,
+                    "user_message": user_input,
+                    "qa_response": chat_qa_response.to_dict() if chat_qa_response else None,
+                    "raw": chat_result.raw_stdout[:300],
+                },
+            ))
+
+            # QA timed out during chat — inform user and continue
+            if chat_result.timed_out:
+                timeout_minutes = self.timeout_secs / 60
+                self.ui.print_warning(
+                    f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during chat — continuing"
+                )
+                chat_qa_response = None  # will fall through to raw text display below
+            elif chat_qa_response is None:
+                # QA didn't return structured output in chat mode — show raw text
+                self.ui.print_qa_chat_message(
+                    chat_result.raw_stdout[:500] if chat_result.raw_stdout else "(no response)"
+                )
+                conversation_history += f"🧪 QA: {chat_result.raw_stdout or '(no response)'}\n\n"
+                continue
+
+            conversation_history += f"🧪 QA: {chat_qa_response.feedback}\n\n"
+
+            # Check if QA considers the issue resolved
+            if chat_qa_response.decision == "approve":
+                self.ui.print_qa_chat_message(
+                    f"✓ {chat_qa_response.feedback}"
+                )
+                self.ui.print_chat_resolved()
+                self.ui.resume()
+                return True
+
+            if chat_qa_response.decision == "needs_user_input":
+                # QA has a follow-up question
+                self.ui.print_qa_chat_message(chat_qa_response.feedback)
+                if chat_qa_response.user_question:
+                    self.ui.print_qa_chat_message(f"Follow-up: {chat_qa_response.user_question}")
+                continue
+
+            # reject or other — QA gave guidance, show it and continue chatting
+            self.ui.print_qa_chat_message(chat_qa_response.feedback)
+            if chat_qa_response.concerns:
+                for c in chat_qa_response.concerns[:3]:
+                    self.ui.print_qa_chat_message(f"  • {c}")
+
+        # Max chat turns reached
+        self.ui.print_warning(
+            f"[{task.label}] Max chat turns ({max_chat_turns}) reached. Resuming pipeline."
+        )
+        self.ui.resume()
+        return True  # best effort — continue
+
+    # ── JJ integration methods ───────────────────────────────────
+
+    def _jj_begin_task(self, task: Task) -> None:
+        """Create a new jj change for the task.
+
+        Called at the start of each task when jj is enabled.
+        Sets task.base_change_id and task.task_change_id.
+        """
+        if not self.enable_jj or not self._last_committed_change_id:
+            return
+
+        result = jj_mod.jj_new_task(
+            parent_change_id=self._last_committed_change_id,
+            description=task.jj_description,
+            cwd=self.cwd,
+        )
+
+        if result.success:
+            task.task_change_id = jj_mod.jj_get_current_change_id(cwd=self.cwd)
+            task.base_change_id = self._last_committed_change_id
+            self.ui.print_info(
+                f"[{task.label}] JJ: created task change "
+                f"(base={task.base_change_id[:12]}, task={task.task_change_id[:12] if task.task_change_id else '?'})"
+            )
+        else:
+            self.ui.print_warning(
+                f"[{task.label}] JJ: failed to create task change: {result.stderr[:100]}. "
+                f"Continuing without jj."
+            )
+
+    def _jj_get_diff(self, task: Task) -> str:
+        """Get the jj diff for the current task.
+
+        Called before QA review to provide context about what changed.
+        """
+        if not self.enable_jj or not task.base_change_id:
+            return ""
+        result = jj_mod.jj_diff(
+            base_change_id=task.base_change_id,
+            cwd=self.cwd,
+        )
+        if result.success and result.stdout.strip():
+            return result.stdout.strip()
+        return ""
+
+    def _jj_commit_task(self, task: Task) -> None:
+        """Commit the task's changes as a single jj commit.
+
+        Called when QA approves the task.
+        """
+        if not self.enable_jj:
+            return
+
+        result = jj_mod.jj_commit_task(
+            description=task.jj_description,
+            cwd=self.cwd,
+        )
+
+        if result.success:
+            # The old task_change_id is now committed; the new @ is empty.
+            # Update _last_committed_change_id to point to the committed task.
+            new_current = jj_mod.jj_get_current_change_id(cwd=self.cwd)
+            if new_current:
+                # The committed task is the parent of @
+                # We need the committed change ID, not @
+                # After `jj commit`, the committed change is @-
+                self._last_committed_change_id = task.task_change_id or new_current
+            self.ui.print_info(
+                f"[{task.label}] JJ: task committed "
+                f"(change={self._last_committed_change_id[:12]})"
+            )
+        else:
+            self.ui.print_warning(
+                f"[{task.label}] JJ: failed to commit task: {result.stderr[:100]}"
+            )
+
+    def _run_dev_with_recovery(
+        self,
+        task: Task,
+        iteration: int,
+        feedback: str | None,
+    ) -> DevResponse:
+        """Run the dev agent with graceful degradation on malformed output.
+
+        Escalation: NORMAL(1) → CONTINUE×3 → SUBTASK×3 → SUMMARIZE(1)
+        Returns the final DevResponse (may be blocked if all retries fail).
+        """
+        stage = RecoveryStage.NORMAL
+        attempts_in_stage = 0
+
+        while True:
+            attempts_in_stage += 1
+
+            # Pick recovery instruction based on stage
+            recovery_instruction: str | None = None
+            if stage == RecoveryStage.NORMAL and attempts_in_stage == 1:
+                recovery_instruction = None  # first call, no recovery needed
+            elif stage == RecoveryStage.CONTINUE:
+                recovery_instruction = _RECOVERY_CONTINUE
+            elif stage == RecoveryStage.SUBTASK:
+                recovery_instruction = _RECOVERY_SUBTASK
+            elif stage == RecoveryStage.SUMMARIZE:
+                recovery_instruction = _RECOVERY_SUMMARIZE
+
+            self.ui.update_actor(
+                Actor.DEV, task.label,
+                f"iteration {iteration}" + (f" [{stage.value}]" if stage != RecoveryStage.NORMAL else ""),
+            )
+            self.ui.print_info(
+                f"[{task.label}] Dev call (stage={stage.value}, attempt={attempts_in_stage})..."
+            )
+
+            dev_request = DevRequest(
+                task_label=task.label,
+                task_text=task.text,
+                qa_session_id=self.qa_session_name,
+                dev_session_id=self.dev_session_name,
+                iteration=iteration,
+                feedback=feedback,
+                recovery_instruction=recovery_instruction,
+            )
+
+            dev_result = run_goose(
+                recipe_path=self.dev_recipe,
+                session_name=self.dev_session_name,
+                params=dev_request.to_params(),
+                max_turns=self.max_turns,
+                timeout_secs=self.timeout_secs,
+                model=self.model,
+                provider=self.provider,
+                cwd=self.cwd,
+            )
+
+            # Check for subprocess failure (crash, timeout)
+            if not dev_result.success:
+                if dev_result.timed_out:
+                    # Timeout — don't escalate through recovery stages.
+                    # Instead, return a blocked response with timeout context
+                    # so the caller can relaunch the agent with awareness.
+                    timeout_minutes = self.timeout_secs / 60
+                    self.ui.print_warning(
+                        f"[{task.label}] Dev timed out after {timeout_minutes:.0f}min — "
+                        f"will relaunch with timeout context"
+                    )
+                    self.log.append(IterationEntry(
+                        timestamp=_now_iso(),
+                        iteration=self.global_iteration,
+                        actor=Actor.DEV,
+                        task_label=task.label,
+                        status=TaskStatus.ERROR,
+                        payload={"error": "timeout", "duration": dev_result.duration_secs},
+                        raw_output=dev_result.raw_stderr[:500],
+                    ))
+                    return DevResponse(
+                        status="blocked",
+                        summary=f"Developer agent timed out after {timeout_minutes:.0f} minutes.",
+                        files_modified=[],
+                        notes="The developer process was killed due to timeout. "
+                              "It will be relaunched with awareness of the timeout.",
+                        blocker_description=_timeout_feedback("Developer", self.timeout_secs),
+                        blocker_suggestion="The process was stuck. Review what you were doing "
+                                           "and finish quickly. Do NOT redo completed work.",
+                    )
+
+                # Other subprocess failures (crash, etc.)
+                self.ui.print_error(
+                    f"[{task.label}] Dev subprocess failed (rc={dev_result.return_code}): "
+                    f"{dev_result.raw_stderr[:200]}"
+                )
+                self.log.append(IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.DEV,
+                    task_label=task.label,
+                    status=TaskStatus.ERROR,
+                    payload={"error": "subprocess_failed", "stage": stage.value},
+                    raw_output=dev_result.raw_stderr[:500],
+                ))
+                # Subprocess failures don't count as malformed — try again in same stage
+                if attempts_in_stage < stage.max_attempts:
+                    self.ui.print_warning(
+                        f"[{task.label}] Retrying ({attempts_in_stage}/{stage.max_attempts})..."
+                    )
+                    continue
+                # Exhausted this stage, escalate
+                if stage == RecoveryStage.SUMMARIZE:
+                    break
+                stage = RecoveryStage.SUBTASK if stage == RecoveryStage.CONTINUE else RecoveryStage.SUMMARIZE
+                attempts_in_stage = 0
+                continue
+
+            # Try to parse the structured response
+            dev_response = _parse_dev_response(dev_result.raw_stdout, dev_result.parsed_json)
+
+            if dev_response is not None:
+                # Parsed successfully — log and return
+                dev_entry = IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.DEV,
+                    task_label=task.label,
+                    status=TaskStatus.BLOCKED if dev_response.status == "blocked" else TaskStatus.IN_PROGRESS,
+                    payload=dev_response.to_dict(),
+                    raw_output=dev_result.raw_stdout[:500],
+                )
+                self.log.append(dev_entry)
+                self.ui.add_iteration(dev_entry)
+                return dev_response
+
+            # Malformed output — log the failure
+            self.ui.print_warning(
+                f"[{task.label}] Dev did not return valid JSON (stage={stage.value}, "
+                f"attempt={attempts_in_stage}/{stage.max_attempts})"
+            )
+            self.log.append(IterationEntry(
+                timestamp=_now_iso(),
+                iteration=self.global_iteration,
+                actor=Actor.DEV,
+                task_label=task.label,
+                status=TaskStatus.ERROR,
+                payload={"error": "malformed_output", "stage": stage.value},
+                raw_output=dev_result.raw_stdout[:500],
+            ))
+
+            # Escalation logic
+            if attempts_in_stage >= stage.max_attempts:
+                if stage == RecoveryStage.SUMMARIZE:
+                    break  # all stages exhausted
+                # Move to next stage
+                if stage == RecoveryStage.NORMAL:
+                    stage = RecoveryStage.CONTINUE
+                elif stage == RecoveryStage.CONTINUE:
+                    stage = RecoveryStage.SUBTASK
+                elif stage == RecoveryStage.SUBTASK:
+                    stage = RecoveryStage.SUMMARIZE
+                attempts_in_stage = 0
+                self.ui.print_warning(
+                    f"[{task.label}] Escalating to stage: {stage.value}"
+                )
+
+        # All stages exhausted — return a synthetic blocked response
+        self.ui.print_error(
+            f"[{task.label}] All recovery attempts exhausted. "
+            f"Returning synthetic blocked response."
+        )
+        synthetic = DevResponse(
+            status="blocked",
+            summary="Developer failed to produce a valid response after multiple recovery attempts.",
+            files_modified=[],
+            notes="The developer agent could not complete the task. "
+                  "All recovery stages (continue, subtask, summarize) were exhausted.",
+            blocker_description="Developer agent returned malformed output across all recovery attempts. "
+                                "The task may be too complex, poorly specified, or the agent may be "
+                                "encountering tooling issues.",
+            blocker_suggestion="Consider breaking this task into smaller, more specific subtasks. "
+                               "Or review if the task description is clear and complete.",
+        )
+        self.log.append(IterationEntry(
+            timestamp=_now_iso(),
+            iteration=self.global_iteration,
+            actor=Actor.DEV,
+            task_label=task.label,
+            status=TaskStatus.BLOCKED,
+            payload=synthetic.to_dict(),
+        ))
+        return synthetic
+
+    def _process_task(self, phase: Phase, task: Task) -> None:
+        """Run QA→Dev feedback loop for a single task."""
+        # Begin jj change for this task
+        self._jj_begin_task(task)
+
+        feedback: str | None = None  # None on first iteration
+
+        for iteration in range(1, self.max_iterations + 1):
+            self.global_iteration += 1
+
+            # ── 1. Assign to DEV (with recovery) ──
+            dev_response = self._run_dev_with_recovery(
+                task=task,
+                iteration=iteration,
+                feedback=feedback,
+            )
+
+            # ── Handle dev blocked ──
+            if dev_response.status == "blocked":
+                self.ui.print_warning(
+                    f"[{task.label}] Developer BLOCKED: {dev_response.blocker_description[:200]}"
+                )
+                if dev_response.blocker_suggestion:
+                    self.ui.print_info(
+                        f"[{task.label}] Dev suggestion: {dev_response.blocker_suggestion[:200]}"
+                    )
+
+                # Send blocker to QA for triage
+                self.ui.update_actor(Actor.QA, task.label, f"triaging blocker (iteration {iteration})")
+                self.ui.print_info(f"[{task.label}] Asking QA to triage blocker...")
+
+                qa_blocked_request = QARequest(
+                    task_label=task.label,
+                    task_text=task.text,
+                    dev_response=dev_response,
+                    dev_session_id=self.dev_session_name,
+                    qa_session_id=self.qa_session_name,
+                    iteration=iteration,
+                    dev_blocked=True,
+                    blocker_description=dev_response.blocker_description,
+                )
+
+                qa_result = run_goose(
+                    recipe_path=self.qa_recipe,
+                    session_name=self.qa_session_name,
+                    params=qa_blocked_request.to_params(),
+                    max_turns=self.max_turns,
+                    timeout_secs=self.timeout_secs,
+                    model=self.model,
+                    provider=self.provider,
+                    cwd=self.cwd,
+                )
+
+                qa_response = _parse_qa_response(qa_result.raw_stdout, qa_result.parsed_json)
+
+                # QA timed out — treat as rejection with timeout context
+                if qa_result.timed_out:
+                    timeout_minutes = self.timeout_secs / 60
+                    self.ui.print_warning(
+                        f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during blocker triage — treating as rejection"
+                    )
+                    self.log.append(IterationEntry(
+                        timestamp=_now_iso(),
+                        iteration=self.global_iteration,
+                        actor=Actor.QA,
+                        task_label=task.label,
+                        status=TaskStatus.ERROR,
+                        payload={"error": "timeout", "duration": qa_result.duration_secs},
+                        raw_output=qa_result.raw_stderr[:500],
+                    ))
+                    qa_response = QAResponse(
+                        decision="reject",
+                        feedback=_timeout_feedback("QA", self.timeout_secs),
+                        concerns=["QA agent timed out during blocker triage"],
+                    )
+
+                if qa_response is None:
+                    qa_response = QAResponse(
+                        decision="reject",
+                        feedback="QA could not triage the blocker — no structured response.",
+                        concerns=["QA did not return structured JSON for blocker triage"],
+                    )
+
+                # Log QA triage
+                qa_entry = IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.QA,
+                    task_label=task.label,
+                    status=TaskStatus.BLOCKED,
+                    payload=qa_response.to_dict(),
+                    raw_output=qa_result.raw_stdout[:500],
+                )
+                self.log.append(qa_entry)
+                self.ui.add_iteration(qa_entry)
+
+                if qa_response.decision == "needs_user_input":
+                    resolved = self._interactive_chat_loop(
+                        task=task,
+                        phase=phase,
+                        qa_response=qa_response,
+                        blocker_description=dev_response.blocker_description,
+                    )
+                    if not resolved:
+                        # User skipped — mark done and move on
+                        self._jj_commit_task(task)
+                        mark_task_done(task, self.phases)
+                        update_markdown(self.task_file, self.phases)
+                        self.ui.update_phase(phase)
+                        self.ui.update_project(self.phases, phase)
+                        return
+                    # Issue resolved via chat — loop back so dev retries
+                    feedback = (
+                        f"## Blocker Resolved via User Chat\n\n"
+                        f"The blocker was discussed with the user and resolved. "
+                        f"Please proceed with the task.\n"
+                    )
+                    continue  # back to top of iteration loop
+
+                elif qa_response.decision == "approve":
+                    # QA decided the blocker is acceptable (e.g., task is already partially done)
+                    self.ui.print_success(
+                        f"[{task.label}] QA approved blocked task: {qa_response.feedback[:100]}"
+                    )
+                    self._jj_commit_task(task)
+                    mark_task_done(task, self.phases)
+                    update_markdown(self.task_file, self.phases)
+                    self.ui.update_phase(phase)
+                    self.ui.update_project(self.phases, phase)
+                    return
+
+                else:
+                    # reject — QA gave guidance to unblock the dev, loop back
+                    self.ui.print_warning(
+                        f"[{task.label}] QA triage: try again with guidance: "
+                        f"{qa_response.feedback[:200]}"
+                    )
+                    feedback = (
+                        f"## Developer Blocker\n\n"
+                        f"**Blocker**: {dev_response.blocker_description}\n"
+                        f"**Dev suggestion**: {dev_response.blocker_suggestion}\n\n"
+                        f"## QA Triage Guidance\n\n"
+                        f"{qa_response.feedback}\n\n"
+                    )
+                    for c in qa_response.concerns:
+                        feedback += f"- {c}\n"
+                    feedback += "\nPlease address the blocker and the QA guidance above."
+                    continue  # back to top of iteration loop → dev retry
+
+            self.ui.print_info(
+                f"[{task.label}] Developer done: {dev_response.summary[:100]}"
+            )
+
+            # ── 2. Send to QA for review ──
+            self.ui.update_actor(Actor.QA, task.label, f"reviewing iteration {iteration}")
+            self.ui.print_info(f"[{task.label}] Iteration {iteration}: calling QA...")
+
+            # Get jj diff for QA context
+            jj_diff = self._jj_get_diff(task)
+
+            qa_request = QARequest(
+                task_label=task.label,
+                task_text=task.text,
+                dev_response=dev_response,
+                dev_session_id=self.dev_session_name,
+                qa_session_id=self.qa_session_name,
+                iteration=iteration,
+                project_context=f"## JJ Diff (task changes)\n```\n{jj_diff}\n```" if jj_diff else "",
+            )
+
+            qa_result = run_goose(
+                recipe_path=self.qa_recipe,
+                session_name=self.qa_session_name,
+                params=qa_request.to_params(),
+                max_turns=self.max_turns,
+                timeout_secs=self.timeout_secs,
+                model=self.model,
+                provider=self.provider,
+                cwd=self.cwd,
+            )
+
+            qa_response = _parse_qa_response(qa_result.raw_stdout, qa_result.parsed_json)
+
+            # QA timed out — treat as rejection with timeout context
+            if qa_result.timed_out:
+                timeout_minutes = self.timeout_secs / 60
+                self.ui.print_warning(
+                    f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during review — treating as rejection"
+                )
+                self.log.append(IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.QA,
+                    task_label=task.label,
+                    status=TaskStatus.ERROR,
+                    payload={"error": "timeout", "duration": qa_result.duration_secs},
+                    raw_output=qa_result.raw_stderr[:500],
+                ))
+                qa_response = QAResponse(
+                    decision="reject",
+                    feedback=_timeout_feedback("QA", self.timeout_secs),
+                    concerns=["QA agent timed out during review"],
+                )
+
+            # QA returned unparseable output — treat as rejection with raw feedback
+            if qa_response is None:
+                self.ui.print_warning(
+                    f"[{task.label}] QA did not return valid JSON, treating as rejection."
+                )
+                qa_response = QAResponse(
+                    decision="reject",
+                    feedback=qa_result.raw_stdout[:300] if qa_result.raw_stdout else "QA returned no structured response",
+                    concerns=["QA did not return structured JSON"],
+                )
+
+            # Log QA iteration
+            qa_status = TaskStatus.APPROVED if qa_response.decision == "approve" else TaskStatus.FEEDBACK
+            qa_entry = IterationEntry(
+                timestamp=_now_iso(),
+                iteration=self.global_iteration,
+                actor=Actor.QA,
+                task_label=task.label,
+                status=qa_status,
+                payload=qa_response.to_dict(),
+                raw_output=qa_result.raw_stdout[:500],
+            )
+            self.log.append(qa_entry)
+            self.ui.add_iteration(qa_entry)
+
+            if qa_response.decision == "approve":
+                self.ui.print_success(
+                    f"[{task.label}] ✓ APPROVED by QA: {qa_response.feedback[:100]}"
+                )
+                self._jj_commit_task(task)
+                mark_task_done(task, self.phases)
+                update_markdown(self.task_file, self.phases)
+                self.ui.update_phase(phase)
+                self.ui.update_project(self.phases, phase)
+                return
+
+            elif qa_response.decision == "needs_user_input":
+                resolved = self._interactive_chat_loop(
+                    task=task,
+                    phase=phase,
+                    qa_response=qa_response,
+                )
+                if not resolved:
+                    # User skipped — mark done and move on
+                    self._jj_commit_task(task)
+                    mark_task_done(task, self.phases)
+                    update_markdown(self.task_file, self.phases)
+                    self.ui.update_phase(phase)
+                    self.ui.update_project(self.phases, phase)
+                    return
+                # Issue resolved via chat — loop back so dev retries with updated context
+                feedback = (
+                    f"## Issue Resolved via User Chat\n\n"
+                    f"An issue was discussed with the user and resolved. "
+                    f"Please continue the task.\n"
+                )
+                continue  # back to top of iteration loop
+
+            else:
+                # reject
+                self.ui.print_warning(
+                    f"[{task.label}] ✗ REJECTED by QA: {qa_response.feedback[:200]}"
+                )
+                if qa_response.concerns:
+                    for c in qa_response.concerns[:5]:
+                        self.ui.print_warning(f"  • {c}")
+                feedback = (
+                    f"## QA Decision: REJECT\n\n"
+                    f"**Feedback:** {qa_response.feedback}\n\n"
+                    f"**Concerns:**\n"
+                )
+                for c in qa_response.concerns:
+                    feedback += f"- {c}\n"
+                feedback += (
+                    f"\nPlease fix ALL concerns above and re-submit."
+                )
+
+        # Max iterations reached — mark done to prevent infinite loop
+        self.ui.print_error(
+            f"[{task.label}] Max iterations ({self.max_iterations}) reached. "
+            f"Marking task done and moving on."
+        )
+        self._jj_commit_task(task)
+        mark_task_done(task, self.phases)
+        update_markdown(self.task_file, self.phases)
+        self.ui.update_phase(phase)
+        self.ui.update_project(self.phases, phase)
+        self.log.append(IterationEntry(
+            timestamp=_now_iso(),
+            iteration=self.global_iteration,
+            actor=Actor.QA,
+            task_label=task.label,
+            status=TaskStatus.ERROR,
+            payload={"error": "max_iterations_reached"},
+        ))
