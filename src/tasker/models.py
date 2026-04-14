@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any
 
 
 # ── Task & Phase models ────────────────────────────────────────────
 
+
 @dataclass
 class Task:
     """A single actionable item inside a phase."""
+
     phase_index: int
     task_index: int
     text: str
@@ -20,11 +21,15 @@ class Task:
 
     # Sub-phase context — set by parser when the task sits under a ### heading
     subphase: str = ""
-    subphase_index: int = -1  # 0-based task index within its ### group (-1 if no subphase)
+    subphase_index: int = (
+        -1
+    )  # 0-based task index within its ### group (-1 if no subphase)
 
     # VCS tracking — set by the VCS backend (jj or git) when enabled
-    base_ref: str | None = None    # parent ref (what we diff against): jj change ID or git commit hash
-    task_ref: str | None = None    # task ref: jj change ID or git branch name
+    base_ref: str | None = (
+        None  # parent ref (what we diff against): jj change ID or git commit hash
+    )
+    task_ref: str | None = None  # task ref: jj change ID or git branch name
 
     # Legacy aliases (deprecated — use base_ref / task_ref)
     @property
@@ -73,6 +78,7 @@ class Phase:
     uses ### headings to group tasks within a phase (e.g. "### P1-1 Core").
     The `subphase` value is the full ### heading text (without the hashes).
     """
+
     index: int
     title: str
     tasks: list[Task] = field(default_factory=list)
@@ -93,6 +99,7 @@ class Phase:
 
 # ── Actor / status enums ──────────────────────────────────────────
 
+
 class Actor(str, enum.Enum):
     QA = "qa"
     DEV = "dev"
@@ -110,6 +117,7 @@ class TaskStatus(str, enum.Enum):
 
 # ── Recovery state for graceful degradation ──────────────────────
 
+
 class SessionScope(str, enum.Enum):
     """Controls when goose sessions are rotated (new session = fresh context).
 
@@ -117,6 +125,7 @@ class SessionScope(str, enum.Enum):
     subphase — one session per ### sub-heading (default, good balance)
     task     — one session per task (finest, least context but no overflow)
     """
+
     PHASE = "phase"
     SUBPHASE = "subphase"
     TASK = "task"
@@ -124,10 +133,11 @@ class SessionScope(str, enum.Enum):
 
 class RecoveryStage(str, enum.Enum):
     """Escalation stages when goose returns malformed output."""
-    NORMAL = "normal"           # first attempt, no special instruction
-    CONTINUE = "continue"       # "continue from where you left off"
-    SUBTASK = "subtask"         # "break into subtasks and implement one at a time"
-    SUMMARIZE = "summarize"     # "summarize progress and difficulties"
+
+    NORMAL = "normal"  # first attempt, no special instruction
+    CONTINUE = "continue"  # "continue from where you left off"
+    SUBTASK = "subtask"  # "break into subtasks and implement one at a time"
+    SUMMARIZE = "summarize"  # "summarize progress and difficulties"
 
     @property
     def max_attempts(self) -> int:
@@ -136,9 +146,11 @@ class RecoveryStage(str, enum.Enum):
 
 # ── JSONL iteration log entry ─────────────────────────────────────
 
+
 @dataclass
 class IterationEntry:
     """One QA↔Dev exchange recorded in the JSONL log."""
+
     timestamp: str
     iteration: int
     actor: Actor
@@ -164,9 +176,11 @@ class IterationEntry:
 
 # ── Payload schemas for QA ↔ Dev communication ────────────────────
 
+
 @dataclass
 class DevRequest:
     """QA → Dev: implement this task."""
+
     task_label: str
     task_text: str
     qa_session_id: str
@@ -192,12 +206,13 @@ class DevRequest:
 @dataclass
 class DevResponse:
     """Dev → QA: result of implementation."""
+
     status: str  # "done" | "blocked"
     summary: str
     files_modified: list[str]
     notes: str = ""
     blocker_description: str = ""  # what is blocking (when status="blocked")
-    blocker_suggestion: str = ""   # dev's suggestion to resolve (when status="blocked")
+    blocker_suggestion: str = ""  # dev's suggestion to resolve (when status="blocked")
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -216,6 +231,7 @@ class DevResponse:
 @dataclass
 class QARequest:
     """Orchestrator → QA: review this dev work."""
+
     task_label: str
     task_text: str
     dev_response: DevResponse
@@ -253,6 +269,7 @@ class QARequest:
 @dataclass
 class QAResponse:
     """QA → Orchestrator: approve, reject, or request user input."""
+
     decision: str  # "approve" | "reject" | "needs_user_input"
     feedback: str
     concerns: list[str] = field(default_factory=list)
@@ -273,6 +290,7 @@ class QAResponse:
 @dataclass
 class UserChatRequest:
     """Orchestrator → QA (chat mode): relay user's answer."""
+
     task_label: str
     task_text: str
     blocker_description: str

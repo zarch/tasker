@@ -7,13 +7,14 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
 @dataclass
 class GooseRunResult:
     """Result of a goose run invocation."""
+
     success: bool
     raw_stdout: str
     raw_stderr: str
@@ -104,18 +105,26 @@ def build_goose_command(
     `--text` and `--recipe` are mutually exclusive, so we use --params.
     """
     cmd = [
-        "goose", "run",
-        "--recipe", str(recipe_path),
-        "--name", session_name,
-        "--output-format", "json",
+        "goose",
+        "run",
+        "--recipe",
+        str(recipe_path),
+        "--name",
+        session_name,
+        "--output-format",
+        "json",
         "--quiet",
-        "--max-turns", str(max_turns),
-        "--with-builtin", "developer",
+        "--max-turns",
+        str(max_turns),
+        "--with-builtin",
+        "developer",
     ]
     if params:
         for key, value in params.items():
             # Escape newlines and other shell-unsafe characters in values
-            safe_value = value.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+            safe_value = (
+                value.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+            )
             cmd.extend(["--params", f"{key}={safe_value}"])
     if model:
         cmd.extend(["--model", model])

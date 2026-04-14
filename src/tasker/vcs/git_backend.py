@@ -38,11 +38,11 @@ def _sanitize_branch_name(name: str) -> str:
     See: https://git-scm.com/docs/git-check-ref-format
     """
     # Replace characters that are problematic in branch names
-    sanitized = re.sub(r'[~^:\s\\]+', '-', name)
+    sanitized = re.sub(r"[~^:\s\\]+", "-", name)
     # Remove leading dots, dashes, or slashes
-    sanitized = sanitized.lstrip('.-/')
+    sanitized = sanitized.lstrip(".-/")
     # Collapse consecutive slashes
-    sanitized = re.sub(r'/+', '/', sanitized)
+    sanitized = re.sub(r"/+", "/", sanitized)
     # Truncate to reasonable length (git allows 255 but let's be safe)
     return sanitized[:200]
 
@@ -50,6 +50,7 @@ def _sanitize_branch_name(name: str) -> str:
 @dataclass
 class GitResult:
     """Result of a git command."""
+
     success: bool
     stdout: str
     stderr: str
@@ -80,9 +81,16 @@ def _run_git(
             return_code=proc.returncode,
         )
     except subprocess.TimeoutExpired:
-        return GitResult(success=False, stdout="", stderr=f"TIMEOUT after {timeout_secs}s", return_code=-1)
+        return GitResult(
+            success=False,
+            stdout="",
+            stderr=f"TIMEOUT after {timeout_secs}s",
+            return_code=-1,
+        )
     except FileNotFoundError:
-        return GitResult(success=False, stdout="", stderr="git not found in PATH", return_code=-1)
+        return GitResult(
+            success=False, stdout="", stderr="git not found in PATH", return_code=-1
+        )
 
 
 def _get_current_branch(cwd: Path | None = None) -> str | None:
@@ -121,7 +129,7 @@ class GitBackend:
 
     def __init__(self) -> None:
         self._base_branch: str | None = None  # the branch we started on (e.g. "main")
-        self._base_commit: str | None = None   # the commit hash at start
+        self._base_commit: str | None = None  # the commit hash at start
 
     # ── Protocol implementation ──────────────────────────────────
 
@@ -171,12 +179,16 @@ class GitBackend:
 
         # Guard against reserved names
         if branch_name.replace(_BRANCH_PREFIX, "") in _RESERVED_BRANCHES:
-            raise RuntimeError(f"Branch name {branch_name!r} conflicts with a reserved name.")
+            raise RuntimeError(
+                f"Branch name {branch_name!r} conflicts with a reserved name."
+            )
 
         # If branch already exists (e.g. from a previous interrupted run),
         # delete it so we start fresh from the base.
         if _branch_exists(branch_name, cwd=cwd):
-            logger.warning("Branch %s already exists — deleting and recreating.", branch_name)
+            logger.warning(
+                "Branch %s already exists — deleting and recreating.", branch_name
+            )
             _run_git(["branch", "-D", branch_name], cwd=cwd)
 
         # Make sure we're on the base branch before creating the feature branch
@@ -190,7 +202,9 @@ class GitBackend:
             task.base_ref = self._base_commit
             logger.info("Created feature branch: %s", branch_name)
         else:
-            raise RuntimeError(f"Failed to create branch {branch_name!r}: {result.stderr}")
+            raise RuntimeError(
+                f"Failed to create branch {branch_name!r}: {result.stderr}"
+            )
 
     def get_diff(self, task: Task, cwd: str | None = None) -> str:
         """Return diff between base commit and the feature branch's working tree.
@@ -235,10 +249,14 @@ class GitBackend:
             ["diff", "--quiet", self._base_commit, feature_branch],
             cwd=cwd,
         )
-        has_changes = not diff_check.success  # git diff --quiet returns 1 if there are diffs
+        has_changes = (
+            not diff_check.success
+        )  # git diff --quiet returns 1 if there are diffs
 
         if not has_changes:
-            logger.info("No changes on feature branch %s — skipping merge.", feature_branch)
+            logger.info(
+                "No changes on feature branch %s — skipping merge.", feature_branch
+            )
             # Still switch back to base and clean up
             _run_git(["checkout", self._base_branch], cwd=cwd)
             if _branch_exists(feature_branch, cwd=cwd):
@@ -267,9 +285,7 @@ class GitBackend:
         if not commit.success:
             # Merge was staged but commit failed — unstage to leave repo in clean state
             _run_git(["reset", "--hard", "HEAD"], cwd=cwd)
-            raise RuntimeError(
-                f"Failed to commit squash-merge: {commit.stderr}"
-            )
+            raise RuntimeError(f"Failed to commit squash-merge: {commit.stderr}")
 
         # Update base commit so the next task branches from here
         new_head = _get_commit_hash("HEAD", cwd=cwd)
@@ -282,5 +298,7 @@ class GitBackend:
 
         logger.info(
             "Squash-merged %s → %s: %s",
-            feature_branch, self._base_branch, task.vcs_description[:60],
+            feature_branch,
+            self._base_branch,
+            task.vcs_description[:60],
         )

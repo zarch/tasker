@@ -69,8 +69,10 @@ def create_backend(vcs_type: str) -> VCSBackend | None:
         return None
     if vcs_type == "jj":
         from .jj_backend import JJBackend
+
         return JJBackend()
     if vcs_type == "git":
         from .git_backend import GitBackend
+
         return GitBackend()
     raise ValueError(f"Unknown VCS type: {vcs_type!r}. Must be 'jj', 'git', or 'none'.")

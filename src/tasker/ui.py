@@ -5,7 +5,7 @@ from __future__ import annotations
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 from rich.text import Text
 from rich.layout import Layout
@@ -156,7 +156,9 @@ class TaskerUI:
 
             table.add_row(
                 f"#{entry.iteration}",
-                entry.timestamp.split("T")[1].split(".")[0] if "T" in entry.timestamp else entry.timestamp,
+                entry.timestamp.split("T")[1].split(".")[0]
+                if "T" in entry.timestamp
+                else entry.timestamp,
                 f"[{status_color}]{actor_str}[/{status_color}]",
                 entry.task_label,
                 f"[{status_color}]{entry.status.value}[/{status_color}]",
@@ -208,9 +210,11 @@ class TaskerUI:
     def print_chat_header(self, task_label: str, question: str) -> None:
         """Print the header when entering interactive chat mode."""
         self.console.print()
-        self.console.rule(f"[bold magenta]💬 Interactive Chat — {task_label}[/bold magenta]")
+        self.console.rule(
+            f"[bold magenta]💬 Interactive Chat — {task_label}[/bold magenta]"
+        )
         self.console.print(
-            f"[magenta]QA has a question that requires your input:[/magenta]\n"
+            "[magenta]QA has a question that requires your input:[/magenta]\n"
         )
         self.console.print(f"  {question}")
         self.console.print()
@@ -243,7 +247,9 @@ class TaskerUI:
     def print_chat_resolved(self) -> None:
         """Print confirmation that the chat issue was resolved."""
         self.console.print()
-        self.console.print("[bold green]✓ Issue resolved. Continuing pipeline...[/bold green]")
+        self.console.print(
+            "[bold green]✓ Issue resolved. Continuing pipeline...[/bold green]"
+        )
         self.console.rule()
         self.console.print()
 

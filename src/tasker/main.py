@@ -41,12 +41,12 @@ def main(
     dev: Path = typer.Option(
         _DEFAULT_DEV,
         "--dev",
-        help=f"Path to the developer goose recipe (YAML). Default: recipe-dev.yaml",
+        help="Path to the developer goose recipe (YAML). Default: recipe-dev.yaml",
     ),
     qa: Path = typer.Option(
         _DEFAULT_QA,
         "--qa",
-        help=f"Path to the QA goose recipe (YAML). Default: recipe-qa.yaml",
+        help="Path to the QA goose recipe (YAML). Default: recipe-qa.yaml",
     ),
     task_file: Path = typer.Argument(
         ...,
@@ -135,6 +135,7 @@ def main(
 
     # Resolve VCS backend
     from .vcs import create_backend
+
     try:
         vcs_backend = create_backend(vcs)
     except ValueError as exc:

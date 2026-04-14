@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class JJResult:
     """Result of a jj command."""
+
     success: bool
     stdout: str
     stderr: str
@@ -58,9 +59,16 @@ def _run_jj(
             return_code=proc.returncode,
         )
     except subprocess.TimeoutExpired:
-        return JJResult(success=False, stdout="", stderr=f"TIMEOUT after {timeout_secs}s", return_code=-1)
+        return JJResult(
+            success=False,
+            stdout="",
+            stderr=f"TIMEOUT after {timeout_secs}s",
+            return_code=-1,
+        )
     except FileNotFoundError:
-        return JJResult(success=False, stdout="", stderr="jj not found in PATH", return_code=-1)
+        return JJResult(
+            success=False, stdout="", stderr="jj not found in PATH", return_code=-1
+        )
 
 
 def _jj_get_current_change_id(cwd: Path | None = None) -> str | None:
@@ -136,6 +144,7 @@ class JJBackend:
 
 
 # ── Standalone helpers (used by tests and diagnostics) ────────────
+
 
 def jj_is_available() -> bool:
     """Check if jj CLI is available."""

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .goose import GooseRunResult, run_goose
+from .goose import run_goose
 from .log import IterationLog
 from .models import (
     Actor,
@@ -26,7 +25,7 @@ from .models import (
 )
 from .parser import find_next_task, mark_task_done, parse_task_file, update_markdown
 from .ui import TaskerUI
-from .vcs import VCSBackend, create_backend
+from .vcs import VCSBackend
 
 
 def _generate_session_id(prefix: str) -> str:
@@ -133,7 +132,6 @@ def _compute_scope_key(task: Task, scope: SessionScope) -> str:
     return f"{phase_key}::T{task.task_index + 1}"
 
 
-
 class Orchestrator:
     """Drives the QA → Dev → QA loop for all tasks in the task file."""
 
@@ -197,13 +195,13 @@ class Orchestrator:
         if self.vcs is not None:
             if not self.vcs.is_available():
                 self.ui.print_error(
-                    f"VCS tool not found in PATH. Disabling VCS integration."
+                    "VCS tool not found in PATH. Disabling VCS integration."
                 )
                 self.vcs = None
             else:
                 try:
                     self.vcs.init(cwd=self.cwd)
-                    self.ui.print_info(f"VCS integration: ON")
+                    self.ui.print_info("VCS integration: ON")
                 except RuntimeError as exc:
                     self.ui.print_error(f"VCS init failed: {exc}")
                     self.vcs = None
@@ -244,8 +242,7 @@ class Orchestrator:
         total_tasks = sum(p.total for p in self.phases)
         done_tasks = sum(p.completed for p in self.phases)
         self.ui.print_success(
-            f"Done! {done_tasks}/{total_tasks} tasks completed. "
-            f"Log: {self.log._path}"
+            f"Done! {done_tasks}/{total_tasks} tasks completed. Log: {self.log._path}"
         )
 
     def _run_loop(self) -> None:
@@ -263,10 +260,10 @@ class Orchestrator:
             self.ui.update_phase(phase)
 
             self.ui.print_info(
-                f"\n{'='*60}\n"
+                f"\n{'=' * 60}\n"
                 f"Starting task {task.label}: {task.text}\n"
                 f"Phase: {phase.title} ({phase.completed}/{phase.total})\n"
-                f"{'='*60}"
+                f"{'=' * 60}"
             )
 
             # Rotate sessions if scope boundary changed or --new-session was set
@@ -292,9 +289,7 @@ class Orchestrator:
         if self._force_new_session:
             should_rotate = True
             self._force_new_session = False  # one-shot
-            self.ui.print_info(
-                f"[{task.label}] Forcing new session (--new-session)"
-            )
+            self.ui.print_info(f"[{task.label}] Forcing new session (--new-session)")
         elif scope_key != self._current_scope_key:
             should_rotate = True
             if self._current_scope_key:
@@ -333,7 +328,9 @@ class Orchestrator:
         # Pause Live so input() works without interference
         self.ui.pause()
 
-        self.ui.print_chat_header(task.label, qa_response.user_question or qa_response.feedback)
+        self.ui.print_chat_header(
+            task.label, qa_response.user_question or qa_response.feedback
+        )
 
         conversation_history = ""
         chat_turn = 0
@@ -385,22 +382,28 @@ class Orchestrator:
                 cwd=self.cwd,
             )
 
-            chat_qa_response = _parse_qa_response(chat_result.raw_stdout, chat_result.parsed_json)
+            chat_qa_response = _parse_qa_response(
+                chat_result.raw_stdout, chat_result.parsed_json
+            )
 
             # Log the chat exchange
-            self.log.append(IterationEntry(
-                timestamp=_now_iso(),
-                iteration=self.global_iteration,
-                actor=Actor.QA,
-                task_label=task.label,
-                status=TaskStatus.NEEDS_USER_INPUT,
-                payload={
-                    "chat_turn": chat_turn,
-                    "user_message": user_input,
-                    "qa_response": chat_qa_response.to_dict() if chat_qa_response else None,
-                    "raw": chat_result.raw_stdout[:300],
-                },
-            ))
+            self.log.append(
+                IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.QA,
+                    task_label=task.label,
+                    status=TaskStatus.NEEDS_USER_INPUT,
+                    payload={
+                        "chat_turn": chat_turn,
+                        "user_message": user_input,
+                        "qa_response": chat_qa_response.to_dict()
+                        if chat_qa_response
+                        else None,
+                        "raw": chat_result.raw_stdout[:300],
+                    },
+                )
+            )
 
             # QA timed out during chat — inform user and continue
             if chat_result.timed_out:
@@ -412,18 +415,20 @@ class Orchestrator:
             elif chat_qa_response is None:
                 # QA didn't return structured output in chat mode — show raw text
                 self.ui.print_qa_chat_message(
-                    chat_result.raw_stdout[:500] if chat_result.raw_stdout else "(no response)"
+                    chat_result.raw_stdout[:500]
+                    if chat_result.raw_stdout
+                    else "(no response)"
                 )
-                conversation_history += f"🧪 QA: {chat_result.raw_stdout or '(no response)'}\n\n"
+                conversation_history += (
+                    f"🧪 QA: {chat_result.raw_stdout or '(no response)'}\n\n"
+                )
                 continue
 
             conversation_history += f"🧪 QA: {chat_qa_response.feedback}\n\n"
 
             # Check if QA considers the issue resolved
             if chat_qa_response.decision == "approve":
-                self.ui.print_qa_chat_message(
-                    f"✓ {chat_qa_response.feedback}"
-                )
+                self.ui.print_qa_chat_message(f"✓ {chat_qa_response.feedback}")
                 self.ui.print_chat_resolved()
                 self.ui.resume()
                 return True
@@ -432,7 +437,9 @@ class Orchestrator:
                 # QA has a follow-up question
                 self.ui.print_qa_chat_message(chat_qa_response.feedback)
                 if chat_qa_response.user_question:
-                    self.ui.print_qa_chat_message(f"Follow-up: {chat_qa_response.user_question}")
+                    self.ui.print_qa_chat_message(
+                        f"Follow-up: {chat_qa_response.user_question}"
+                    )
                 continue
 
             # reject or other — QA gave guidance, show it and continue chatting
@@ -483,9 +490,7 @@ class Orchestrator:
         try:
             return self.vcs.get_diff(task, cwd=self.cwd)
         except RuntimeError as exc:
-            self.ui.print_warning(
-                f"[{task.label}] VCS: failed to get diff: {exc}"
-            )
+            self.ui.print_warning(f"[{task.label}] VCS: failed to get diff: {exc}")
             return ""
 
     def _vcs_commit_task(self, task: Task) -> None:
@@ -497,13 +502,9 @@ class Orchestrator:
             return
         try:
             self.vcs.commit_task(task, cwd=self.cwd)
-            self.ui.print_info(
-                f"[{task.label}] VCS: task committed"
-            )
+            self.ui.print_info(f"[{task.label}] VCS: task committed")
         except RuntimeError as exc:
-            self.ui.print_warning(
-                f"[{task.label}] VCS: failed to commit task: {exc}"
-            )
+            self.ui.print_warning(f"[{task.label}] VCS: failed to commit task: {exc}")
 
     def _run_dev_with_recovery(
         self,
@@ -534,8 +535,10 @@ class Orchestrator:
                 recovery_instruction = _RECOVERY_SUMMARIZE
 
             self.ui.update_actor(
-                Actor.DEV, task.label,
-                f"iteration {iteration}" + (f" [{stage.value}]" if stage != RecoveryStage.NORMAL else ""),
+                Actor.DEV,
+                task.label,
+                f"iteration {iteration}"
+                + (f" [{stage.value}]" if stage != RecoveryStage.NORMAL else ""),
             )
             self.ui.print_info(
                 f"[{task.label}] Dev call (stage={stage.value}, attempt={attempts_in_stage})..."
@@ -573,24 +576,31 @@ class Orchestrator:
                         f"[{task.label}] Dev timed out after {timeout_minutes:.0f}min — "
                         f"will relaunch with timeout context"
                     )
-                    self.log.append(IterationEntry(
-                        timestamp=_now_iso(),
-                        iteration=self.global_iteration,
-                        actor=Actor.DEV,
-                        task_label=task.label,
-                        status=TaskStatus.ERROR,
-                        payload={"error": "timeout", "duration": dev_result.duration_secs},
-                        raw_output=dev_result.raw_stderr[:500],
-                    ))
+                    self.log.append(
+                        IterationEntry(
+                            timestamp=_now_iso(),
+                            iteration=self.global_iteration,
+                            actor=Actor.DEV,
+                            task_label=task.label,
+                            status=TaskStatus.ERROR,
+                            payload={
+                                "error": "timeout",
+                                "duration": dev_result.duration_secs,
+                            },
+                            raw_output=dev_result.raw_stderr[:500],
+                        )
+                    )
                     return DevResponse(
                         status="blocked",
                         summary=f"Developer agent timed out after {timeout_minutes:.0f} minutes.",
                         files_modified=[],
                         notes="The developer process was killed due to timeout. "
-                              "It will be relaunched with awareness of the timeout.",
-                        blocker_description=_timeout_feedback("Developer", self.timeout_secs),
+                        "It will be relaunched with awareness of the timeout.",
+                        blocker_description=_timeout_feedback(
+                            "Developer", self.timeout_secs
+                        ),
                         blocker_suggestion="The process was stuck. Review what you were doing "
-                                           "and finish quickly. Do NOT redo completed work.",
+                        "and finish quickly. Do NOT redo completed work.",
                     )
 
                 # Other subprocess failures (crash, etc.)
@@ -598,15 +608,17 @@ class Orchestrator:
                     f"[{task.label}] Dev subprocess failed (rc={dev_result.return_code}): "
                     f"{dev_result.raw_stderr[:200]}"
                 )
-                self.log.append(IterationEntry(
-                    timestamp=_now_iso(),
-                    iteration=self.global_iteration,
-                    actor=Actor.DEV,
-                    task_label=task.label,
-                    status=TaskStatus.ERROR,
-                    payload={"error": "subprocess_failed", "stage": stage.value},
-                    raw_output=dev_result.raw_stderr[:500],
-                ))
+                self.log.append(
+                    IterationEntry(
+                        timestamp=_now_iso(),
+                        iteration=self.global_iteration,
+                        actor=Actor.DEV,
+                        task_label=task.label,
+                        status=TaskStatus.ERROR,
+                        payload={"error": "subprocess_failed", "stage": stage.value},
+                        raw_output=dev_result.raw_stderr[:500],
+                    )
+                )
                 # Subprocess failures don't count as malformed — try again in same stage
                 if attempts_in_stage < stage.max_attempts:
                     self.ui.print_warning(
@@ -616,12 +628,18 @@ class Orchestrator:
                 # Exhausted this stage, escalate
                 if stage == RecoveryStage.SUMMARIZE:
                     break
-                stage = RecoveryStage.SUBTASK if stage == RecoveryStage.CONTINUE else RecoveryStage.SUMMARIZE
+                stage = (
+                    RecoveryStage.SUBTASK
+                    if stage == RecoveryStage.CONTINUE
+                    else RecoveryStage.SUMMARIZE
+                )
                 attempts_in_stage = 0
                 continue
 
             # Try to parse the structured response
-            dev_response = _parse_dev_response(dev_result.raw_stdout, dev_result.parsed_json)
+            dev_response = _parse_dev_response(
+                dev_result.raw_stdout, dev_result.parsed_json
+            )
 
             if dev_response is not None:
                 # Parsed successfully — log and return
@@ -630,7 +648,9 @@ class Orchestrator:
                     iteration=self.global_iteration,
                     actor=Actor.DEV,
                     task_label=task.label,
-                    status=TaskStatus.BLOCKED if dev_response.status == "blocked" else TaskStatus.IN_PROGRESS,
+                    status=TaskStatus.BLOCKED
+                    if dev_response.status == "blocked"
+                    else TaskStatus.IN_PROGRESS,
                     payload=dev_response.to_dict(),
                     raw_output=dev_result.raw_stdout[:500],
                 )
@@ -643,15 +663,17 @@ class Orchestrator:
                 f"[{task.label}] Dev did not return valid JSON (stage={stage.value}, "
                 f"attempt={attempts_in_stage}/{stage.max_attempts})"
             )
-            self.log.append(IterationEntry(
-                timestamp=_now_iso(),
-                iteration=self.global_iteration,
-                actor=Actor.DEV,
-                task_label=task.label,
-                status=TaskStatus.ERROR,
-                payload={"error": "malformed_output", "stage": stage.value},
-                raw_output=dev_result.raw_stdout[:500],
-            ))
+            self.log.append(
+                IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.DEV,
+                    task_label=task.label,
+                    status=TaskStatus.ERROR,
+                    payload={"error": "malformed_output", "stage": stage.value},
+                    raw_output=dev_result.raw_stdout[:500],
+                )
+            )
 
             # Escalation logic
             if attempts_in_stage >= stage.max_attempts:
@@ -679,21 +701,23 @@ class Orchestrator:
             summary="Developer failed to produce a valid response after multiple recovery attempts.",
             files_modified=[],
             notes="The developer agent could not complete the task. "
-                  "All recovery stages (continue, subtask, summarize) were exhausted.",
+            "All recovery stages (continue, subtask, summarize) were exhausted.",
             blocker_description="Developer agent returned malformed output across all recovery attempts. "
-                                "The task may be too complex, poorly specified, or the agent may be "
-                                "encountering tooling issues.",
+            "The task may be too complex, poorly specified, or the agent may be "
+            "encountering tooling issues.",
             blocker_suggestion="Consider breaking this task into smaller, more specific subtasks. "
-                               "Or review if the task description is clear and complete.",
+            "Or review if the task description is clear and complete.",
         )
-        self.log.append(IterationEntry(
-            timestamp=_now_iso(),
-            iteration=self.global_iteration,
-            actor=Actor.DEV,
-            task_label=task.label,
-            status=TaskStatus.BLOCKED,
-            payload=synthetic.to_dict(),
-        ))
+        self.log.append(
+            IterationEntry(
+                timestamp=_now_iso(),
+                iteration=self.global_iteration,
+                actor=Actor.DEV,
+                task_label=task.label,
+                status=TaskStatus.BLOCKED,
+                payload=synthetic.to_dict(),
+            )
+        )
         return synthetic
 
     def _process_task(self, phase: Phase, task: Task) -> None:
@@ -724,7 +748,9 @@ class Orchestrator:
                     )
 
                 # Send blocker to QA for triage
-                self.ui.update_actor(Actor.QA, task.label, f"triaging blocker (iteration {iteration})")
+                self.ui.update_actor(
+                    Actor.QA, task.label, f"triaging blocker (iteration {iteration})"
+                )
                 self.ui.print_info(f"[{task.label}] Asking QA to triage blocker...")
 
                 qa_blocked_request = QARequest(
@@ -749,7 +775,9 @@ class Orchestrator:
                     cwd=self.cwd,
                 )
 
-                qa_response = _parse_qa_response(qa_result.raw_stdout, qa_result.parsed_json)
+                qa_response = _parse_qa_response(
+                    qa_result.raw_stdout, qa_result.parsed_json
+                )
 
                 # QA timed out — treat as rejection with timeout context
                 if qa_result.timed_out:
@@ -757,15 +785,20 @@ class Orchestrator:
                     self.ui.print_warning(
                         f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during blocker triage — treating as rejection"
                     )
-                    self.log.append(IterationEntry(
-                        timestamp=_now_iso(),
-                        iteration=self.global_iteration,
-                        actor=Actor.QA,
-                        task_label=task.label,
-                        status=TaskStatus.ERROR,
-                        payload={"error": "timeout", "duration": qa_result.duration_secs},
-                        raw_output=qa_result.raw_stderr[:500],
-                    ))
+                    self.log.append(
+                        IterationEntry(
+                            timestamp=_now_iso(),
+                            iteration=self.global_iteration,
+                            actor=Actor.QA,
+                            task_label=task.label,
+                            status=TaskStatus.ERROR,
+                            payload={
+                                "error": "timeout",
+                                "duration": qa_result.duration_secs,
+                            },
+                            raw_output=qa_result.raw_stderr[:500],
+                        )
+                    )
                     qa_response = QAResponse(
                         decision="reject",
                         feedback=_timeout_feedback("QA", self.timeout_secs),
@@ -776,7 +809,9 @@ class Orchestrator:
                     qa_response = QAResponse(
                         decision="reject",
                         feedback="QA could not triage the blocker — no structured response.",
-                        concerns=["QA did not return structured JSON for blocker triage"],
+                        concerns=[
+                            "QA did not return structured JSON for blocker triage"
+                        ],
                     )
 
                 # Log QA triage
@@ -809,9 +844,9 @@ class Orchestrator:
                         return
                     # Issue resolved via chat — loop back so dev retries
                     feedback = (
-                        f"## Blocker Resolved via User Chat\n\n"
-                        f"The blocker was discussed with the user and resolved. "
-                        f"Please proceed with the task.\n"
+                        "## Blocker Resolved via User Chat\n\n"
+                        "The blocker was discussed with the user and resolved. "
+                        "Please proceed with the task.\n"
                     )
                     continue  # back to top of iteration loop
 
@@ -842,7 +877,9 @@ class Orchestrator:
                     )
                     for c in qa_response.concerns:
                         feedback += f"- {c}\n"
-                    feedback += "\nPlease address the blocker and the QA guidance above."
+                    feedback += (
+                        "\nPlease address the blocker and the QA guidance above."
+                    )
                     continue  # back to top of iteration loop → dev retry
 
             self.ui.print_info(
@@ -850,7 +887,9 @@ class Orchestrator:
             )
 
             # ── 2. Send to QA for review ──
-            self.ui.update_actor(Actor.QA, task.label, f"reviewing iteration {iteration}")
+            self.ui.update_actor(
+                Actor.QA, task.label, f"reviewing iteration {iteration}"
+            )
             self.ui.print_info(f"[{task.label}] Iteration {iteration}: calling QA...")
 
             # Get VCS diff for QA context
@@ -863,7 +902,9 @@ class Orchestrator:
                 dev_session_id=self.dev_session_name,
                 qa_session_id=self.qa_session_name,
                 iteration=iteration,
-                project_context=f"## VCS Diff (task changes)\n```\n{vcs_diff}\n```" if vcs_diff else "",
+                project_context=f"## VCS Diff (task changes)\n```\n{vcs_diff}\n```"
+                if vcs_diff
+                else "",
             )
 
             qa_result = run_goose(
@@ -877,7 +918,9 @@ class Orchestrator:
                 cwd=self.cwd,
             )
 
-            qa_response = _parse_qa_response(qa_result.raw_stdout, qa_result.parsed_json)
+            qa_response = _parse_qa_response(
+                qa_result.raw_stdout, qa_result.parsed_json
+            )
 
             # QA timed out — treat as rejection with timeout context
             if qa_result.timed_out:
@@ -885,15 +928,20 @@ class Orchestrator:
                 self.ui.print_warning(
                     f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during review — treating as rejection"
                 )
-                self.log.append(IterationEntry(
-                    timestamp=_now_iso(),
-                    iteration=self.global_iteration,
-                    actor=Actor.QA,
-                    task_label=task.label,
-                    status=TaskStatus.ERROR,
-                    payload={"error": "timeout", "duration": qa_result.duration_secs},
-                    raw_output=qa_result.raw_stderr[:500],
-                ))
+                self.log.append(
+                    IterationEntry(
+                        timestamp=_now_iso(),
+                        iteration=self.global_iteration,
+                        actor=Actor.QA,
+                        task_label=task.label,
+                        status=TaskStatus.ERROR,
+                        payload={
+                            "error": "timeout",
+                            "duration": qa_result.duration_secs,
+                        },
+                        raw_output=qa_result.raw_stderr[:500],
+                    )
+                )
                 qa_response = QAResponse(
                     decision="reject",
                     feedback=_timeout_feedback("QA", self.timeout_secs),
@@ -907,12 +955,18 @@ class Orchestrator:
                 )
                 qa_response = QAResponse(
                     decision="reject",
-                    feedback=qa_result.raw_stdout[:300] if qa_result.raw_stdout else "QA returned no structured response",
+                    feedback=qa_result.raw_stdout[:300]
+                    if qa_result.raw_stdout
+                    else "QA returned no structured response",
                     concerns=["QA did not return structured JSON"],
                 )
 
             # Log QA iteration
-            qa_status = TaskStatus.APPROVED if qa_response.decision == "approve" else TaskStatus.FEEDBACK
+            qa_status = (
+                TaskStatus.APPROVED
+                if qa_response.decision == "approve"
+                else TaskStatus.FEEDBACK
+            )
             qa_entry = IterationEntry(
                 timestamp=_now_iso(),
                 iteration=self.global_iteration,
@@ -952,9 +1006,9 @@ class Orchestrator:
                     return
                 # Issue resolved via chat — loop back so dev retries with updated context
                 feedback = (
-                    f"## Issue Resolved via User Chat\n\n"
-                    f"An issue was discussed with the user and resolved. "
-                    f"Please continue the task.\n"
+                    "## Issue Resolved via User Chat\n\n"
+                    "An issue was discussed with the user and resolved. "
+                    "Please continue the task.\n"
                 )
                 continue  # back to top of iteration loop
 
@@ -973,9 +1027,7 @@ class Orchestrator:
                 )
                 for c in qa_response.concerns:
                     feedback += f"- {c}\n"
-                feedback += (
-                    f"\nPlease fix ALL concerns above and re-submit."
-                )
+                feedback += "\nPlease fix ALL concerns above and re-submit."
 
         # Max iterations reached — mark done to prevent infinite loop
         self.ui.print_error(
@@ -987,11 +1039,13 @@ class Orchestrator:
         update_markdown(self.task_file, self.phases)
         self.ui.update_phase(phase)
         self.ui.update_project(self.phases, phase)
-        self.log.append(IterationEntry(
-            timestamp=_now_iso(),
-            iteration=self.global_iteration,
-            actor=Actor.QA,
-            task_label=task.label,
-            status=TaskStatus.ERROR,
-            payload={"error": "max_iterations_reached"},
-        ))
+        self.log.append(
+            IterationEntry(
+                timestamp=_now_iso(),
+                iteration=self.global_iteration,
+                actor=Actor.QA,
+                task_label=task.label,
+                status=TaskStatus.ERROR,
+                payload={"error": "max_iterations_reached"},
+            )
+        )

@@ -4,7 +4,6 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 # Add src to path so we can import tasker
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -12,10 +11,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from tasker.parser import parse_task_file, find_next_task, update_markdown
 from tasker.log import IterationLog
 from tasker.models import IterationEntry, Actor, TaskStatus
-from tasker.ui import TaskerUI
 
 
 # ── 1. Test parser ────────────────────────────────────────────────
+
 
 def test_parser():
     sample = Path(__file__).parent / "fixtures" / "sample_tasks.md"
@@ -38,6 +37,7 @@ def test_parser():
 
 
 # ── 2. Test JSONL logger ─────────────────────────────────────────
+
 
 def test_logger():
     with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w") as f:
@@ -83,6 +83,7 @@ def test_logger():
 
 # ── 3. Test JSON extraction ──────────────────────────────────────
 
+
 def test_json_extraction():
     from tasker.goose import _extract_json_block
 
@@ -102,7 +103,7 @@ def test_json_extraction():
     assert result3 == {"status": "done"}
 
     # No JSON
-    text4 = 'Just plain text, no json here'
+    text4 = "Just plain text, no json here"
     result4 = _extract_json_block(text4)
     assert result4 is None
 
@@ -110,6 +111,7 @@ def test_json_extraction():
 
 
 # ── 4. Test update_markdown ──────────────────────────────────────
+
 
 def test_markdown_update():
     with tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w") as f:
@@ -144,6 +146,7 @@ def test_markdown_update():
 
 
 # ── 5. Test goose command builder ────────────────────────────────
+
 
 def test_command_builder():
     from tasker.goose import build_goose_command
@@ -193,6 +196,7 @@ def test_command_builder():
 
 # ── 6. Test models ───────────────────────────────────────────────
 
+
 def test_models():
     from tasker.models import DevRequest, DevResponse, QARequest, QAResponse
 
@@ -210,7 +214,9 @@ def test_models():
     assert params["dev_session_id"] == "dev_456"
     assert params["iteration"] == "1"
     assert params["feedback"] == ""  # empty on first iteration (always provided)
-    assert params["recovery_instruction"] == ""  # empty on first iteration (always provided)
+    assert (
+        params["recovery_instruction"] == ""
+    )  # empty on first iteration (always provided)
 
     # DevRequest with feedback
     req_fb = DevRequest(
@@ -288,7 +294,9 @@ def test_models():
     )
     qa_params_b = qa_req_blocked.to_params()
     assert qa_params_b["dev_blocked"] == "true"
-    assert qa_params_b["blocker_description"] == "No spec defines the config file format"
+    assert (
+        qa_params_b["blocker_description"] == "No spec defines the config file format"
+    )
 
     # QAResponse — approve
     qa_approve = QAResponse(decision="approve", feedback="Looks good")
@@ -309,6 +317,7 @@ def test_models():
 
     # UserChatRequest params generation
     from tasker.models import UserChatRequest
+
     chat_req = UserChatRequest(
         task_label="P1.T1",
         task_text="Create hello world",
@@ -320,10 +329,14 @@ def test_models():
     )
     chat_params = chat_req.to_params()
     assert chat_params["user_message"] == "Use REST with JSON"
-    assert chat_params["conversation_history"] == "👤 User: What API?\n🧪 QA: Not specified"
+    assert (
+        chat_params["conversation_history"]
+        == "👤 User: What API?\n🧪 QA: Not specified"
+    )
 
     # RecoveryStage enum
     from tasker.models import RecoveryStage
+
     assert RecoveryStage.NORMAL.max_attempts == 3
     assert RecoveryStage.CONTINUE.max_attempts == 3
     assert RecoveryStage.SUBTASK.max_attempts == 3
@@ -334,60 +347,85 @@ def test_models():
 
 # ── 7. Test parser strictness ────────────────────────────────────
 
+
 def test_parser_strictness():
     """Test that parsers return None on truly unparseable output (no guessing)."""
     from tasker.orchestrator import _parse_dev_response, _parse_qa_response
 
     # Valid dev response — done
-    assert _parse_dev_response(
-        '{"status": "done", "summary": "ok", "files_modified": []}',
-        {"status": "done", "summary": "ok", "files_modified": []},
-    ) is not None
+    assert (
+        _parse_dev_response(
+            '{"status": "done", "summary": "ok", "files_modified": []}',
+            {"status": "done", "summary": "ok", "files_modified": []},
+        )
+        is not None
+    )
 
     # Valid dev response — blocked
     resp = _parse_dev_response(
         '{"status": "blocked", "summary": "stuck", "files_modified": [], '
         '"blocker_description": "no spec", "blocker_suggestion": "ask user"}',
-        {"status": "blocked", "summary": "stuck", "files_modified": [],
-         "blocker_description": "no spec", "blocker_suggestion": "ask user"},
+        {
+            "status": "blocked",
+            "summary": "stuck",
+            "files_modified": [],
+            "blocker_description": "no spec",
+            "blocker_suggestion": "ask user",
+        },
     )
     assert resp is not None
     assert resp.status == "blocked"
     assert resp.blocker_description == "no spec"
 
     # Invalid dev response — unknown status
-    assert _parse_dev_response(
-        '{"status": "hmm", "summary": "???"}',
-        {"status": "hmm", "summary": "???"},
-    ) is None
+    assert (
+        _parse_dev_response(
+            '{"status": "hmm", "summary": "???"}',
+            {"status": "hmm", "summary": "???"},
+        )
+        is None
+    )
 
     # Invalid dev response — no status key at all
     assert _parse_dev_response("just text", None) is None
-    assert _parse_dev_response(
-        '{"summary": "ok but no status"}',
-        {"summary": "ok but no status"},
-    ) is None
+    assert (
+        _parse_dev_response(
+            '{"summary": "ok but no status"}',
+            {"summary": "ok but no status"},
+        )
+        is None
+    )
 
     # Valid QA response — approve
-    assert _parse_qa_response(
-        '{"decision": "approve", "feedback": "LGTM"}',
-        {"decision": "approve", "feedback": "LGTM"},
-    ) is not None
+    assert (
+        _parse_qa_response(
+            '{"decision": "approve", "feedback": "LGTM"}',
+            {"decision": "approve", "feedback": "LGTM"},
+        )
+        is not None
+    )
 
     # Valid QA response — needs_user_input
     resp2 = _parse_qa_response(
         '{"decision": "needs_user_input", "feedback": "need info", "user_question": "what?"}',
-        {"decision": "needs_user_input", "feedback": "need info", "user_question": "what?"},
+        {
+            "decision": "needs_user_input",
+            "feedback": "need info",
+            "user_question": "what?",
+        },
     )
     assert resp2 is not None
     assert resp2.decision == "needs_user_input"
     assert resp2.user_question == "what?"
 
     # Invalid QA response — unknown decision
-    assert _parse_qa_response(
-        '{"decision": "maybe", "feedback": "idk"}',
-        {"decision": "maybe", "feedback": "idk"},
-    ) is None
+    assert (
+        _parse_qa_response(
+            '{"decision": "maybe", "feedback": "idk"}',
+            {"decision": "maybe", "feedback": "idk"},
+        )
+        is None
+    )
 
     # Invalid QA response — no decision key
     assert _parse_qa_response("just text", None) is None
@@ -397,42 +435,63 @@ def test_parser_strictness():
 
 # ── 8. Test envelope extraction ──────────────────────────────────
 
+
 def test_envelope_extraction():
     """Test that the goose JSON envelope is properly unwrapped."""
     from tasker.goose import _extract_last_assistant_text
 
     # Valid envelope with assistant message
-    envelope = json.dumps({
-        "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "do task"}]},
-            {"role": "assistant", "content": [
-                {"type": "text", "text": 'I did it\n```json\n{"status": "done", "summary": "ok", "files_modified": []}\n```'}
-            ]},
-        ]
-    })
+    envelope = json.dumps(
+        {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "do task"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": 'I did it\n```json\n{"status": "done", "summary": "ok", "files_modified": []}\n```',
+                        }
+                    ],
+                },
+            ]
+        }
+    )
     result = _extract_last_assistant_text(envelope)
     assert '{"status": "done"' in result
     assert "I did it" in result
 
     # Envelope with multiple assistant messages
-    envelope2 = json.dumps({
-        "messages": [
-            {"role": "assistant", "content": [{"type": "text", "text": "thinking..."}]},
-            {"role": "assistant", "content": [{"type": "text", "text": '{"status": "done"}'}]},
-        ]
-    })
+    envelope2 = json.dumps(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "thinking..."}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": '{"status": "done"}'}],
+                },
+            ]
+        }
+    )
     result2 = _extract_last_assistant_text(envelope2)
     assert "thinking..." in result2
     assert '{"status": "done"}' in result2
 
     # Envelope with only user messages (goose errored before agent responded)
-    envelope_no_assistant = json.dumps({
-        "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "do task"}]},
-        ]
-    })
+    envelope_no_assistant = json.dumps(
+        {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "do task"}]},
+            ]
+        }
+    )
     result_no_asst = _extract_last_assistant_text(envelope_no_assistant)
-    assert result_no_asst == "", f"Expected empty string for envelope with no assistant messages, got: {result_no_asst!r}"
+    assert result_no_asst == "", (
+        f"Expected empty string for envelope with no assistant messages, got: {result_no_asst!r}"
+    )
 
     # Empty messages list
     envelope_empty = json.dumps({"messages": []})
@@ -447,6 +506,7 @@ def test_envelope_extraction():
 
 
 # ── 9. Test JJ module ────────────────────────────────────────────
+
 
 def test_jj_module():
     """Test the jj utility module functions."""
@@ -472,6 +532,7 @@ def test_jj_module():
 
 
 # ── 10. Test Task jj fields ─────────────────────────────────────
+
 
 def test_task_jj_fields():
     """Test that Task model has jj tracking fields."""
@@ -499,6 +560,7 @@ def test_task_jj_fields():
 
 
 # ── 11. Test QARequest with project_context ──────────────────────
+
 
 def test_qa_request_with_project_context():
     """Test that QARequest includes project_context in to_params()."""
@@ -540,20 +602,28 @@ def test_qa_request_with_project_context():
 
 # ── 12. Test GooseRunResult timed_out field ──────────────────────
 
+
 def test_goose_result_timed_out():
     """Test that GooseRunResult has timed_out field and defaults to False."""
     from tasker.goose import GooseRunResult
 
     # Default — not timed out
     result_ok = GooseRunResult(
-        success=True, raw_stdout="ok", raw_stderr="", return_code=0,
+        success=True,
+        raw_stdout="ok",
+        raw_stderr="",
+        return_code=0,
     )
     assert result_ok.timed_out is False
 
     # Explicit timed out
     result_timeout = GooseRunResult(
-        success=False, raw_stdout="", raw_stderr="TIMEOUT after 600s",
-        return_code=-1, duration_secs=600.5, timed_out=True,
+        success=False,
+        raw_stdout="",
+        raw_stderr="TIMEOUT after 600s",
+        return_code=-1,
+        duration_secs=600.5,
+        timed_out=True,
     )
     assert result_timeout.timed_out is True
     assert result_timeout.success is False
@@ -562,7 +632,9 @@ def test_goose_result_timed_out():
 
     print("✓ GooseRunResult timed_out tests passed")
 
+
 # ── 13. Test timeout feedback helper ─────────────────────────────
+
 
 def test_timeout_feedback():
     """Test that _timeout_feedback produces a useful message."""
@@ -582,7 +654,9 @@ def test_timeout_feedback():
 
     print("✓ Timeout feedback tests passed")
 
+
 # ── 14. Test subphase parsing ────────────────────────────────────
+
 
 def test_subphase_parsing():
     """Test that ### sub-headings are parsed and attached to tasks."""
@@ -624,6 +698,7 @@ def test_subphase_parsing():
 
 # ── 15. Test SessionScope enum ──────────────────────────────────
 
+
 def test_session_scope_enum():
     """Test SessionScope enum values."""
     from tasker.models import SessionScope
@@ -641,6 +716,7 @@ def test_session_scope_enum():
 
 # ── 16. Test scope key computation ───────────────────────────────
 
+
 def test_scope_key_computation():
     """Test _compute_scope_key produces correct keys for each scope level."""
     from tasker.models import SessionScope, Task
@@ -648,7 +724,11 @@ def test_scope_key_computation():
 
     # Task with subphase
     task = Task(
-        phase_index=0, task_index=2, text="Some task", subphase="P1-2 API Endpoints", subphase_index=0
+        phase_index=0,
+        task_index=2,
+        text="Some task",
+        subphase="P1-2 API Endpoints",
+        subphase_index=0,
     )
 
     # PHASE scope — only phase index matters
@@ -664,28 +744,47 @@ def test_scope_key_computation():
     task_no_sub = Task(phase_index=1, task_index=0, text="No subphase task")
 
     assert _compute_scope_key(task_no_sub, SessionScope.PHASE) == "P2"
-    assert _compute_scope_key(task_no_sub, SessionScope.SUBPHASE) == "P2"  # falls back to phase
+    assert (
+        _compute_scope_key(task_no_sub, SessionScope.SUBPHASE) == "P2"
+    )  # falls back to phase
     assert _compute_scope_key(task_no_sub, SessionScope.TASK) == "P2::T1"
 
     # Same scope key for tasks in the same subphase
-    task_a = Task(phase_index=0, task_index=0, text="A", subphase="P1-1 DB", subphase_index=0)
-    task_b = Task(phase_index=0, task_index=1, text="B", subphase="P1-1 DB", subphase_index=1)
-    assert _compute_scope_key(task_a, SessionScope.SUBPHASE) == _compute_scope_key(task_b, SessionScope.SUBPHASE)
+    task_a = Task(
+        phase_index=0, task_index=0, text="A", subphase="P1-1 DB", subphase_index=0
+    )
+    task_b = Task(
+        phase_index=0, task_index=1, text="B", subphase="P1-1 DB", subphase_index=1
+    )
+    assert _compute_scope_key(task_a, SessionScope.SUBPHASE) == _compute_scope_key(
+        task_b, SessionScope.SUBPHASE
+    )
     # Different TASK scope keys for different tasks in same subphase
-    assert _compute_scope_key(task_a, SessionScope.TASK) != _compute_scope_key(task_b, SessionScope.TASK)
+    assert _compute_scope_key(task_a, SessionScope.TASK) != _compute_scope_key(
+        task_b, SessionScope.TASK
+    )
 
     # Different scope keys for tasks in different subphases
-    task_c = Task(phase_index=0, task_index=2, text="C", subphase="P1-2 API", subphase_index=0)
-    assert _compute_scope_key(task_a, SessionScope.SUBPHASE) != _compute_scope_key(task_c, SessionScope.SUBPHASE)
+    task_c = Task(
+        phase_index=0, task_index=2, text="C", subphase="P1-2 API", subphase_index=0
+    )
+    assert _compute_scope_key(task_a, SessionScope.SUBPHASE) != _compute_scope_key(
+        task_c, SessionScope.SUBPHASE
+    )
 
     # Different scope keys for tasks in different phases
-    task_d = Task(phase_index=1, task_index=0, text="D", subphase="P1-1 DB", subphase_index=0)
-    assert _compute_scope_key(task_a, SessionScope.PHASE) != _compute_scope_key(task_d, SessionScope.PHASE)
+    task_d = Task(
+        phase_index=1, task_index=0, text="D", subphase="P1-1 DB", subphase_index=0
+    )
+    assert _compute_scope_key(task_a, SessionScope.PHASE) != _compute_scope_key(
+        task_d, SessionScope.PHASE
+    )
 
     print("✓ Scope key computation tests passed")
 
 
 # ── 17. Test backward compatibility (no subphases) ───────────────
+
 
 def test_backward_compat_no_subphases():
     """Test that files without ### headings still parse correctly."""
@@ -711,6 +810,7 @@ def test_backward_compat_no_subphases():
 
 # ── 18. Test Task.subphase field ────────────────────────────────
 
+
 def test_task_subphase_field():
     """Test that Task model has subphase field with correct default."""
     from tasker.models import Task
@@ -718,7 +818,13 @@ def test_task_subphase_field():
     task = Task(phase_index=0, task_index=0, text="Do something")
     assert task.subphase == ""  # default
 
-    task2 = Task(phase_index=0, task_index=1, text="Another", subphase="P1-1 Setup", subphase_index=0)
+    task2 = Task(
+        phase_index=0,
+        task_index=1,
+        text="Another",
+        subphase="P1-1 Setup",
+        subphase_index=0,
+    )
     assert task2.subphase == "P1-1 Setup"
 
     # subphase-aware label: short key from heading + local task index
@@ -726,7 +832,9 @@ def test_task_subphase_field():
 
     print("✓ Task subphase field tests passed")
 
+
 # ── 19. Test subphase-aware label derivation ────────────────────
+
 
 def test_subphase_labels():
     """Test that tasks under ### headings get meaningful labels derived from the heading."""
@@ -734,22 +842,31 @@ def test_subphase_labels():
 
     # Task with subphase "P1-4 · hay-grid — Pixel" → short key "P1-4"
     task = Task(
-        phase_index=0, task_index=24, text="Some pixel task",
-        subphase="P1-4 · hay-grid — Pixel", subphase_index=2,
+        phase_index=0,
+        task_index=24,
+        text="Some pixel task",
+        subphase="P1-4 · hay-grid — Pixel",
+        subphase_index=2,
     )
     assert task.label == "P1-4.T3"  # 3rd task (0-based index 2) under this ###
 
     # First task in a subphase
     task_first = Task(
-        phase_index=0, task_index=0, text="Setup DB",
-        subphase="P1-1 Database Setup", subphase_index=0,
+        phase_index=0,
+        task_index=0,
+        text="Setup DB",
+        subphase="P1-1 Database Setup",
+        subphase_index=0,
     )
     assert task_first.label == "P1-1.T1"
 
     # Second task in the same subphase
     task_second = Task(
-        phase_index=0, task_index=1, text="Run migrations",
-        subphase="P1-1 Database Setup", subphase_index=1,
+        phase_index=0,
+        task_index=1,
+        text="Run migrations",
+        subphase="P1-1 Database Setup",
+        subphase_index=1,
     )
     assert task_second.label == "P1-1.T2"
 
@@ -759,8 +876,11 @@ def test_subphase_labels():
 
     # Task with subphase="" and subphase_index=-1 — also flat fallback
     task_neg = Task(
-        phase_index=1, task_index=3, text="Orphan",
-        subphase="", subphase_index=-1,
+        phase_index=1,
+        task_index=3,
+        text="Orphan",
+        subphase="",
+        subphase_index=-1,
     )
     assert task_neg.label == "P2.T4"
 
@@ -790,6 +910,7 @@ def test_subphase_labels():
 
 # ── 20. Test VCSBackend protocol ───────────────────────────────
 
+
 def test_vcs_backend_protocol():
     """Test that both backends satisfy the VCSBackend protocol."""
     from tasker.vcs import VCSBackend, create_backend
@@ -816,6 +937,7 @@ def test_vcs_backend_protocol():
 
 
 # ── 21. Test Task VCS fields (base_ref / task_ref) ──────────────
+
 
 def test_task_vcs_fields():
     """Test that Task model uses VCS-agnostic base_ref / task_ref fields."""
@@ -857,6 +979,7 @@ def test_task_vcs_fields():
 
 # ── 22. Test backward-compatible jj re-exports ─────────────────
 
+
 def test_jj_reexports():
     """Test that tasker.jj re-exports all public symbols from vcs.jj_backend."""
     from tasker import jj as jj_mod
@@ -890,6 +1013,7 @@ def test_jj_reexports():
 
 # ── 23. Test git backend helper functions ───────────────────────
 
+
 def test_git_backend_helpers():
     """Test git backend helper functions."""
     from tasker.vcs.git_backend import _sanitize_branch_name, GitBackend
@@ -918,6 +1042,7 @@ def test_git_backend_helpers():
 
 # ── 24. Test git backend init validation ────────────────────────
 
+
 def test_git_backend_init_errors():
     """Test that GitBackend.init() raises on invalid states."""
     from tasker.vcs.git_backend import GitBackend
@@ -926,6 +1051,7 @@ def test_git_backend_init_errors():
 
     # Not a git repo — init should fail
     import tempfile
+
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
             backend.init(cwd=tmpdir)
@@ -937,6 +1063,7 @@ def test_git_backend_init_errors():
 
 
 # ── 25. Test VCSBackend create_backend factory ──────────────────
+
 
 def test_create_backend_types():
     """Test that create_backend returns the correct backend type."""
@@ -962,6 +1089,7 @@ def test_create_backend_types():
 
 # ── 26. Test JJBackend protocol compliance ──────────────────────
 
+
 def test_jj_backend_protocol():
     """Test JJBackend implements all VCSBackend protocol methods."""
     from tasker.vcs.jj_backend import JJBackend
@@ -969,11 +1097,11 @@ def test_jj_backend_protocol():
     backend = JJBackend()
 
     # Has all required methods
-    assert hasattr(backend, 'is_available')
-    assert hasattr(backend, 'init')
-    assert hasattr(backend, 'begin_task')
-    assert hasattr(backend, 'get_diff')
-    assert hasattr(backend, 'commit_task')
+    assert hasattr(backend, "is_available")
+    assert hasattr(backend, "init")
+    assert hasattr(backend, "begin_task")
+    assert hasattr(backend, "get_diff")
+    assert hasattr(backend, "commit_task")
 
     # All are callable
     assert callable(backend.is_available)
@@ -991,6 +1119,7 @@ def test_jj_backend_protocol():
 
 # ── 27. Test GitBackend protocol compliance ─────────────────────
 
+
 def test_git_backend_protocol():
     """Test GitBackend implements all VCSBackend protocol methods."""
     from tasker.vcs.git_backend import GitBackend
@@ -998,11 +1127,11 @@ def test_git_backend_protocol():
     backend = GitBackend()
 
     # Has all required methods
-    assert hasattr(backend, 'is_available')
-    assert hasattr(backend, 'init')
-    assert hasattr(backend, 'begin_task')
-    assert hasattr(backend, 'get_diff')
-    assert hasattr(backend, 'commit_task')
+    assert hasattr(backend, "is_available")
+    assert hasattr(backend, "init")
+    assert hasattr(backend, "begin_task")
+    assert hasattr(backend, "get_diff")
+    assert hasattr(backend, "commit_task")
 
     # All are callable
     assert callable(backend.is_available)
@@ -1020,6 +1149,7 @@ def test_git_backend_protocol():
 
 # ── 28. Test Task.vcs_description ───────────────────────────────
 
+
 def test_task_vcs_description():
     """Test vcs_description property on Task."""
     from tasker.models import Task
@@ -1029,8 +1159,11 @@ def test_task_vcs_description():
 
     # With subphase
     task2 = Task(
-        phase_index=0, task_index=5, text="Add grid cell",
-        subphase="P1-4 Grid System", subphase_index=2,
+        phase_index=0,
+        task_index=5,
+        text="Add grid cell",
+        subphase="P1-4 Grid System",
+        subphase_index=2,
     )
     assert task2.vcs_description == "P1-4.T3: Add grid cell"
 
