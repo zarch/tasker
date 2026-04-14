@@ -1170,6 +1170,90 @@ def test_task_vcs_description():
     print("✓ Task vcs_description tests passed")
 
 
+# ── 29. Test _finalize_task ordering invariant ────────────────────
+
+
+def test_finalize_task_ordering():
+    """Verify that _finalize_task marks done, updates markdown, THEN commits.
+
+    Regression test for the bug where _vcs_commit_task ran BEFORE
+    mark_task_done + update_markdown, causing [x] marks to live only as
+    unstaged working-tree changes that were never committed.
+    """
+    import tempfile
+    from unittest.mock import patch
+
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task
+
+    # Create a temp markdown file
+    with tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w") as f:
+        f.write("## Phase 1\n\n- [ ] Task A\n- [ ] Task B\n")
+        md_path = f.name
+
+    try:
+        # Build an orchestrator with minimal setup (no VCS needed — we mock it)
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as lf:
+            log_path = lf.name
+        try:
+            orch = Orchestrator(
+                task_file=md_path,
+                dev_recipe="/dev/null",
+                qa_recipe="/dev/null",
+                log_file=log_path,
+            )
+        finally:
+            Path(log_path).unlink(missing_ok=True)
+
+        # Parse the file to populate orch.phases
+        orch.phases = parse_task_file(md_path)
+        phase = orch.phases[0]
+        task = phase.tasks[0]  # Task A
+
+        assert not task.done
+        assert "- [ ] Task A" in Path(md_path).read_text()
+
+        # Track call order and verify markdown state at commit time
+        call_order: list[str] = []
+        commit_time_markdown: list[str] = []
+
+        original_vcs_commit = orch._vcs_commit_task
+
+        def spy_vcs_commit(t: Task) -> None:
+            call_order.append("vcs_commit")
+            # Capture the markdown content AT THE MOMENT the VCS commit runs
+            commit_time_markdown.append(Path(md_path).read_text())
+            original_vcs_commit(t)
+
+        with patch.object(orch, "_vcs_commit_task", side_effect=spy_vcs_commit):
+            with patch.object(orch, "ui"):
+                orch._finalize_task(phase, task)
+
+        # 1. Verify call order: vcs_commit was called (after mark+update)
+        assert "vcs_commit" in call_order, "vcs_commit should have been called"
+
+        # 2. Verify the markdown had [x] when VCS commit ran
+        assert len(commit_time_markdown) == 1
+        md_at_commit = commit_time_markdown[0]
+        assert "- [x] Task A" in md_at_commit, (
+            f"Expected [x] in markdown at VCS commit time, but got: {md_at_commit!r}"
+        )
+        assert "- [ ] Task B" in md_at_commit, (
+            "Only the approved task should be marked done"
+        )
+
+        # 3. Verify in-memory state
+        assert task.done is True
+
+        # 4. Verify the file on disk
+        content = Path(md_path).read_text()
+        assert "- [x] Task A" in content
+
+        print("✓ _finalize_task ordering invariant verified")
+    finally:
+        Path(md_path).unlink(missing_ok=True)
+
+
 # ── Run all ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1201,4 +1285,5 @@ if __name__ == "__main__":
     test_jj_backend_protocol()
     test_git_backend_protocol()
     test_task_vcs_description()
-    print("\n✅ All 28 dry-run tests passed!")
+    test_finalize_task_ordering()
+    print("\n✅ All 29 dry-run tests passed!")
