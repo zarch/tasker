@@ -5,7 +5,7 @@ from __future__ import annotations
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedColumn
 from rich.table import Table
 from rich.text import Text
 from rich.layout import Layout
@@ -36,8 +36,8 @@ class TaskerUI:
         )
 
         # Task IDs for progress bars (set during init_progress)
-        self._project_task_id: int = 0
-        self._phase_task_id: int = 0
+        self._project_task_id: TaskID = TaskID(0)
+        self._phase_task_id: TaskID = TaskID(0)
 
         # Accumulated iteration entries for the live table
         self._iteration_entries: list[IterationEntry] = []

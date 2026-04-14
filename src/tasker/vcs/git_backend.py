@@ -137,7 +137,7 @@ class GitBackend:
         """Check if git CLI is available."""
         return _run_git(["version"]).success
 
-    def init(self, cwd: str | None = None) -> None:
+    def init(self, cwd: Path | None = None) -> None:
         """Capture the current branch and commit as the starting base."""
         # Verify we're in a git repo
         repo_check = _run_git(["rev-parse", "--is-inside-work-tree"], cwd=cwd)
@@ -170,7 +170,7 @@ class GitBackend:
         self._base_commit = commit
         logger.info("Git init: base_branch=%s, base_commit=%s", branch, commit[:12])
 
-    def begin_task(self, task: Task, cwd: str | None = None) -> None:
+    def begin_task(self, task: Task, cwd: Path | None = None) -> None:
         """Create and checkout a feature branch for the task."""
         if not self._base_branch:
             return
@@ -206,7 +206,7 @@ class GitBackend:
                 f"Failed to create branch {branch_name!r}: {result.stderr}"
             )
 
-    def get_diff(self, task: Task, cwd: str | None = None) -> str:
+    def get_diff(self, task: Task, cwd: Path | None = None) -> str:
         """Return diff between base commit and the feature branch's working tree.
 
         This captures ALL changes on the feature branch, including uncommitted
@@ -227,7 +227,7 @@ class GitBackend:
 
         return ""
 
-    def commit_task(self, task: Task, cwd: str | None = None) -> None:
+    def commit_task(self, task: Task, cwd: Path | None = None) -> None:
         """Squash-merge the feature branch onto the base branch.
 
         Workflow:
@@ -246,7 +246,7 @@ class GitBackend:
 
         # Check if there are any changes to merge
         diff_check = _run_git(
-            ["diff", "--quiet", self._base_commit, feature_branch],
+            ["diff", "--quiet", self._base_commit or "HEAD", feature_branch],
             cwd=cwd,
         )
         has_changes = (

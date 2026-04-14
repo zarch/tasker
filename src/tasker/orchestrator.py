@@ -40,7 +40,7 @@ def _now_iso() -> str:
 
 
 def _parse_dev_response(raw: str, parsed: dict | None) -> DevResponse | None:
-    """Extract DevResponse from goose output. Returns None if unparseable."""
+    """Extract DevResponse from goose output. Returns None if unparsable."""
     if parsed and "status" in parsed:
         status = parsed["status"]
         if status not in ("done", "blocked"):
@@ -57,7 +57,7 @@ def _parse_dev_response(raw: str, parsed: dict | None) -> DevResponse | None:
 
 
 def _parse_qa_response(raw: str, parsed: dict | None) -> QAResponse | None:
-    """Extract QAResponse from goose output. Returns None if unparseable."""
+    """Extract QAResponse from goose output. Returns None if unparsable."""
     if parsed and "decision" in parsed:
         decision = parsed["decision"]
         if decision not in ("approve", "reject", "needs_user_input"):
@@ -411,7 +411,9 @@ class Orchestrator:
                 self.ui.print_warning(
                     f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during chat — continuing"
                 )
-                chat_qa_response = None  # will fall through to raw text display below
+                chat_qa_response = None
+                conversation_history += "🧪 QA: (timed out — no response)\n\n"
+                continue
             elif chat_qa_response is None:
                 # QA didn't return structured output in chat mode — show raw text
                 self.ui.print_qa_chat_message(
@@ -948,7 +950,7 @@ class Orchestrator:
                     concerns=["QA agent timed out during review"],
                 )
 
-            # QA returned unparseable output — treat as rejection with raw feedback
+            # QA returned unparsable output — treat as rejection with raw feedback
             if qa_response is None:
                 self.ui.print_warning(
                     f"[{task.label}] QA did not return valid JSON, treating as rejection."

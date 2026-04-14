@@ -94,7 +94,7 @@ class JJBackend:
         """Check if jj CLI is available."""
         return _run_jj(["version"]).success
 
-    def init(self, cwd: str | None = None) -> None:
+    def init(self, cwd: Path | None = None) -> None:
         """Capture the current change as the starting base."""
         current = _jj_get_current_change_id(cwd=cwd)
         if current:
@@ -102,7 +102,7 @@ class JJBackend:
         else:
             raise RuntimeError("Could not determine current jj change ID during init.")
 
-    def begin_task(self, task: Task, cwd: str | None = None) -> None:
+    def begin_task(self, task: Task, cwd: Path | None = None) -> None:
         """Create a new jj change for the task."""
         if not self._last_committed_change_id:
             return
@@ -120,7 +120,7 @@ class JJBackend:
             logger.error("Failed to create new task change: %s", result.stderr)
             raise RuntimeError(f"jj new failed: {result.stderr}")
 
-    def get_diff(self, task: Task, cwd: str | None = None) -> str:
+    def get_diff(self, task: Task, cwd: Path | None = None) -> str:
         """Get the diff from the task's base change to the working copy."""
         if not task.base_ref:
             return ""
@@ -129,7 +129,7 @@ class JJBackend:
             return result.stdout.strip()
         return ""
 
-    def commit_task(self, task: Task, cwd: str | None = None) -> None:
+    def commit_task(self, task: Task, cwd: Path | None = None) -> None:
         """Commit the current working-copy change (finalize task on QA approval)."""
         result = _run_jj(["commit", "-m", task.vcs_description], cwd=cwd)
 

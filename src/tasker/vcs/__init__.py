@@ -6,6 +6,7 @@ allowing the orchestrator to work with either version control system.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from ..models import Task
@@ -23,7 +24,7 @@ class VCSBackend(Protocol):
         """Check if the VCS tool is available in PATH."""
         ...
 
-    def init(self, cwd: str | None = None) -> None:
+    def init(self, cwd: Path | None = None) -> None:
         """Initialize the VCS state for the first task.
 
         Called once at orchestrator startup. Captures the current
@@ -32,7 +33,7 @@ class VCSBackend(Protocol):
         """
         ...
 
-    def begin_task(self, task: Task, cwd: str | None = None) -> None:
+    def begin_task(self, task: Task, cwd: Path | None = None) -> None:
         """Create an isolated workspace for a task.
 
         Sets task.base_ref and task.task_ref with VCS-specific
@@ -40,14 +41,14 @@ class VCSBackend(Protocol):
         """
         ...
 
-    def get_diff(self, task: Task, cwd: str | None = None) -> str:
+    def get_diff(self, task: Task, cwd: Path | None = None) -> str:
         """Return the diff for the current task's changes.
 
         Used to inject context into QA prompts.
         """
         ...
 
-    def commit_task(self, task: Task, cwd: str | None = None) -> None:
+    def commit_task(self, task: Task, cwd: Path | None = None) -> None:
         """Finalize the task's changes as a permanent commit.
 
         Called when QA approves (or user skips a blocked task).

@@ -315,8 +315,8 @@ Recipe parameters are passed via `--params` and substituted into the `prompt:` t
 |-----------|-------------|
 | **Dev returns `status: "blocked"`** | Blocker info sent to QA for triage. QA can guide dev, request user input, or approve. |
 | **QA returns `needs_user_input`** | Interactive chat mode: user types answers, QA processes them until resolved. |
-| **Dev returns unparseable output** | Graceful degradation: 1× normal → 3× continue → 3× subtask → 3× summarize → synthetic blocked → QA triage. |
-| **QA returns unparseable output** | Treated as rejection with raw text as feedback. |
+| **Dev returns unparsable output** | Graceful degradation: 1× normal → 3× continue → 3× subtask → 3× summarize → synthetic blocked → QA triage. |
+| **QA returns unparsable output** | Treated as rejection with raw text as feedback. |
 | **Dev subprocess crashes** | Logged as error, retried within current recovery stage. (Timeouts are handled separately — see below.) |
 | **Max QA↔Dev iterations reached** | Task is skipped (not marked done — will retry on next run). |
 | **Max chat turns reached** | Best-effort continue — pipeline resumes. |

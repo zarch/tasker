@@ -349,7 +349,7 @@ def test_models():
 
 
 def test_parser_strictness():
-    """Test that parsers return None on truly unparseable output (no guessing)."""
+    """Test that parsers return None on truly unparsable output (no guessing)."""
     from tasker.orchestrator import _parse_dev_response, _parse_qa_response
 
     # Valid dev response — done
@@ -1054,7 +1054,7 @@ def test_git_backend_init_errors():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            backend.init(cwd=tmpdir)
+            backend.init(cwd=Path(tmpdir))
             assert False, "Should have raised RuntimeError"
         except RuntimeError as exc:
             assert "git" in str(exc).lower() or "repository" in str(exc).lower()
