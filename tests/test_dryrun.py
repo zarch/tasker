@@ -568,6 +568,148 @@ def test_timeout_feedback():
 
     print("✓ Timeout feedback tests passed")
 
+# ── 14. Test subphase parsing ────────────────────────────────────
+
+def test_subphase_parsing():
+    """Test that ### sub-headings are parsed and attached to tasks."""
+    sample = Path(__file__).parent / "fixtures" / "subphase_tasks.md"
+    phases = parse_task_file(sample)
+
+    # Should still be 2 phases (## headings)
+    assert len(phases) == 2
+    assert phases[0].title == "Phase 1 — Core Backend"
+    assert phases[1].title == "Phase 2 — Frontend"
+
+    # Phase 1 should have 5 tasks total
+    assert phases[0].total == 5
+
+    # Check subphase assignment on tasks
+    # P1-1 tasks
+    assert phases[0].tasks[0].subphase == "P1-1 Database Setup"
+    assert phases[0].tasks[1].subphase == "P1-1 Database Setup"
+    assert phases[0].tasks[2].subphase == "P1-1 Database Setup"
+    # P1-2 tasks
+    assert phases[0].tasks[3].subphase == "P1-2 API Endpoints"
+    assert phases[0].tasks[4].subphase == "P1-2 API Endpoints"
+
+    # Phase 2 tasks
+    assert phases[1].tasks[0].subphase == "P2-1 Components"
+    assert phases[1].tasks[1].subphase == "P2-1 Components"
+    assert phases[1].tasks[2].subphase == "P2-2 Integration"
+    assert phases[1].tasks[3].subphase == "P2-2 Integration"
+
+    # Check the done task is correctly parsed
+    assert phases[1].tasks[3].done is True
+
+    # Phase subphase should reflect the first ### heading
+    assert phases[0].subphase == "P1-1 Database Setup"
+    assert phases[1].subphase == "P2-1 Components"
+
+    print("✓ Subphase parsing tests passed")
+
+
+# ── 15. Test SessionScope enum ──────────────────────────────────
+
+def test_session_scope_enum():
+    """Test SessionScope enum values."""
+    from tasker.models import SessionScope
+
+    assert SessionScope.PHASE.value == "phase"
+    assert SessionScope.SUBPHASE.value == "subphase"
+    assert SessionScope.TASK.value == "task"
+
+    # Can construct from string
+    scope = SessionScope("subphase")
+    assert scope is SessionScope.SUBPHASE
+
+    print("✓ SessionScope enum tests passed")
+
+
+# ── 16. Test scope key computation ───────────────────────────────
+
+def test_scope_key_computation():
+    """Test _compute_scope_key produces correct keys for each scope level."""
+    from tasker.models import SessionScope, Task
+    from tasker.orchestrator import _compute_scope_key
+
+    # Task with subphase
+    task = Task(
+        phase_index=0, task_index=2, text="Some task", subphase="P1-2 API Endpoints"
+    )
+
+    # PHASE scope — only phase index matters
+    assert _compute_scope_key(task, SessionScope.PHASE) == "P1"
+
+    # SUBPHASE scope — phase + subphase
+    assert _compute_scope_key(task, SessionScope.SUBPHASE) == "P1::P1-2 API Endpoints"
+
+    # TASK scope — phase + subphase + task index
+    assert _compute_scope_key(task, SessionScope.TASK) == "P1::P1-2 API Endpoints::T3"
+
+    # Task without subphase (e.g., sample_tasks.md which has no ### headings)
+    task_no_sub = Task(phase_index=1, task_index=0, text="No subphase task")
+
+    assert _compute_scope_key(task_no_sub, SessionScope.PHASE) == "P2"
+    assert _compute_scope_key(task_no_sub, SessionScope.SUBPHASE) == "P2"  # falls back to phase
+    assert _compute_scope_key(task_no_sub, SessionScope.TASK) == "P2::T1"
+
+    # Same scope key for tasks in the same subphase
+    task_a = Task(phase_index=0, task_index=0, text="A", subphase="P1-1 DB")
+    task_b = Task(phase_index=0, task_index=1, text="B", subphase="P1-1 DB")
+    assert _compute_scope_key(task_a, SessionScope.SUBPHASE) == _compute_scope_key(task_b, SessionScope.SUBPHASE)
+
+    # Different scope keys for tasks in different subphases
+    task_c = Task(phase_index=0, task_index=2, text="C", subphase="P1-2 API")
+    assert _compute_scope_key(task_a, SessionScope.SUBPHASE) != _compute_scope_key(task_c, SessionScope.SUBPHASE)
+
+    # Different scope keys for tasks in different phases
+    task_d = Task(phase_index=1, task_index=0, text="D", subphase="P1-1 DB")
+    assert _compute_scope_key(task_a, SessionScope.PHASE) != _compute_scope_key(task_d, SessionScope.PHASE)
+
+    print("✓ Scope key computation tests passed")
+
+
+# ── 17. Test backward compatibility (no subphases) ───────────────
+
+def test_backward_compat_no_subphases():
+    """Test that files without ### headings still parse correctly."""
+    sample = Path(__file__).parent / "fixtures" / "sample_tasks.md"
+    phases = parse_task_file(sample)
+
+    # Should be 2 phases, 5 tasks total
+    assert len(phases) == 2
+    assert phases[0].total == 3
+    assert phases[1].total == 2
+
+    # No subphases — all tasks should have empty subphase
+    for phase in phases:
+        for task in phase.tasks:
+            assert task.subphase == ""
+
+    # Phase.subphase should also be empty
+    assert phases[0].subphase == ""
+    assert phases[1].subphase == ""
+
+    print("✓ Backward compatibility tests passed")
+
+
+# ── 18. Test Task.subphase field ────────────────────────────────
+
+def test_task_subphase_field():
+    """Test that Task model has subphase field with correct default."""
+    from tasker.models import Task
+
+    task = Task(phase_index=0, task_index=0, text="Do something")
+    assert task.subphase == ""  # default
+
+    task2 = Task(phase_index=0, task_index=1, text="Another", subphase="P1-1 Setup")
+    assert task2.subphase == "P1-1 Setup"
+
+    # subphase doesn't affect label
+    assert task2.label == "P1.T2"
+
+    print("✓ Task subphase field tests passed")
+
 # ── Run all ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -584,4 +726,9 @@ if __name__ == "__main__":
     test_qa_request_with_project_context()
     test_goose_result_timed_out()
     test_timeout_feedback()
-    print("\n✅ All 13 dry-run tests passed!")
+    test_subphase_parsing()
+    test_session_scope_enum()
+    test_scope_key_computation()
+    test_backward_compat_no_subphases()
+    test_task_subphase_field()
+    print("\n✅ All 17 dry-run tests passed!")
