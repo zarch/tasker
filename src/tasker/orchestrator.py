@@ -19,6 +19,7 @@ from .models import (
     QAResponse,
     QARequest,
     RecoveryStage,
+    SessionScope,
     Task,
     TaskStatus,
     UserChatRequest,
@@ -114,6 +115,24 @@ def _timeout_feedback(actor: str, timeout_secs: int) -> str:
     )
 
 
+def _compute_scope_key(task: Task, scope: SessionScope) -> str:
+    """Compute a scope key for a task based on the session scope setting.
+
+    phase    → "P1"
+    subphase → "P1::P1-1 Core" (or "P1" if no subphase)
+    task     → "P1::P1-1 Core::T3" (or "P1::T3" if no subphase)
+    """
+    phase_key = f"P{task.phase_index + 1}"
+    if scope == SessionScope.PHASE:
+        return phase_key
+    if scope == SessionScope.SUBPHASE:
+        return f"{phase_key}::{task.subphase}" if task.subphase else phase_key
+    # TASK — include subphase if present for consistent ordering
+    if task.subphase:
+        return f"{phase_key}::{task.subphase}::T{task.task_index + 1}"
+    return f"{phase_key}::T{task.task_index + 1}"
+
+
 
 class Orchestrator:
     """Drives the QA → Dev → QA loop for all tasks in the task file."""
@@ -132,6 +151,8 @@ class Orchestrator:
         cwd: str | Path | None = None,
         start_phase: int | None = None,
         enable_jj: bool = False,
+        session_scope: SessionScope = SessionScope.SUBPHASE,
+        force_new_session: bool = False,
     ) -> None:
         self.task_file = Path(task_file)
         self.dev_recipe = Path(dev_recipe)
@@ -148,7 +169,13 @@ class Orchestrator:
 
         # JJ (Jujutsu) integration
         self.enable_jj = enable_jj
-        self._last_committed_change_id: str | None = None  # tracks the last committed task's change ID — generated once, reused across all tasks.
+        self._last_committed_change_id: str | None = None
+
+        # Session scope — controls when new goose sessions are created
+        self.session_scope = session_scope
+        self._current_scope_key: str = ""  # tracks the current scope boundary
+        self._force_new_session = force_new_session  # one-shot flag
+
         # goose run uses --name for session persistence and auto-resumes
         # when the same name is used again.
         self.dev_session_name = _generate_session_id("dev")
@@ -163,6 +190,7 @@ class Orchestrator:
         """Main entry point — run all tasks."""
         self.ui.print_info(f"Developer session: {self.dev_session_name}")
         self.ui.print_info(f"QA session:       {self.qa_session_name}")
+        self.ui.print_info(f"Session scope:    {self.session_scope.value}")
         self.ui.print_info(f"Iteration log:    {self.log._path}")
         self.ui.print_info("")
 
@@ -242,8 +270,51 @@ class Orchestrator:
                 f"{'='*60}"
             )
 
+            # Rotate sessions if scope boundary changed or --new-session was set
+            self._maybe_rotate_session(task)
+
             # Run the QA→Dev loop for this task
             self._process_task(phase, task)
+
+    def _maybe_rotate_session(self, task: Task) -> None:
+        """Rotate dev/qa session IDs when the scope boundary changes.
+
+        Generates new session names when:
+        - The scope key (phase/subphase/task) differs from the previous task, OR
+        - The user passed ``--new-session`` (one-shot, resets after firing).
+
+        When scope is PHASE, all tasks within the same ## heading share a session.
+        When scope is SUBPHASE (default), tasks share a session within each ### group.
+        When scope is TASK, every task gets a fresh session.
+        """
+        scope_key = _compute_scope_key(task, self.session_scope)
+        should_rotate = False
+
+        if self._force_new_session:
+            should_rotate = True
+            self._force_new_session = False  # one-shot
+            self.ui.print_info(
+                f"[{task.label}] Forcing new session (--new-session)"
+            )
+        elif scope_key != self._current_scope_key:
+            should_rotate = True
+            if self._current_scope_key:
+                self.ui.print_info(
+                    f"[{task.label}] Session scope changed: "
+                    f"{self._current_scope_key} → {scope_key} — rotating sessions"
+                )
+
+        if should_rotate:
+            self.dev_session_name = _generate_session_id("dev")
+            self.qa_session_name = _generate_session_id("qa")
+            self.ui.print_info(
+                f"[{task.label}] New dev session: {self.dev_session_name}"
+            )
+            self.ui.print_info(
+                f"[{task.label}] New QA session:  {self.qa_session_name}"
+            )
+
+        self._current_scope_key = scope_key
 
     def _interactive_chat_loop(
         self,

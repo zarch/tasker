@@ -13,6 +13,7 @@ import typer
 from rich.console import Console
 
 from .orchestrator import Orchestrator
+from .models import SessionScope
 
 # Default recipes shipped with tasker, resolved relative to this file.
 _RECIPES_DIR = Path(__file__).resolve().parent.parent.parent / "recipes"
@@ -92,8 +93,27 @@ def main(
         "--jj",
         help="Enable Jujutsu (jj) integration for task-scoped version control.",
     ),
+    session_scope: str = typer.Option(
+        "subphase",
+        "--session-scope",
+        help="When to rotate goose sessions: phase (per ## heading), subphase (per ### heading, default), or task (per task).",
+    ),
+    new_session: bool = typer.Option(
+        False,
+        "--new-session",
+        help="Force creation of a new goose session on the next task (one-shot).",
+    ),
 ) -> None:
     """Run the QA/Dev orchestrator on a markdown task list."""
+    # Validate session scope
+    valid_scopes = {s.value for s in SessionScope}
+    if session_scope not in valid_scopes:
+        console.print(
+            f"[bold red]Error:[/bold red] Invalid --session-scope '{session_scope}'. "
+            f"Must be one of: {', '.join(sorted(valid_scopes))}"
+        )
+        raise typer.Exit(1)
+
     # Validate recipe paths (typer's exists=True doesn't work with dynamic defaults)
     for label, path in [("Developer", dev), ("QA", qa)]:
         if not path.exists():
@@ -126,6 +146,8 @@ def main(
         cwd=cwd,
         start_phase=start_phase,
         enable_jj=jj,
+        session_scope=SessionScope(session_scope),
+        force_new_session=new_session,
     )
 
     orchestrator.run()
