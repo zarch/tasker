@@ -12,6 +12,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from .monitoring import setup_monitoring
 from .orchestrator import Orchestrator
 from .models import SessionScope
 
@@ -103,6 +104,31 @@ def main(
         "--new-session",
         help="Force creation of a new goose session on the next task (one-shot).",
     ),
+    monitor_log: Path = typer.Option(
+        None,
+        "--monitor-log",
+        help=(
+            "Path for the structured monitor log file (default: tasker.log in the "
+            "task file's parent directory). Captures orchestration decisions, "
+            "recovery escalations, session rotations, VCS ops, subprocess launches, "
+            "and parser events. Use --no-monitor-log to disable file logging."
+        ),
+    ),
+    no_monitor_log: bool = typer.Option(
+        False,
+        "--no-monitor-log",
+        help="Disable the monitor log file (only console output).",
+    ),
+    log_level: str = typer.Option(
+        "WARNING",
+        "--log-level",
+        help="Minimum log level for console (stderr) output. One of: debug, info, warning, error, critical. Default: WARNING (quiet terminal).",
+    ),
+    file_log_level: str = typer.Option(
+        "DEBUG",
+        "--file-log-level",
+        help="Minimum log level for the monitor log file. One of: debug, info, warning, error, critical. Default: DEBUG (capture everything).",
+    ),
 ) -> None:
     """Run the QA/Dev orchestrator on a markdown task list."""
     # Validate session scope
@@ -128,6 +154,22 @@ def main(
     # Default cwd to the task file's parent so goose agents operate
     # in the correct project context.
     cwd = task_file.resolve().parent
+
+    # ── Configure structured monitoring log ──────────────────────
+    if no_monitor_log:
+        monitor_log_path = None
+    elif monitor_log:
+        monitor_log_path = monitor_log
+    else:
+        monitor_log_path = cwd / "tasker.log"
+
+    try:
+        setup_monitoring(
+            monitor_log_path, console_level=log_level, file_level=file_log_level
+        )
+    except ValueError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(1)
 
     # Resolve recipe paths to absolute so goose can find them regardless of cwd
     dev_abs = dev.resolve()

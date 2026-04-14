@@ -1254,6 +1254,392 @@ def test_finalize_task_ordering():
         Path(md_path).unlink(missing_ok=True)
 
 
+# ── 30. Test monitoring setup ───────────────────────────────────
+
+
+def test_monitoring_setup():
+    """Test that setup_monitoring configures structlog correctly."""
+    import structlog
+    import logging
+    from tasker.monitoring import setup_monitoring
+    import tasker.monitoring as mon
+
+    # Reset module state for testing
+    mon._configured = False
+    structlog.reset_defaults()
+    root = logging.getLogger()
+    root.handlers.clear()
+
+    # Setup with a temp file
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        log_path = f.name
+
+    try:
+        setup_monitoring(log_path)
+
+        # Should now be configured
+        assert mon._configured is True
+
+        # Root logger should have handlers
+        root = logging.getLogger()
+        assert len(root.handlers) >= 1  # at least console
+
+        # File handler should exist
+        file_handlers = [
+            h
+            for h in root.handlers
+            if hasattr(h, "baseFilename") and log_path in getattr(h, "baseFilename", "")
+        ]
+        assert len(file_handlers) == 1, (
+            f"Expected 1 file handler for {log_path}, got {len(file_handlers)}"
+        )
+
+        # Verify the file was created
+        assert Path(log_path).exists()
+
+        print("✓ Monitoring setup tests passed")
+    finally:
+        Path(log_path).unlink(missing_ok=True)
+        mon._configured = False
+        structlog.reset_defaults()
+        logging.getLogger().handlers.clear()
+
+
+# ── 31. Test monitoring file output ──────────────────────────────
+
+
+def test_monitoring_file_output():
+    """Test that structlog events actually appear in the monitor log file."""
+    import structlog
+    import logging
+    from tasker.monitoring import setup_monitoring
+    import tasker.monitoring as mon
+
+    mon._configured = False
+    structlog.reset_defaults()
+    logging.getLogger().handlers.clear()
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        log_path = f.name
+
+    try:
+        setup_monitoring(log_path)
+
+        logger = structlog.get_logger("test_monitor")
+        logger.info("test.event", key="value", number=42)
+
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        content = Path(log_path).read_text(encoding="utf-8")
+        assert "test.event" in content
+        assert "key=value" in content
+        assert "number=42" in content
+        assert "info" in content.lower()
+
+        print("✓ Monitoring file output tests passed")
+    finally:
+        Path(log_path).unlink(missing_ok=True)
+        mon._configured = False
+        structlog.reset_defaults()
+        logging.getLogger().handlers.clear()
+
+
+# ── 32. Test monitoring idempotent ───────────────────────────────
+
+
+def test_monitoring_idempotent():
+    """Test that calling setup_monitoring twice is a no-op."""
+    import structlog
+    import logging
+    from tasker.monitoring import setup_monitoring
+    import tasker.monitoring as mon
+
+    mon._configured = False
+    structlog.reset_defaults()
+    logging.getLogger().handlers.clear()
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        log_path = f.name
+
+    try:
+        setup_monitoring(log_path)
+        handler_count_1 = len(logging.getLogger().handlers)
+
+        setup_monitoring(log_path)
+        handler_count_2 = len(logging.getLogger().handlers)
+
+        assert handler_count_1 == handler_count_2, (
+            f"setup_monitoring should be idempotent: {handler_count_1} != {handler_count_2}"
+        )
+
+        print("✓ Monitoring idempotent tests passed")
+    finally:
+        Path(log_path).unlink(missing_ok=True)
+        mon._configured = False
+        structlog.reset_defaults()
+        logging.getLogger().handlers.clear()
+
+
+# ── 33. Test get_logger convenience ─────────────────────────────
+
+
+def test_monitoring_get_logger():
+    """Test that get_logger returns a usable structlog logger."""
+    import structlog
+    import logging
+    from tasker.monitoring import setup_monitoring, get_logger
+    import tasker.monitoring as mon
+
+    mon._configured = False
+    structlog.reset_defaults()
+    logging.getLogger().handlers.clear()
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        log_path = f.name
+
+    try:
+        setup_monitoring(log_path)
+
+        logger1 = get_logger("my.module")
+        assert logger1 is not None
+        logger1.info("test.named_logger", module="my.module")
+
+        logger2 = get_logger(None)
+        assert logger2 is not None
+        logger2.info("test.default_logger")
+
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        content = Path(log_path).read_text(encoding="utf-8")
+        assert "test.named_logger" in content
+        assert "test.default_logger" in content
+
+        print("✓ get_logger tests passed")
+    finally:
+        Path(log_path).unlink(missing_ok=True)
+        mon._configured = False
+        structlog.reset_defaults()
+        logging.getLogger().handlers.clear()
+
+
+# ── 34. Test parser events captured in monitor log ───────────────
+
+
+def test_monitoring_parser_captured():
+    """Test that parser.py log events are captured in the monitor log."""
+    import structlog
+    import logging
+    from tasker.monitoring import setup_monitoring
+    import tasker.monitoring as mon
+
+    mon._configured = False
+    structlog.reset_defaults()
+    logging.getLogger().handlers.clear()
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        log_path = f.name
+
+    try:
+        setup_monitoring(log_path)
+
+        sample = Path(__file__).parent / "fixtures" / "sample_tasks.md"
+        parse_task_file(sample)
+
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        content = Path(log_path).read_text(encoding="utf-8")
+        assert "parser.parsed" in content, (
+            f"Expected 'parser.parsed' in log, got:\n{content}"
+        )
+        assert "phases=2" in content
+        assert "tasks=5" in content
+
+        print("✓ Parser events captured tests passed")
+    finally:
+        Path(log_path).unlink(missing_ok=True)
+        mon._configured = False
+        structlog.reset_defaults()
+        logging.getLogger().handlers.clear()
+
+
+# ── 35. Test orchestrator events captured in monitor log ──────────
+
+
+def test_monitoring_orchestrator_events_captured():
+    """Test that orchestrator.py log events (task lifecycle) are captured."""
+    import structlog
+    import logging
+    from tasker.monitoring import setup_monitoring
+    from tasker.orchestrator import Orchestrator
+    from unittest.mock import patch
+    import tasker.monitoring as mon
+
+    mon._configured = False
+    structlog.reset_defaults()
+    logging.getLogger().handlers.clear()
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        log_path = f.name
+    with tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w") as f:
+        f.write("## Phase 1\n\n- [ ] Task A\n- [ ] Task B\n")
+        md_path = f.name
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+        iter_log_path = f.name
+
+    try:
+        setup_monitoring(log_path)
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=iter_log_path,
+        )
+        orch.phases = parse_task_file(md_path)
+
+        phase = orch.phases[0]
+        task = phase.tasks[0]
+
+        with patch.object(orch, "ui"):
+            with patch.object(orch, "_vcs_commit_task"):
+                orch._finalize_task(phase, task)
+
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        content = Path(log_path).read_text(encoding="utf-8")
+        assert "task.finalizing" in content, (
+            f"Expected 'task.finalizing' in log, got:\n{content}"
+        )
+        assert "task.markdown_updated" in content
+        assert "task.finalized" in content
+        assert "P1.T1" in content
+
+        print("✓ Orchestrator events captured tests passed")
+    finally:
+        Path(log_path).unlink(missing_ok=True)
+        Path(md_path).unlink(missing_ok=True)
+        Path(iter_log_path).unlink(missing_ok=True)
+        mon._configured = False
+        structlog.reset_defaults()
+        logging.getLogger().handlers.clear()
+
+
+# ── 36. Test _resolve_level helper ────────────────────────────────
+
+
+def test_resolve_level():
+    """Test that _resolve_level maps names to stdlib logging constants."""
+    import logging
+    from tasker.monitoring import _resolve_level
+
+    assert _resolve_level("debug") == logging.DEBUG
+    assert _resolve_level("DEBUG") == logging.DEBUG
+    assert _resolve_level("info") == logging.INFO
+    assert _resolve_level("INFO") == logging.INFO
+    assert _resolve_level("warning") == logging.WARNING
+    assert _resolve_level("warn") == logging.WARNING
+    assert _resolve_level("WARN") == logging.WARNING
+    assert _resolve_level("error") == logging.ERROR
+    assert _resolve_level("critical") == logging.CRITICAL
+    assert _resolve_level("crit") == logging.CRITICAL
+    assert _resolve_level("  debug  ") == logging.DEBUG  # whitespace trimmed
+
+    # Unknown level raises ValueError
+    try:
+        _resolve_level("trace")
+        assert False, "Should have raised ValueError for unknown level"
+    except ValueError as exc:
+        assert "trace" in str(exc)
+
+    print("✓ _resolve_level tests passed")
+
+
+# ── 37. Test log-level filtering (file vs console) ──────────────
+
+
+def test_monitoring_log_levels():
+    """Test that console_level and file_level independently filter output."""
+    import structlog
+    import logging
+    from tasker.monitoring import setup_monitoring
+    import tasker.monitoring as mon
+
+    mon._configured = False
+    structlog.reset_defaults()
+    logging.getLogger().handlers.clear()
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        file_log = f.name
+
+    try:
+        # File: DEBUG (captures everything). Console: ERROR (only errors).
+        setup_monitoring(file_log, console_level="ERROR", file_level="DEBUG")
+
+        log = structlog.get_logger("test.levels")
+        log.debug("should_be_in_file_only")
+        log.info("also_file_only")
+        log.warning("still_file_only")
+        log.error("in_both_file_and_console")
+
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        # File should have all four messages
+        file_content = Path(file_log).read_text(encoding="utf-8")
+        assert "should_be_in_file_only" in file_content
+        assert "also_file_only" in file_content
+        assert "still_file_only" in file_content
+        assert "in_both_file_and_console" in file_content
+
+        print("✓ Log level filtering tests passed")
+    finally:
+        Path(file_log).unlink(missing_ok=True)
+        mon._configured = False
+        structlog.reset_defaults()
+        logging.getLogger().handlers.clear()
+
+
+# ── 38. Test invalid log level raises ValueError ─────────────────
+
+
+def test_monitoring_invalid_level():
+    """Test that an invalid log level raises ValueError from setup_monitoring."""
+    import structlog
+    import logging
+    from tasker.monitoring import setup_monitoring
+    import tasker.monitoring as mon
+
+    mon._configured = False
+    structlog.reset_defaults()
+    logging.getLogger().handlers.clear()
+
+    try:
+        setup_monitoring(None, console_level="TRACE")
+        assert False, "Should have raised ValueError"
+    except ValueError as exc:
+        assert "TRACE" in str(exc)
+
+    # Reset after the failed call — _configured was NOT set on ValueError
+    mon._configured = False
+
+    # File level also validated
+    try:
+        setup_monitoring(None, file_level="verbose")
+        assert False, "Should have raised ValueError"
+    except ValueError as exc:
+        assert "verbose" in str(exc)
+
+    mon._configured = False
+    structlog.reset_defaults()
+    logging.getLogger().handlers.clear()
+
+    print("✓ Invalid log level tests passed")
+
+
 # ── Run all ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1286,4 +1672,13 @@ if __name__ == "__main__":
     test_git_backend_protocol()
     test_task_vcs_description()
     test_finalize_task_ordering()
-    print("\n✅ All 29 dry-run tests passed!")
+    test_monitoring_setup()
+    test_monitoring_file_output()
+    test_monitoring_idempotent()
+    test_monitoring_get_logger()
+    test_monitoring_parser_captured()
+    test_monitoring_orchestrator_events_captured()
+    test_resolve_level()
+    test_monitoring_log_levels()
+    test_monitoring_invalid_level()
+    print("\n✅ All 38 dry-run tests passed!")

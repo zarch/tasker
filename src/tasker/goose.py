@@ -10,6 +10,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import structlog
+
+
+log = structlog.get_logger(__name__)
+
 
 @dataclass
 class GooseRunResult:
@@ -160,6 +165,18 @@ def run_goose(
         provider=provider,
     )
 
+    log.debug(
+        "goose.launching",
+        session=session_name,
+        recipe=str(recipe_path),
+        max_turns=max_turns,
+        timeout_secs=timeout_secs,
+        model=model,
+        provider=provider,
+        cwd=str(cwd) if cwd else None,
+        param_keys=list(params.keys()) if params else [],
+    )
+
     # Merge required env vars with the current process environment
     env = os.environ.copy()
     env["GOOSE_CONTEXT_STRATEGY"] = "summarize"
@@ -188,6 +205,16 @@ def run_goose(
             assistant_text = _extract_last_assistant_text(stdout)
             parsed = _extract_json_block(assistant_text)
 
+            log.info(
+                "goose.completed",
+                session=session_name,
+                return_code=proc.returncode,
+                duration_secs=round(duration, 2),
+                parsed=bool(parsed),
+                stdout_len=len(assistant_text),
+                stderr_len=len(stderr),
+            )
+
             return GooseRunResult(
                 success=proc.returncode == 0,
                 raw_stdout=assistant_text,
@@ -200,6 +227,12 @@ def run_goose(
         except subprocess.TimeoutExpired:
             # Kill the entire process group (goose + any child processes)
             duration = time.monotonic() - start
+            log.warning(
+                "goose.timeout",
+                session=session_name,
+                timeout_secs=timeout_secs,
+                duration_secs=round(duration, 2),
+            )
             try:
                 os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
             except (ProcessLookupError, OSError):
@@ -219,6 +252,7 @@ def run_goose(
             )
     except Exception as exc:
         duration = time.monotonic() - start
+        log.error("goose.launch_failed", session=session_name, error=str(exc))
         return GooseRunResult(
             success=False,
             raw_stdout="",

@@ -12,7 +12,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import structlog
+
 from .models import Phase, Task
+
+log = structlog.get_logger(__name__)
 
 
 _PHASE_RE = re.compile(r"^##\s+(?:Phase\s+)?(\d+)[^\n]*$", re.IGNORECASE)
@@ -39,6 +43,8 @@ def parse_task_file(path: str | Path) -> list[Phase]:
     current_subphase: str = ""  # tracks the latest ### heading text within a phase
     subphase_task_counter: int = 0  # 0-based task index within current ### group
     task_counter = 0
+
+    log.debug("parser.parsing", path=str(path), lines=len(lines))
 
     for line in lines:
         stripped = line.strip()
@@ -83,6 +89,14 @@ def parse_task_file(path: str | Path) -> list[Phase]:
     if not phases:
         raise ValueError(f"No phases found in {path}. Expected '## Phase N' headings.")
 
+    total_tasks = sum(len(p.tasks) for p in phases)
+    log.info(
+        "parser.parsed",
+        path=str(path),
+        phases=len(phases),
+        tasks=total_tasks,
+    )
+
     return phases
 
 
@@ -103,6 +117,7 @@ def mark_task_done(task: Task, phases: list[Phase]) -> None:
 def update_markdown(path: str | Path, phases: list[Phase]) -> None:
     """Rewrite the markdown file, reflecting done/undone checkboxes."""
     path = Path(path)
+    log.debug("parser.updating_markdown", path=str(path))
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
     task_idx = 0

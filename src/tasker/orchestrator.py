@@ -7,6 +7,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import structlog
+
 from .goose import run_goose
 from .log import IterationLog
 from .models import (
@@ -26,6 +28,9 @@ from .models import (
 from .parser import find_next_task, mark_task_done, parse_task_file, update_markdown
 from .ui import TaskerUI
 from .vcs import VCSBackend
+
+
+log = structlog.get_logger(__name__)
 
 
 def _generate_session_id(prefix: str) -> str:
@@ -185,6 +190,21 @@ class Orchestrator:
 
     def run(self) -> None:
         """Main entry point — run all tasks."""
+        log.info(
+            "orchestrator.starting",
+            dev_session=self.dev_session_name,
+            qa_session=self.qa_session_name,
+            session_scope=self.session_scope.value,
+            iteration_log=str(self.log._path),
+            task_file=str(self.task_file),
+            max_iterations=self.max_iterations,
+            max_turns=self.max_turns,
+            timeout_secs=self.timeout_secs,
+            model=self.model,
+            provider=self.provider,
+            cwd=str(self.cwd),
+            vcs="enabled" if self.vcs else "disabled",
+        )
         self.ui.print_info(f"Developer session: {self.dev_session_name}")
         self.ui.print_info(f"QA session:       {self.qa_session_name}")
         self.ui.print_info(f"Session scope:    {self.session_scope.value}")
@@ -194,6 +214,7 @@ class Orchestrator:
         # Initialize VCS integration
         if self.vcs is not None:
             if not self.vcs.is_available():
+                log.warning("vcs.disabled", reason="tool_not_found_in_path")
                 self.ui.print_error(
                     "VCS tool not found in PATH. Disabling VCS integration."
                 )
@@ -201,8 +222,10 @@ class Orchestrator:
             else:
                 try:
                     self.vcs.init(cwd=self.cwd)
+                    log.info("vcs.initialized", cwd=str(self.cwd))
                     self.ui.print_info("VCS integration: ON")
                 except RuntimeError as exc:
+                    log.error("vcs.init_failed", error=str(exc))
                     self.ui.print_error(f"VCS init failed: {exc}")
                     self.vcs = None
 
@@ -210,18 +233,33 @@ class Orchestrator:
         self.phases = parse_task_file(self.task_file)
 
         if not self.phases:
+            log.error("parser.no_phases", task_file=str(self.task_file))
             self.ui.print_error("No phases found in task file. Nothing to do.")
             return
 
         # If start_phase is specified, mark all earlier tasks as done
         if self.start_phase is not None:
+            skipped = 0
             for phase in self.phases:
                 if phase.index < self.start_phase:
                     for task in phase.tasks:
                         task.done = True
+                        skipped += 1
+            log.info(
+                "start_phase.skipped",
+                start_phase=self.start_phase,
+                tasks_skipped=skipped,
+            )
 
         total_tasks = sum(p.total for p in self.phases)
         done_tasks = sum(p.completed for p in self.phases)
+        log.info(
+            "tasks.loaded",
+            phases=len(self.phases),
+            total_tasks=total_tasks,
+            done_tasks=done_tasks,
+            remaining=total_tasks - done_tasks,
+        )
         self.ui.print_info(
             f"Loaded {len(self.phases)} phases, {total_tasks} tasks "
             f"({done_tasks} already done, {total_tasks - done_tasks} remaining)"
@@ -241,6 +279,12 @@ class Orchestrator:
         # Final summary
         total_tasks = sum(p.total for p in self.phases)
         done_tasks = sum(p.completed for p in self.phases)
+        log.info(
+            "orchestrator.finished",
+            total_tasks=total_tasks,
+            completed=done_tasks,
+            global_iterations=self.global_iteration,
+        )
         self.ui.print_success(
             f"Done! {done_tasks}/{total_tasks} tasks completed. Log: {self.log._path}"
         )
@@ -250,6 +294,7 @@ class Orchestrator:
         while True:
             pair = find_next_task(self.phases)
             if pair is None:
+                log.info("all_tasks.complete")
                 self.ui.update_actor(Actor.QA, "—", "All tasks complete! 🎉")
                 time.sleep(1)
                 break
@@ -258,6 +303,15 @@ class Orchestrator:
             self.current_phase = phase
             self.ui.update_project(self.phases, phase)
             self.ui.update_phase(phase)
+
+            log.info(
+                "task.starting",
+                task_label=task.label,
+                task_text=task.text,
+                phase=phase.title,
+                phase_progress=f"{phase.completed}/{phase.total}",
+                global_iteration=self.global_iteration,
+            )
 
             self.ui.print_info(
                 f"\n{'=' * 60}\n"
@@ -285,13 +339,16 @@ class Orchestrator:
         """
         scope_key = _compute_scope_key(task, self.session_scope)
         should_rotate = False
+        rotation_reason = ""
 
         if self._force_new_session:
             should_rotate = True
+            rotation_reason = "force_new_session"
             self._force_new_session = False  # one-shot
             self.ui.print_info(f"[{task.label}] Forcing new session (--new-session)")
         elif scope_key != self._current_scope_key:
             should_rotate = True
+            rotation_reason = "scope_boundary"
             if self._current_scope_key:
                 self.ui.print_info(
                     f"[{task.label}] Session scope changed: "
@@ -301,6 +358,15 @@ class Orchestrator:
         if should_rotate:
             self.dev_session_name = _generate_session_id("dev")
             self.qa_session_name = _generate_session_id("qa")
+            log.info(
+                "session.rotated",
+                task_label=task.label,
+                old_scope_key=self._current_scope_key or "(initial)",
+                new_scope_key=scope_key,
+                reason=rotation_reason,
+                dev_session=self.dev_session_name,
+                qa_session=self.qa_session_name,
+            )
             self.ui.print_info(
                 f"[{task.label}] New dev session: {self.dev_session_name}"
             )
@@ -471,11 +537,18 @@ class Orchestrator:
             self.vcs.begin_task(task, cwd=self.cwd)
             base_display = task.base_ref[:12] if task.base_ref else "?"
             task_display = task.task_ref[:12] if task.task_ref else "?"
+            log.info(
+                "vcs.task_started",
+                task_label=task.label,
+                base_ref=base_display,
+                task_ref=task_display,
+            )
             self.ui.print_info(
                 f"[{task.label}] VCS: created task workspace "
                 f"(base={base_display}, task={task_display})"
             )
         except RuntimeError as exc:
+            log.warning("vcs.begin_task_failed", task_label=task.label, error=str(exc))
             self.ui.print_warning(
                 f"[{task.label}] VCS: failed to begin task: {exc}. "
                 f"Continuing without VCS."
@@ -490,8 +563,15 @@ class Orchestrator:
         if self.vcs is None:
             return ""
         try:
-            return self.vcs.get_diff(task, cwd=self.cwd)
+            diff = self.vcs.get_diff(task, cwd=self.cwd)
+            log.debug(
+                "vcs.diff_obtained",
+                task_label=task.label,
+                diff_lines=diff.count("\n") if diff else 0,
+            )
+            return diff
         except RuntimeError as exc:
+            log.warning("vcs.get_diff_failed", task_label=task.label, error=str(exc))
             self.ui.print_warning(f"[{task.label}] VCS: failed to get diff: {exc}")
             return ""
 
@@ -504,8 +584,10 @@ class Orchestrator:
             return
         try:
             self.vcs.commit_task(task, cwd=self.cwd)
+            log.info("vcs.task_committed", task_label=task.label)
             self.ui.print_info(f"[{task.label}] VCS: task committed")
         except RuntimeError as exc:
+            log.error("vcs.commit_failed", task_label=task.label, error=str(exc))
             self.ui.print_warning(f"[{task.label}] VCS: failed to commit task: {exc}")
 
     def _finalize_task(self, phase: Phase, task: Task) -> None:
@@ -516,11 +598,16 @@ class Orchestrator:
         Otherwise the markdown change lives only in the working tree and
         is never committed (git) or is lost on the next task's branch switch.
         """
+        log.info("task.finalizing", task_label=task.label)
         mark_task_done(task, self.phases)
         update_markdown(self.task_file, self.phases)
+        log.debug(
+            "task.markdown_updated", task_label=task.label, file=str(self.task_file)
+        )
         self._vcs_commit_task(task)
         self.ui.update_phase(phase)
         self.ui.update_project(self.phases, phase)
+        log.info("task.finalized", task_label=task.label)
 
     def _run_dev_with_recovery(
         self,
@@ -535,6 +622,13 @@ class Orchestrator:
         """
         stage = RecoveryStage.NORMAL
         attempts_in_stage = 0
+
+        log.info(
+            "dev.recovery_start",
+            task_label=task.label,
+            iteration=iteration,
+            has_feedback=feedback is not None,
+        )
 
         while True:
             attempts_in_stage += 1
@@ -558,6 +652,14 @@ class Orchestrator:
             )
             self.ui.print_info(
                 f"[{task.label}] Dev call (stage={stage.value}, attempt={attempts_in_stage})..."
+            )
+
+            log.debug(
+                "dev.call",
+                task_label=task.label,
+                stage=stage.value,
+                attempt=f"{attempts_in_stage}/{stage.max_attempts}",
+                iteration=iteration,
             )
 
             dev_request = DevRequest(
@@ -588,6 +690,12 @@ class Orchestrator:
                     # Instead, return a blocked response with timeout context
                     # so the caller can relaunch the agent with awareness.
                     timeout_minutes = self.timeout_secs / 60
+                    log.warning(
+                        "dev.timeout",
+                        task_label=task.label,
+                        duration=dev_result.duration_secs,
+                        timeout_secs=self.timeout_secs,
+                    )
                     self.ui.print_warning(
                         f"[{task.label}] Dev timed out after {timeout_minutes:.0f}min — "
                         f"will relaunch with timeout context"
@@ -620,6 +728,12 @@ class Orchestrator:
                     )
 
                 # Other subprocess failures (crash, etc.)
+                log.error(
+                    "dev.subprocess_failed",
+                    task_label=task.label,
+                    return_code=dev_result.return_code,
+                    stderr=dev_result.raw_stderr[:200],
+                )
                 self.ui.print_error(
                     f"[{task.label}] Dev subprocess failed (rc={dev_result.return_code}): "
                     f"{dev_result.raw_stderr[:200]}"
@@ -659,6 +773,15 @@ class Orchestrator:
 
             if dev_response is not None:
                 # Parsed successfully — log and return
+                log.info(
+                    "dev.response_parsed",
+                    task_label=task.label,
+                    status=dev_response.status,
+                    summary=dev_response.summary[:100],
+                    files=dev_response.files_modified,
+                    stage=stage.value,
+                    attempt=attempts_in_stage,
+                )
                 dev_entry = IterationEntry(
                     timestamp=_now_iso(),
                     iteration=self.global_iteration,
@@ -675,6 +798,12 @@ class Orchestrator:
                 return dev_response
 
             # Malformed output — log the failure
+            log.warning(
+                "dev.malformed_output",
+                task_label=task.label,
+                stage=stage.value,
+                attempt=f"{attempts_in_stage}/{stage.max_attempts}",
+            )
             self.ui.print_warning(
                 f"[{task.label}] Dev did not return valid JSON (stage={stage.value}, "
                 f"attempt={attempts_in_stage}/{stage.max_attempts})"
@@ -696,6 +825,7 @@ class Orchestrator:
                 if stage == RecoveryStage.SUMMARIZE:
                     break  # all stages exhausted
                 # Move to next stage
+                old_stage = stage
                 if stage == RecoveryStage.NORMAL:
                     stage = RecoveryStage.CONTINUE
                 elif stage == RecoveryStage.CONTINUE:
@@ -706,8 +836,19 @@ class Orchestrator:
                 self.ui.print_warning(
                     f"[{task.label}] Escalating to stage: {stage.value}"
                 )
+                log.warning(
+                    "dev.escalating",
+                    task_label=task.label,
+                    from_stage=old_stage.value,
+                    to_stage=stage.value,
+                )
 
         # All stages exhausted — return a synthetic blocked response
+        log.error(
+            "dev.recovery_exhausted",
+            task_label=task.label,
+            iteration=iteration,
+        )
         self.ui.print_error(
             f"[{task.label}] All recovery attempts exhausted. "
             f"Returning synthetic blocked response."
@@ -743,6 +884,12 @@ class Orchestrator:
 
         feedback: str | None = None  # None on first iteration
 
+        log.info(
+            "feedback_loop.start",
+            task_label=task.label,
+            max_iterations=self.max_iterations,
+        )
+
         for iteration in range(1, self.max_iterations + 1):
             self.global_iteration += 1
 
@@ -755,6 +902,15 @@ class Orchestrator:
 
             # ── Handle dev blocked ──
             if dev_response.status == "blocked":
+                log.warning(
+                    "dev.blocked",
+                    task_label=task.label,
+                    iteration=iteration,
+                    blocker=dev_response.blocker_description[:200],
+                    suggestion=dev_response.blocker_suggestion[:200]
+                    if dev_response.blocker_suggestion
+                    else None,
+                )
                 self.ui.print_warning(
                     f"[{task.label}] Developer BLOCKED: {dev_response.blocker_description[:200]}"
                 )
@@ -798,6 +954,13 @@ class Orchestrator:
                 # QA timed out — treat as rejection with timeout context
                 if qa_result.timed_out:
                     timeout_minutes = self.timeout_secs / 60
+                    log.warning(
+                        "qa.timeout",
+                        task_label=task.label,
+                        iteration=iteration,
+                        context="blocker_triage",
+                        duration=qa_result.duration_secs,
+                    )
                     self.ui.print_warning(
                         f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during blocker triage — treating as rejection"
                     )
@@ -844,6 +1007,14 @@ class Orchestrator:
                 self.ui.add_iteration(qa_entry)
 
                 if qa_response.decision == "needs_user_input":
+                    log.info(
+                        "qa.needs_user_input",
+                        task_label=task.label,
+                        iteration=iteration,
+                        question=qa_response.user_question[:200]
+                        if qa_response.user_question
+                        else None,
+                    )
                     resolved = self._interactive_chat_loop(
                         task=task,
                         phase=phase,
@@ -894,6 +1065,13 @@ class Orchestrator:
                 f"[{task.label}] Developer done: {dev_response.summary[:100]}"
             )
 
+            log.info(
+                "dev.done",
+                task_label=task.label,
+                iteration=iteration,
+                summary=dev_response.summary[:100],
+            )
+
             # ── 2. Send to QA for review ──
             self.ui.update_actor(
                 Actor.QA, task.label, f"reviewing iteration {iteration}"
@@ -902,6 +1080,13 @@ class Orchestrator:
 
             # Get VCS diff for QA context
             vcs_diff = self._vcs_get_diff(task)
+
+            log.debug(
+                "qa.call",
+                task_label=task.label,
+                iteration=iteration,
+                has_vcs_diff=bool(vcs_diff),
+            )
 
             qa_request = QARequest(
                 task_label=task.label,
@@ -933,6 +1118,13 @@ class Orchestrator:
             # QA timed out — treat as rejection with timeout context
             if qa_result.timed_out:
                 timeout_minutes = self.timeout_secs / 60
+                log.warning(
+                    "qa.timeout",
+                    task_label=task.label,
+                    iteration=iteration,
+                    context="review",
+                    duration=qa_result.duration_secs,
+                )
                 self.ui.print_warning(
                     f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during review — treating as rejection"
                 )
@@ -988,6 +1180,12 @@ class Orchestrator:
             self.ui.add_iteration(qa_entry)
 
             if qa_response.decision == "approve":
+                log.info(
+                    "qa.approved",
+                    task_label=task.label,
+                    iteration=iteration,
+                    feedback=qa_response.feedback[:100],
+                )
                 self.ui.print_success(
                     f"[{task.label}] ✓ APPROVED by QA: {qa_response.feedback[:100]}"
                 )
@@ -1014,6 +1212,13 @@ class Orchestrator:
 
             else:
                 # reject
+                log.info(
+                    "qa.rejected",
+                    task_label=task.label,
+                    iteration=iteration,
+                    feedback=qa_response.feedback[:200],
+                    num_concerns=len(qa_response.concerns),
+                )
                 self.ui.print_warning(
                     f"[{task.label}] ✗ REJECTED by QA: {qa_response.feedback[:200]}"
                 )
@@ -1030,6 +1235,11 @@ class Orchestrator:
                 feedback += "\nPlease fix ALL concerns above and re-submit."
 
         # Max iterations reached — mark done to prevent infinite loop
+        log.error(
+            "feedback_loop.max_iterations",
+            task_label=task.label,
+            max_iterations=self.max_iterations,
+        )
         self.ui.print_error(
             f"[{task.label}] Max iterations ({self.max_iterations}) reached. "
             f"Marking task done and moving on."

@@ -20,9 +20,12 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import structlog
+
 from ..models import Task
 
 logger = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
 # Branch name prefix for task-scoped feature branches
 _BRANCH_PREFIX = "task/"
@@ -64,6 +67,7 @@ def _run_git(
 ) -> GitResult:
     """Run a git command and return structured result."""
     cmd = ["git"] + args
+    log.debug("git.run", args=" ".join(args), cwd=str(cwd))
     logger.debug("Running: %s (cwd=%s)", " ".join(cmd), cwd)
 
     try:

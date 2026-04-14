@@ -8,6 +8,7 @@ dependencies = [
     "rich>=13.9.0",
     "pyyaml>=6.0",
     "jsonlines>=4.0.0",
+    "structlog>=25.5.0",
 ]
 
 [project.scripts]

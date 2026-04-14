@@ -17,9 +17,12 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import structlog
+
 from ..models import Task
 
 logger = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -42,6 +45,7 @@ def _run_jj(
     All jj commands MUST pass `-m` with a message to avoid opening $EDITOR.
     """
     cmd = ["jj"] + args
+    log.debug("jj.run", args=" ".join(args), cwd=str(cwd))
     logger.debug("Running: %s (cwd=%s)", " ".join(cmd), cwd)
 
     try:

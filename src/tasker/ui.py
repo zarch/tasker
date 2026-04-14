@@ -12,6 +12,10 @@ from rich.layout import Layout
 
 from .models import Actor, IterationEntry, Phase, TaskStatus
 
+import structlog
+
+log = structlog.get_logger(__name__)
+
 
 class TaskerUI:
     """Live rich console UI for the tasker pipeline."""
@@ -43,12 +47,14 @@ class TaskerUI:
         self._iteration_entries: list[IterationEntry] = []
 
     def start(self) -> Live:
+        log.debug("ui.live_started")
         self._layout = self._build_layout()
         self._live = Live(self._layout, console=self.console, refresh_per_second=4)
         self._live.start()
         return self._live
 
     def stop(self) -> None:
+        log.debug("ui.live_stopped")
         if self._live:
             self._live.stop()
             self._live = None
@@ -56,12 +62,14 @@ class TaskerUI:
 
     def pause(self) -> None:
         """Temporarily stop Live so interactive input works."""
+        log.debug("ui.live_paused")
         if self._live:
             self._live.stop()
             self._live = None
 
     def resume(self) -> None:
         """Recreate Live after interactive input is done."""
+        log.debug("ui.live_resumed")
         if self._layout:
             self._live = Live(self._layout, console=self.console, refresh_per_second=4)
             self._live.start()
