@@ -20,6 +20,7 @@ class Task:
 
     # Sub-phase context — set by parser when the task sits under a ### heading
     subphase: str = ""
+    subphase_index: int = -1  # 0-based task index within its ### group (-1 if no subphase)
 
     # JJ (Jujutsu) change tracking — set by orchestrator when jj is enabled
     base_change_id: str | None = None   # parent change (what we diff against)
@@ -27,6 +28,10 @@ class Task:
 
     @property
     def label(self) -> str:
+        if self.subphase and self.subphase_index >= 0:
+            # Derive short key from subphase heading (e.g. "P1-2 API Endpoints" → "P1-2")
+            short = self.subphase.split()[0] if self.subphase else ""
+            return f"{short}.T{self.subphase_index + 1}"
         return f"P{self.phase_index + 1}.T{self.task_index + 1}"
 
     @property

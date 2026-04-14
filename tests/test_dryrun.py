@@ -634,7 +634,7 @@ def test_scope_key_computation():
 
     # Task with subphase
     task = Task(
-        phase_index=0, task_index=2, text="Some task", subphase="P1-2 API Endpoints"
+        phase_index=0, task_index=2, text="Some task", subphase="P1-2 API Endpoints", subphase_index=0
     )
 
     # PHASE scope — only phase index matters
@@ -643,8 +643,8 @@ def test_scope_key_computation():
     # SUBPHASE scope — phase + subphase
     assert _compute_scope_key(task, SessionScope.SUBPHASE) == "P1::P1-2 API Endpoints"
 
-    # TASK scope — phase + subphase + task index
-    assert _compute_scope_key(task, SessionScope.TASK) == "P1::P1-2 API Endpoints::T3"
+    # TASK scope — phase + subphase + subphase-local task index
+    assert _compute_scope_key(task, SessionScope.TASK) == "P1::P1-2 API Endpoints::T1"
 
     # Task without subphase (e.g., sample_tasks.md which has no ### headings)
     task_no_sub = Task(phase_index=1, task_index=0, text="No subphase task")
@@ -654,16 +654,18 @@ def test_scope_key_computation():
     assert _compute_scope_key(task_no_sub, SessionScope.TASK) == "P2::T1"
 
     # Same scope key for tasks in the same subphase
-    task_a = Task(phase_index=0, task_index=0, text="A", subphase="P1-1 DB")
-    task_b = Task(phase_index=0, task_index=1, text="B", subphase="P1-1 DB")
+    task_a = Task(phase_index=0, task_index=0, text="A", subphase="P1-1 DB", subphase_index=0)
+    task_b = Task(phase_index=0, task_index=1, text="B", subphase="P1-1 DB", subphase_index=1)
     assert _compute_scope_key(task_a, SessionScope.SUBPHASE) == _compute_scope_key(task_b, SessionScope.SUBPHASE)
+    # Different TASK scope keys for different tasks in same subphase
+    assert _compute_scope_key(task_a, SessionScope.TASK) != _compute_scope_key(task_b, SessionScope.TASK)
 
     # Different scope keys for tasks in different subphases
-    task_c = Task(phase_index=0, task_index=2, text="C", subphase="P1-2 API")
+    task_c = Task(phase_index=0, task_index=2, text="C", subphase="P1-2 API", subphase_index=0)
     assert _compute_scope_key(task_a, SessionScope.SUBPHASE) != _compute_scope_key(task_c, SessionScope.SUBPHASE)
 
     # Different scope keys for tasks in different phases
-    task_d = Task(phase_index=1, task_index=0, text="D", subphase="P1-1 DB")
+    task_d = Task(phase_index=1, task_index=0, text="D", subphase="P1-1 DB", subphase_index=0)
     assert _compute_scope_key(task_a, SessionScope.PHASE) != _compute_scope_key(task_d, SessionScope.PHASE)
 
     print("✓ Scope key computation tests passed")
@@ -702,13 +704,75 @@ def test_task_subphase_field():
     task = Task(phase_index=0, task_index=0, text="Do something")
     assert task.subphase == ""  # default
 
-    task2 = Task(phase_index=0, task_index=1, text="Another", subphase="P1-1 Setup")
+    task2 = Task(phase_index=0, task_index=1, text="Another", subphase="P1-1 Setup", subphase_index=0)
     assert task2.subphase == "P1-1 Setup"
 
-    # subphase doesn't affect label
-    assert task2.label == "P1.T2"
+    # subphase-aware label: short key from heading + local task index
+    assert task2.label == "P1-1.T1"
 
     print("✓ Task subphase field tests passed")
+
+# ── 19. Test subphase-aware label derivation ────────────────────
+
+def test_subphase_labels():
+    """Test that tasks under ### headings get meaningful labels derived from the heading."""
+    from tasker.models import Task
+
+    # Task with subphase "P1-4 · hay-grid — Pixel" → short key "P1-4"
+    task = Task(
+        phase_index=0, task_index=24, text="Some pixel task",
+        subphase="P1-4 · hay-grid — Pixel", subphase_index=2,
+    )
+    assert task.label == "P1-4.T3"  # 3rd task (0-based index 2) under this ###
+
+    # First task in a subphase
+    task_first = Task(
+        phase_index=0, task_index=0, text="Setup DB",
+        subphase="P1-1 Database Setup", subphase_index=0,
+    )
+    assert task_first.label == "P1-1.T1"
+
+    # Second task in the same subphase
+    task_second = Task(
+        phase_index=0, task_index=1, text="Run migrations",
+        subphase="P1-1 Database Setup", subphase_index=1,
+    )
+    assert task_second.label == "P1-1.T2"
+
+    # Task without subphase — falls back to flat positional label
+    task_no_sub = Task(phase_index=2, task_index=5, text="No subphase here")
+    assert task_no_sub.label == "P3.T6"
+
+    # Task with subphase="" and subphase_index=-1 — also flat fallback
+    task_neg = Task(
+        phase_index=1, task_index=3, text="Orphan",
+        subphase="", subphase_index=-1,
+    )
+    assert task_neg.label == "P2.T4"
+
+    # Verify from fixture file: subphase_tasks.md
+    sample = Path(__file__).parent / "fixtures" / "subphase_tasks.md"
+    phases = parse_task_file(sample)
+
+    # P1-1 Database Setup: 3 tasks → P1-1.T1, P1-1.T2, P1-1.T3
+    assert phases[0].tasks[0].label == "P1-1.T1"
+    assert phases[0].tasks[1].label == "P1-1.T2"
+    assert phases[0].tasks[2].label == "P1-1.T3"
+
+    # P1-2 API Endpoints: 2 tasks → P1-2.T1, P1-2.T2
+    assert phases[0].tasks[3].label == "P1-2.T1"
+    assert phases[0].tasks[4].label == "P1-2.T2"
+
+    # P2-1 Components: 2 tasks → P2-1.T1, P2-1.T2
+    assert phases[1].tasks[0].label == "P2-1.T1"
+    assert phases[1].tasks[1].label == "P2-1.T2"
+
+    # P2-2 Integration: 2 tasks → P2-2.T1, P2-2.T2
+    assert phases[1].tasks[2].label == "P2-2.T1"
+    assert phases[1].tasks[3].label == "P2-2.T2"
+
+    print("✓ Subphase label derivation tests passed")
+
 
 # ── Run all ───────────────────────────────────────────────────────
 
@@ -731,4 +795,5 @@ if __name__ == "__main__":
     test_scope_key_computation()
     test_backward_compat_no_subphases()
     test_task_subphase_field()
-    print("\n✅ All 17 dry-run tests passed!")
+    test_subphase_labels()
+    print("\n✅ All 19 dry-run tests passed!")

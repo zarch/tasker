@@ -37,6 +37,7 @@ def parse_task_file(path: str | Path) -> list[Phase]:
     phases: list[Phase] = []
     current_phase: Phase | None = None
     current_subphase: str = ""  # tracks the latest ### heading text within a phase
+    subphase_task_counter: int = 0  # 0-based task index within current ### group
     task_counter = 0
 
     for line in lines:
@@ -49,12 +50,14 @@ def parse_task_file(path: str | Path) -> list[Phase]:
             current_phase = Phase(index=idx, title=stripped.lstrip("# ").strip())
             phases.append(current_phase)
             current_subphase = ""
+            subphase_task_counter = 0
             continue
 
         # ── Sub-phase heading (###) ──
         m = _SUBPHASE_RE.match(stripped)
         if m and current_phase is not None:
             current_subphase = m.group(1).strip()
+            subphase_task_counter = 0  # reset on each ### heading
             # Also tag the Phase so the orchestrator can see it
             if not current_phase.subphase:
                 current_phase.subphase = current_subphase
@@ -70,9 +73,11 @@ def parse_task_file(path: str | Path) -> list[Phase]:
                 text=m.group(2).strip(),
                 done=done,
                 subphase=current_subphase,
+                subphase_index=subphase_task_counter if current_subphase else -1,
             )
             current_phase.tasks.append(task)
             task_counter += 1
+            subphase_task_counter += 1
             continue
 
     if not phases:

@@ -127,9 +127,9 @@ def _compute_scope_key(task: Task, scope: SessionScope) -> str:
         return phase_key
     if scope == SessionScope.SUBPHASE:
         return f"{phase_key}::{task.subphase}" if task.subphase else phase_key
-    # TASK — include subphase if present for consistent ordering
-    if task.subphase:
-        return f"{phase_key}::{task.subphase}::T{task.task_index + 1}"
+    # TASK — use subphase-local index when available for meaningful keys
+    if task.subphase and task.subphase_index >= 0:
+        return f"{phase_key}::{task.subphase}::T{task.subphase_index + 1}"
     return f"{phase_key}::T{task.task_index + 1}"
 
 
