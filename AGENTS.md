@@ -17,6 +17,7 @@
 | CLI framework | [Typer](https://typer.tiangolo.com/) |
 | Terminal UI | [Rich](https://rich.readthed.me/) |
 | Config format | YAML (recipes), Markdown (task lists), JSONL (logs) |
+| Monitoring | [structlog](https://www.structlog.org/) (structured log file + console) |
 | Package manager | [uv](https://docs.astral.sh/uv/) |
 | Build backend | Hatchling |
 | VCS (optional) | Jujutsu (`jj`) or Git (feature branch + squash merge) |
@@ -43,6 +44,7 @@ tools/tasker/
 │   ├── orchestrator.py       # Core QA↔Dev loop, recovery, chat mode, VCS integration
 │   ├── jj.py                 # Backward-compat re-exports (see vcs/jj_backend.py)
 │   ├── log.py                # Append-only JSONL iteration logger
+│   ├── monitoring.py         # structlog configuration + setup (observability)
 │   ├── ui.py                 # Rich Live UI (progress bars, iteration table, chat input)
 │   └── vcs/
 │       ├── __init__.py       # VCSBackend protocol + create_backend() factory
@@ -53,7 +55,7 @@ tools/tasker/
 │   │   ├── sample_tasks.md   # Test task file (basic ## phases)
 │   │   ├── e2e_test.md       # E2E test task file
 │   │   └── subphase_tasks.md # Test task file with ### sub-phases
-│   └── test_dryrun.py        # 29 unit/integration tests (no goose subprocess)
+│   └── test_dryrun.py        # 38 unit/integration tests (no goose subprocess)
 └── docs/
     └── jj-option-b.md        # Future design doc (not yet implemented)
 ```
@@ -66,6 +68,7 @@ main.py
       ├── goose.py           (subprocess runner)
       ├── parser.py          (markdown → Phase/Task)
       ├── log.py             (JSONL logger)
+      ├── monitoring.py      (structlog setup, called once from main.py)
       ├── ui.py              (Rich live display)
       ├── models.py          (all data types)
       └── vcs/               (optional VCS integration)
@@ -73,12 +76,13 @@ main.py
            ├── jj_backend.py (Jujutsu backend)
            └── git_backend.py(Git backend)
 
-goose.py          ← standalone, only depends on stdlib
-parser.py         ← depends on models.py
+goose.py          ← depends on structlog (subprocess lifecycle)
+parser.py         ← depends on models.py, structlog (parse events)
 log.py            ← depends on models.py
+monitoring.py     ← depends on structlog (configures root logger)
 models.py         ← standalone, no internal deps
 jj.py             ← backward-compat shim, re-exports from vcs.jj_backend
-ui.py             ← depends on models.py
+ui.py             ← depends on models.py, structlog (lifecycle events)
 ```
 
 ## Key Architecture Concepts
@@ -194,7 +198,12 @@ This updates both `pyproject.toml` and `uv.lock`.
 - Malformed agent output triggers recovery stages, never crashes
 
 ### Logging
-- Use `logging.getLogger(__name__)` for debug-level logging (e.g. in `jj.py`)
+- **Structured monitoring** via `structlog` — configured once in `monitoring.py:setup_monitoring()`, called from `main.py` before orchestrator creation
+- All modules use `structlog.get_logger(__name__)` to emit structured key-value events (e.g. `log.info("task.starting", task_label="P1.T1", phase="Phase 1")`)
+- Existing `logging.getLogger(__name__)` calls (VCS backends) also flow through structlog's stdlib integration
+- **Two log files serve different purposes:**
+  - `tasker.log` (monitor log) — **everything**: orchestration decisions, session rotations, recovery escalations, subprocess launches, VCS ops, parser events, UI lifecycle. Human-readable, key-value format.
+  - `<task_file>.iterations.jsonl` (iteration log) — **QA↔Dev exchanges only**: structured JSON records of each agent call's result. Machine-parseable.
 - User-facing messages go through `TaskerUI` methods (`print_info`, `print_warning`, `print_error`, `print_success`)
 - All QA↔Dev exchanges are recorded in the JSONL log via `IterationLog.append()`
 
@@ -217,6 +226,95 @@ This updates both `pyproject.toml` and `uv.lock`.
 5. **Do NOT break the JSON response contract** — agents MUST return JSON with `status` (dev) or `decision` (QA) keys, and parsers MUST reject unknown values (see `_parse_dev_response` / `_parse_qa_response` strictness)
 6. **Do NOT reorder `_finalize_task`** — the sequence `mark_task_done → update_markdown → _vcs_commit_task` is critical. The markdown `[x]` must be on disk before the VCS commit runs, or it will be lost on branch switches (git) or excluded from the commit.
 7. **Do NOT let agents run version control commands** — VCS operations are handled by the orchestrator via the `VCSBackend` protocol
+
+### 7. Structured Monitoring (`--monitor-log`)
+
+The `--monitor-log` flag controls a separate structured log file that captures **all orchestration events** (not just QA↔Dev exchanges). This complements the JSONL iteration log.
+
+```bash
+# Default: tasker.log in the task file's parent directory
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md
+
+# Custom path
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --monitor-log /tmp/debug.log
+
+# Disable file logging (console only)
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --no-monitor-log
+```
+
+**Controlling log levels** (`--log-level` / `--file-log-level`):
+
+The console and file handlers have independent log levels. Defaults are `WARNING` for console (quiet terminal) and `DEBUG` for the file (capture everything).
+
+```bash
+# Console: only warnings+  |  File: debug (everything) — defaults
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md
+
+# Verbose console — see all info+ in the terminal
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --log-level info
+
+# Quiet file — only warnings+ written to disk
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --file-log-level warning
+
+# Debug everything everywhere
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --log-level debug
+
+# Invalid level → clear error message and exit
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --log-level trace
+# Error: Unknown log level 'trace'. Must be one of: critical, debug, error, warning
+```
+
+Accepted values (case-insensitive): `debug`, `info`, `warning` (or `warn`), `error`, `critical` (or `crit`).
+
+**Log event taxonomy** (dot-separated namespace):
+
+| Event | Module | Level | When |
+|-------|--------|-------|------|
+| `orchestrator.starting` | orchestrator | info | Run begins (sessions, config) |
+| `orchestrator.finished` | orchestrator | info | Run ends (summary stats) |
+| `tasks.loaded` | orchestrator | info | After parsing task file |
+| `task.starting` | orchestrator | info | Before dev agent call |
+| `task.finalizing` | orchestrator | info | QA approved, marking done |
+| `task.finalized` | orchestrator | info | Task fully complete |
+| `feedback_loop.start` | orchestrator | info | QA↔Dev loop begins for a task |
+| `feedback_loop.max_iterations` | orchestrator | error | Hit iteration limit |
+| `session.rotated` | orchestrator | info | New dev/qa sessions created |
+| `dev.recovery_start` | orchestrator | info | Recovery loop begins |
+| `dev.call` | orchestrator | debug | Before goose subprocess launch |
+| `dev.response_parsed` | orchestrator | info | Dev returned valid JSON |
+| `dev.done` | orchestrator | info | Dev status=done |
+| `dev.blocked` | orchestrator | warning | Dev status=blocked |
+| `dev.malformed_output` | orchestrator | warning | Dev JSON unparsable |
+| `dev.escalating` | orchestrator | warning | Recovery stage advancing |
+| `dev.recovery_exhausted` | orchestrator | error | All recovery stages failed |
+| `dev.timeout` | orchestrator | warning | Dev process killed |
+| `dev.subprocess_failed` | orchestrator | error | Dev process crashed |
+| `qa.call` | orchestrator | debug | Before QA goose subprocess |
+| `qa.approved` | orchestrator | info | QA decision=approve |
+| `qa.rejected` | orchestrator | info | QA decision=reject |
+| `qa.needs_user_input` | orchestrator | info | QA needs user chat |
+| `qa.timeout` | orchestrator | warning | QA process killed |
+| `vcs.initialized` | orchestrator | info | VCS backend init success |
+| `vcs.task_started` | orchestrator | info | Task workspace created |
+| `vcs.diff_obtained` | orchestrator | debug | Diff retrieved for QA |
+| `vcs.task_committed` | orchestrator | info | Task changes committed |
+| `vcs.begin_task_failed` | orchestrator | warning | VCS workspace creation failed |
+| `vcs.commit_failed` | orchestrator | error | VCS commit failed |
+| `goose.launching` | goose | debug | Before subprocess.Popen |
+| `goose.completed` | goose | info | Subprocess finished |
+| `goose.timeout` | goose | warning | Process killed on timeout |
+| `goose.launch_failed` | goose | error | Failed to start process |
+| `parser.parsing` | parser | debug | Starting file parse |
+| `parser.parsed` | parser | info | Parse complete (counts) |
+| `parser.updating_markdown` | parser | debug | Rewriting checkboxes |
+| `jj.run` | vcs/jj_backend | debug | JJ subprocess command |
+| `git.run` | vcs/git_backend | debug | Git subprocess command |
+| `ui.live_started` | ui | debug | Rich Live display started |
+| `ui.live_stopped` | ui | debug | Rich Live display stopped |
+| `ui.live_paused` | ui | debug | Live paused for chat input |
+| `ui.live_resumed` | ui | debug | Live resumed after chat |
+
+**When adding new log events:** Use dot-separated names (e.g. `module.action`), include `task_label` when available, and choose the appropriate level (`debug` for verbose/noisy, `info` for milestones, `warning` for recoverable issues, `error` for failures).
 
 ## Environment Variables
 
@@ -242,5 +340,7 @@ Tests in `test_dryrun.py` cover:
 - Timeout feedback message generation
 - Session scope (enum, scope key computation, `Task.subphase` field, backward compatibility)
 - `_finalize_task` ordering invariant (markdown [x] must be on disk before VCS commit)
+- Monitoring setup (structlog configuration, file output, idempotency, get_logger helper)
+- Monitoring integration (parser events captured in monitor log, orchestrator task lifecycle captured)
 
 When adding new features, add corresponding dry-run tests — no real Goose subprocess calls.

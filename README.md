@@ -178,6 +178,10 @@ uv run tasker --dev recipes/recipe-dev.yaml \
 | `--vcs` | `none` | VCS integration: `jj` (Jujutsu), `git` (feature branch + squash merge), or `none` (disabled) |
 | `--session-scope` | `subphase` | When to rotate goose sessions: `phase` (per `##`), `subphase` (per `###`), or `task` (per `- [ ]`) |
 | `--new-session` | *(off)* | Force a new goose session on the next task (one-shot) |
+| `--monitor-log` | `tasker.log` | Structured monitor log path (set to empty or use `--no-monitor-log` to disable) |
+| `--no-monitor-log` | *(off)* | Disable the monitor log file (console/stderr logging still active) |
+| `--log-level` | `WARNING` | Minimum level for console (stderr) output: `debug`, `info`, `warning`, `error`, `critical` |
+| `--file-log-level` | `DEBUG` | Minimum level for the monitor log file: `debug`, `info`, `warning`, `error`, `critical` |
 
 ## Version control integration
 
@@ -305,6 +309,50 @@ uv run tasker --dev recipes/recipe-dev.yaml \
 ```
 
 This is a one-shot flag — it fires once and then the normal scope-based rotation takes over.
+
+## Structured monitoring
+
+`tasker` uses [structlog](https://www.structlog.org/) for structured, key-value logging of all orchestration events. Logs are written to **two independent destinations**:
+
+| Destination | Default level | Purpose |
+|---|---|---|
+| **Monitor log file** (`--monitor-log`) | `DEBUG` | Captures everything — orchestration decisions, session rotations, recovery escalations, subprocess launches, VCS ops, parser events, UI lifecycle. |
+| **Console (stderr)** | `WARNING` | Shows warnings and errors in the terminal. Deliberately writes to **stderr** (not stdout) so it never interferes with Rich's Live UI, which renders on stdout. |
+
+> **Why stderr?** Rich's `Live` display takes over stdout for the progress table and status bars. All structured log output goes to stderr so the two never mix — you can pipe stdout without capturing logs, and logs never corrupt the UI.
+
+### Log files
+
+- **`tasker.log`** (monitor log) — human-readable, key-value format. One entry per line with timestamp, level, event name, and context fields.
+- **`<task_file>.iterations.jsonl`** (iteration log) — machine-parseable JSON records of QA↔Dev exchanges only. Controlled separately via `--log`.
+
+The monitor log uses a `RotatingFileHandler` (10 MB max, 3 backups) so it won't grow unbounded on long runs.
+
+### Controlling log levels
+
+Console and file levels are independent. Examples:
+
+```bash
+# Defaults: warnings+ on console, everything in file
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md
+
+# Verbose console — see all info+ in the terminal
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --log-level info
+
+# Quiet file — only warnings+ written to disk
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --file-log-level warning
+
+# Debug everything everywhere
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --log-level debug
+
+# Disable file logging entirely (console/stderr only)
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --no-monitor-log
+
+# Custom log file location
+uv run tasker --dev ... --qa ... specs/arch/99-todo.md --monitor-log /tmp/debug.log
+```
+
+Accepted level values (case-insensitive): `debug`, `info`, `warning` (or `warn`), `error`, `critical` (or `crit`).
 
 ## JSONL log format
 
