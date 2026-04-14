@@ -23,19 +23,42 @@ instructions: |
   - Optional QA feedback from previous iterations (if this is a re-work)
   - Optional recovery instructions (if a previous response was malformed)
 
+  ## Specification Files
+  The project has detailed specification files that define WHAT to build and HOW:
+  - `specs/prd/` — Product Requirements Documents (features, requirements, rationale)
+  - `specs/arch/` — Architecture Documents (module layout, Rust code examples, data structures, API contracts)
+
+  Task descriptions reference these using the format:
+  - `arch/02-grid-system.md §GridCell Trait` → read `specs/arch/02-grid-system.md`, find the "GridCell Trait" section
+  - `prd/06-spatial-indexing.md §6.2` → read `specs/prd/06-spatial-indexing.md`, find section 6.2
+
+  Some references point to subdirectories: `prd/12-api-ergonomics/05-type-system.md §12.5.4`
+
+  **You MUST read every referenced spec file before writing any code.** The specs contain
+  detailed Rust code examples, struct/trait definitions, function signatures, and design
+  decisions that are part of the acceptance criteria — not just suggestions.
+
   ## How to Work
   1. **Read the task carefully** — understand what needs to be built or fixed.
-  2. **Explore the codebase** — use `tree`, `cat`, `rg` to understand existing code.
-  3. **Implement the changes** — write clean, well-structured code.
-  4. **Test if possible** — run tests or verify the implementation compiles.
-  5. **Report back** — always respond with the required JSON block.
+  2. **Extract all spec references** from the task text (lines ending with `— arch/...` or `— prd/...`).
+  3. **Read every referenced spec file and section** — use `cat` to read `specs/<reference>`.
+     Pay close attention to Rust code blocks, struct definitions, and function signatures.
+  4. **Explore the existing codebase** — use `tree`, `cat`, `rg` to understand what's already implemented.
+  5. **Implement the changes** — follow the spec's code examples and structure exactly.
+  6. **Test if possible** — run tests or verify the implementation compiles.
+  7. **Report back** — always respond with the required JSON block.
 
   ## When You Are Blocked
   If you cannot complete the task because:
   - Requirements are unclear, ambiguous, or contradictory
+  - A spec file referenced by the task doesn't exist or is missing a section
   - A dependency or API is missing and you don't know how to proceed
-  - The task references files, modules, or patterns that don't exist
+  - The task references files, modules, or patterns that don't exist in the codebase
   - You need a design decision from the user
+
+  **Before declaring yourself blocked**, check whether the referenced spec files answer
+  your question. Many implementation details, code examples, and design decisions are
+  documented there.
 
   Then respond with `"status": "blocked"` and explain what you need:
   ```json
@@ -61,6 +84,7 @@ instructions: |
   - If you receive QA feedback, address EVERY concern listed. Do not skip any.
   - Keep your implementation focused on the task — don't gold-plate.
   - Use the project's existing patterns and conventions.
+  - Follow the spec's code examples closely — they define the expected API surface and data structures.
 
   ## JSON Response Format
   You MUST end your response with a JSON block like this:
