@@ -18,6 +18,9 @@ class Task:
     text: str
     done: bool = False
 
+    # Sub-phase context — set by parser when the task sits under a ### heading
+    subphase: str = ""
+
     # JJ (Jujutsu) change tracking — set by orchestrator when jj is enabled
     base_change_id: str | None = None   # parent change (what we diff against)
     task_change_id: str | None = None   # the change created by `jj new` for this task
@@ -34,10 +37,16 @@ class Task:
 
 @dataclass
 class Phase:
-    """A group of tasks (e.g. "Phase 1 — MVP")."""
+    """A group of tasks (e.g. "Phase 1 — MVP").
+
+    A Phase may optionally have a `subphase` identifier when the task file
+    uses ### headings to group tasks within a phase (e.g. "### P1-1 Core").
+    The `subphase` value is the full ### heading text (without the hashes).
+    """
     index: int
     title: str
     tasks: list[Task] = field(default_factory=list)
+    subphase: str = ""  # non-empty when this phase group comes from a ### heading
 
     @property
     def total(self) -> int:
@@ -70,6 +79,18 @@ class TaskStatus(str, enum.Enum):
 
 
 # ── Recovery state for graceful degradation ──────────────────────
+
+class SessionScope(str, enum.Enum):
+    """Controls when goose sessions are rotated (new session = fresh context).
+
+    phase    — one session per ## Phase heading (coarsest, most context)
+    subphase — one session per ### sub-heading (default, good balance)
+    task     — one session per task (finest, least context but no overflow)
+    """
+    PHASE = "phase"
+    SUBPHASE = "subphase"
+    TASK = "task"
+
 
 class RecoveryStage(str, enum.Enum):
     """Escalation stages when goose returns malformed output."""

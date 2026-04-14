@@ -16,11 +16,17 @@ from .models import Phase, Task
 
 
 _PHASE_RE = re.compile(r"^##\s+(?:Phase\s+)?(\d+)[^\n]*$", re.IGNORECASE)
+_SUBPHASE_RE = re.compile(r"^###\s+(.+)$")
 _TASK_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+)$")
 
 
 def parse_task_file(path: str | Path) -> list[Phase]:
-    """Parse a markdown file into a list of Phases with Tasks."""
+    """Parse a markdown file into a list of Phases with Tasks.
+
+    Each Phase corresponds to a ``##`` heading.  ``###`` sub-headings
+    are recorded on individual Task objects via the ``subphase`` field
+    so the orchestrator can compute session-scope keys.
+    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Task file not found: {path}")
@@ -30,19 +36,32 @@ def parse_task_file(path: str | Path) -> list[Phase]:
 
     phases: list[Phase] = []
     current_phase: Phase | None = None
+    current_subphase: str = ""  # tracks the latest ### heading text within a phase
     task_counter = 0
 
     for line in lines:
-        # ── Phase heading ──
-        m = _PHASE_RE.match(line.strip())
+        stripped = line.strip()
+
+        # ── Phase heading (##) ──
+        m = _PHASE_RE.match(stripped)
         if m:
             idx = int(m.group(1)) - 1  # 0-based
-            current_phase = Phase(index=idx, title=line.strip().lstrip("# ").strip())
+            current_phase = Phase(index=idx, title=stripped.lstrip("# ").strip())
             phases.append(current_phase)
+            current_subphase = ""
+            continue
+
+        # ── Sub-phase heading (###) ──
+        m = _SUBPHASE_RE.match(stripped)
+        if m and current_phase is not None:
+            current_subphase = m.group(1).strip()
+            # Also tag the Phase so the orchestrator can see it
+            if not current_phase.subphase:
+                current_phase.subphase = current_subphase
             continue
 
         # ── Task checkbox ──
-        m = _TASK_RE.match(line.strip())
+        m = _TASK_RE.match(stripped)
         if m and current_phase is not None:
             done = m.group(1).lower() == "x"
             task = Task(
@@ -50,6 +69,7 @@ def parse_task_file(path: str | Path) -> list[Phase]:
                 task_index=task_counter,
                 text=m.group(2).strip(),
                 done=done,
+                subphase=current_subphase,
             )
             current_phase.tasks.append(task)
             task_counter += 1
