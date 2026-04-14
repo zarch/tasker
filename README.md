@@ -4,6 +4,10 @@ Goose-based task orchestration CLI with a QA/Dev feedback loop, interactive issu
 
 `tasker` reads a markdown task list, assigns each task to a **Developer** goose agent, then sends the result to a **QA Reviewer** goose agent. If QA rejects the work, feedback is routed back to the developer in a loop until the task is approved — then the next task begins. When agents encounter blockers or return malformed output, `tasker` escalates gracefully through multiple recovery strategies, including an interactive chat mode where the user can resolve ambiguities directly.
 
+## Screenshot
+
+![tasker interface](docs/screen.png)
+
 ## How it works
 
 ```
@@ -131,6 +135,24 @@ uv run tasker --dev recipes/recipe-dev.yaml \
               --qa recipes/recipe-qa.yaml \
               specs/arch/99-todo.md \
               --jj
+
+# Rotate sessions per phase (## heading) instead of default sub-phase
+uv run tasker --dev recipes/recipe-dev.yaml \
+              --qa recipes/recipe-qa.yaml \
+              specs/arch/99-todo.md \
+              --session-scope phase
+
+# Rotate sessions per task (fresh context every task)
+uv run tasker --dev recipes/recipe-dev.yaml \
+              --qa recipes/recipe-qa.yaml \
+              specs/arch/99-todo.md \
+              --session-scope task
+
+# Force a new session on the next task (one-shot)
+uv run tasker --dev recipes/recipe-dev.yaml \
+              --qa recipes/recipe-qa.yaml \
+              specs/arch/99-todo.md \
+              --new-session
 ```
 
 ## CLI Options
@@ -148,6 +170,8 @@ uv run tasker --dev recipes/recipe-dev.yaml \
 | `--provider` | *(goose default)* | Override goose provider |
 | `--start-phase` | *(none)* | Start from phase N (1-based) |
 | `--jj` | *(off)* | Enable Jujutsu (jj) integration for task-scoped version control |
+| `--session-scope` | `subphase` | When to rotate goose sessions: `phase` (per `##`), `subphase` (per `###`), or `task` (per `- [ ]`) |
+| `--new-session` | *(off)* | Force a new goose session on the next task (one-shot) |
 
 ## Jujutsu (jj) integration
 
@@ -178,20 +202,26 @@ The result is a **linear history with one meaningful commit per task**, no inter
 
 ## Task file format
 
-Markdown files with `## Phase N` headings and `- [ ]` / `- [x]` checkboxes:
+Markdown files with `## Phase N` headings and `- [ ]` / `- [x]` checkboxes. Optional `###` sub-phase headings group tasks for session scope control:
 
 ```markdown
 ## Phase 1 — MVP
 
+### P1-1 Setup
 - [ ] Create project workspace with Cargo.toml
 - [ ] Implement core geometry types
-- [x] Set up CI pipeline
 
-## Phase 2 — Indexing
-
+### P1-2 Features
 - [ ] Add R-Tree spatial index
 - [ ] Implement Hilbert curve sorting
+
+## Phase 2 — Advanced
+
+- [x] Set up CI pipeline
+- [ ] Add logging support
 ```
+
+The `###` headings are recognized by the parser and used by `--session-scope subphase` to rotate goose sessions at sub-phase boundaries. Files without `###` headings work unchanged.
 
 ## Environment variables
 
@@ -214,6 +244,40 @@ QA session:       qa_20260413_111500_d4e5f6
 These are reused across all tasks within a run via `goose run --name`, giving the agents persistent context. The Developer agent accumulates knowledge across tasks; the QA agent builds a review history.
 
 Sessions can be inspected with `goose session list`.
+
+### Session scope (`--session-scope`)
+
+By default, goose sessions accumulate context across all tasks in a run. For large task files (20+ tasks), this can cause the context window to fill up, leading to truncated responses. The `--session-scope` option controls when new sessions are created:
+
+| Scope | Flag | Boundary | When sessions rotate |
+|-------|------|----------|---------------------|
+| `phase` | `--session-scope phase` | `##` heading | Once per phase — most context, risk of overflow |
+| `subphase` (default) | `--session-scope subphase` | `###` heading | Once per sub-phase — good balance |
+| `task` | `--session-scope task` | `- [ ]` item | Every task — no overflow, no cross-task context |
+
+Example with sub-phase scope:
+
+```
+Developer session: dev_20260413_111500_a1b2c3   ← P1-1 tasks
+QA session:       qa_20260413_111500_d4e5f6
+
+[P1.T4] Session scope changed: P1::P1-1 Database → P1::P1-2 API — rotating sessions
+Developer session: dev_20260413_120300_g7h8i9   ← P1-2 tasks (fresh context)
+QA session:       qa_20260413_120300_j9k0l1
+```
+
+### Manual session reset (`--new-session`)
+
+If the agent starts getting slow or confused mid-subphase, use `--new-session` to force a fresh session on the very next task:
+
+```bash
+uv run tasker --dev recipes/recipe-dev.yaml \
+              --qa recipes/recipe-qa.yaml \
+              specs/arch/99-todo.md \
+              --new-session
+```
+
+This is a one-shot flag — it fires once and then the normal scope-based rotation takes over.
 
 ## JSONL log format
 
@@ -294,6 +358,7 @@ tools/tasker/
 └── tests/
 │   ├── fixtures/
 │   │   ├── sample_tasks.md
-│   │   └── e2e_test.md
+│   │   ├── e2e_test.md
+│   │   └── subphase_tasks.md
 │   └── test_dryrun.py
 ```
