@@ -22,9 +22,26 @@ class Task:
     subphase: str = ""
     subphase_index: int = -1  # 0-based task index within its ### group (-1 if no subphase)
 
-    # JJ (Jujutsu) change tracking — set by orchestrator when jj is enabled
-    base_change_id: str | None = None   # parent change (what we diff against)
-    task_change_id: str | None = None   # the change created by `jj new` for this task
+    # VCS tracking — set by the VCS backend (jj or git) when enabled
+    base_ref: str | None = None    # parent ref (what we diff against): jj change ID or git commit hash
+    task_ref: str | None = None    # task ref: jj change ID or git branch name
+
+    # Legacy aliases (deprecated — use base_ref / task_ref)
+    @property
+    def base_change_id(self) -> str | None:
+        return self.base_ref
+
+    @base_change_id.setter
+    def base_change_id(self, value: str | None) -> None:
+        self.base_ref = value
+
+    @property
+    def task_change_id(self) -> str | None:
+        return self.task_ref
+
+    @task_change_id.setter
+    def task_change_id(self, value: str | None) -> None:
+        self.task_ref = value
 
     @property
     def label(self) -> str:
@@ -36,7 +53,15 @@ class Task:
 
     @property
     def jj_description(self) -> str:
-        """Generate a jj commit message from the task label and text."""
+        """Generate a commit message from the task label and text.
+
+        Deprecated — use vcs_description instead.
+        """
+        return self.vcs_description
+
+    @property
+    def vcs_description(self) -> str:
+        """Generate a VCS commit message from the task label and text."""
         return f"{self.label}: {self.text}"
 
 

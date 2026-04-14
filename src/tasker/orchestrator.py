@@ -26,7 +26,7 @@ from .models import (
 )
 from .parser import find_next_task, mark_task_done, parse_task_file, update_markdown
 from .ui import TaskerUI
-from . import jj as jj_mod
+from .vcs import VCSBackend, create_backend
 
 
 def _generate_session_id(prefix: str) -> str:
@@ -150,7 +150,7 @@ class Orchestrator:
         provider: str | None = None,
         cwd: str | Path | None = None,
         start_phase: int | None = None,
-        enable_jj: bool = False,
+        vcs: VCSBackend | None = None,
         session_scope: SessionScope = SessionScope.SUBPHASE,
         force_new_session: bool = False,
     ) -> None:
@@ -167,9 +167,8 @@ class Orchestrator:
         self.cwd = Path(cwd) if cwd else None
         self.start_phase = start_phase
 
-        # JJ (Jujutsu) integration
-        self.enable_jj = enable_jj
-        self._last_committed_change_id: str | None = None
+        # VCS integration (jj or git backend, or None)
+        self.vcs = vcs
 
         # Session scope — controls when new goose sessions are created
         self.session_scope = session_scope
@@ -194,20 +193,20 @@ class Orchestrator:
         self.ui.print_info(f"Iteration log:    {self.log._path}")
         self.ui.print_info("")
 
-        # Initialize JJ integration
-        if self.enable_jj:
-            if not jj_mod.jj_is_available():
-                self.ui.print_error("jj (Jujutsu) not found in PATH. Disabling jj integration.")
-                self.enable_jj = False
+        # Initialize VCS integration
+        if self.vcs is not None:
+            if not self.vcs.is_available():
+                self.ui.print_error(
+                    f"VCS tool not found in PATH. Disabling VCS integration."
+                )
+                self.vcs = None
             else:
-                # Capture the current change as the starting base
-                current = jj_mod.jj_get_current_change_id(cwd=self.cwd)
-                if current:
-                    self._last_committed_change_id = current
-                    self.ui.print_info(f"JJ integration: ON (base change: {current[:12]})")
-                else:
-                    self.ui.print_error("Could not determine current jj change. Disabling jj integration.")
-                    self.enable_jj = False
+                try:
+                    self.vcs.init(cwd=self.cwd)
+                    self.ui.print_info(f"VCS integration: ON")
+                except RuntimeError as exc:
+                    self.ui.print_error(f"VCS init failed: {exc}")
+                    self.vcs = None
 
         # Parse tasks
         self.phases = parse_task_file(self.task_file)
@@ -449,80 +448,61 @@ class Orchestrator:
         self.ui.resume()
         return True  # best effort — continue
 
-    # ── JJ integration methods ───────────────────────────────────
+    # ── VCS integration methods ────────────────────────────────
 
-    def _jj_begin_task(self, task: Task) -> None:
-        """Create a new jj change for the task.
+    def _vcs_begin_task(self, task: Task) -> None:
+        """Create an isolated workspace for the task.
 
-        Called at the start of each task when jj is enabled.
-        Sets task.base_change_id and task.task_change_id.
+        Called at the start of each task when VCS is enabled.
+        Sets task.base_ref and task.task_ref.
         """
-        if not self.enable_jj or not self._last_committed_change_id:
+        if self.vcs is None:
             return
-
-        result = jj_mod.jj_new_task(
-            parent_change_id=self._last_committed_change_id,
-            description=task.jj_description,
-            cwd=self.cwd,
-        )
-
-        if result.success:
-            task.task_change_id = jj_mod.jj_get_current_change_id(cwd=self.cwd)
-            task.base_change_id = self._last_committed_change_id
+        try:
+            self.vcs.begin_task(task, cwd=self.cwd)
+            base_display = task.base_ref[:12] if task.base_ref else "?"
+            task_display = task.task_ref[:12] if task.task_ref else "?"
             self.ui.print_info(
-                f"[{task.label}] JJ: created task change "
-                f"(base={task.base_change_id[:12]}, task={task.task_change_id[:12] if task.task_change_id else '?'})"
+                f"[{task.label}] VCS: created task workspace "
+                f"(base={base_display}, task={task_display})"
             )
-        else:
+        except RuntimeError as exc:
             self.ui.print_warning(
-                f"[{task.label}] JJ: failed to create task change: {result.stderr[:100]}. "
-                f"Continuing without jj."
+                f"[{task.label}] VCS: failed to begin task: {exc}. "
+                f"Continuing without VCS."
             )
+            self.vcs = None
 
-    def _jj_get_diff(self, task: Task) -> str:
-        """Get the jj diff for the current task.
+    def _vcs_get_diff(self, task: Task) -> str:
+        """Get the diff for the current task.
 
         Called before QA review to provide context about what changed.
         """
-        if not self.enable_jj or not task.base_change_id:
+        if self.vcs is None:
             return ""
-        result = jj_mod.jj_diff(
-            base_change_id=task.base_change_id,
-            cwd=self.cwd,
-        )
-        if result.success and result.stdout.strip():
-            return result.stdout.strip()
-        return ""
+        try:
+            return self.vcs.get_diff(task, cwd=self.cwd)
+        except RuntimeError as exc:
+            self.ui.print_warning(
+                f"[{task.label}] VCS: failed to get diff: {exc}"
+            )
+            return ""
 
-    def _jj_commit_task(self, task: Task) -> None:
-        """Commit the task's changes as a single jj commit.
+    def _vcs_commit_task(self, task: Task) -> None:
+        """Commit the task's changes as a single clean commit.
 
         Called when QA approves the task.
         """
-        if not self.enable_jj:
+        if self.vcs is None:
             return
-
-        result = jj_mod.jj_commit_task(
-            description=task.jj_description,
-            cwd=self.cwd,
-        )
-
-        if result.success:
-            # The old task_change_id is now committed; the new @ is empty.
-            # Update _last_committed_change_id to point to the committed task.
-            new_current = jj_mod.jj_get_current_change_id(cwd=self.cwd)
-            if new_current:
-                # The committed task is the parent of @
-                # We need the committed change ID, not @
-                # After `jj commit`, the committed change is @-
-                self._last_committed_change_id = task.task_change_id or new_current
+        try:
+            self.vcs.commit_task(task, cwd=self.cwd)
             self.ui.print_info(
-                f"[{task.label}] JJ: task committed "
-                f"(change={self._last_committed_change_id[:12]})"
+                f"[{task.label}] VCS: task committed"
             )
-        else:
+        except RuntimeError as exc:
             self.ui.print_warning(
-                f"[{task.label}] JJ: failed to commit task: {result.stderr[:100]}"
+                f"[{task.label}] VCS: failed to commit task: {exc}"
             )
 
     def _run_dev_with_recovery(
@@ -719,7 +699,7 @@ class Orchestrator:
     def _process_task(self, phase: Phase, task: Task) -> None:
         """Run QA→Dev feedback loop for a single task."""
         # Begin jj change for this task
-        self._jj_begin_task(task)
+        self._vcs_begin_task(task)
 
         feedback: str | None = None  # None on first iteration
 
@@ -821,7 +801,7 @@ class Orchestrator:
                     )
                     if not resolved:
                         # User skipped — mark done and move on
-                        self._jj_commit_task(task)
+                        self._vcs_commit_task(task)
                         mark_task_done(task, self.phases)
                         update_markdown(self.task_file, self.phases)
                         self.ui.update_phase(phase)
@@ -840,7 +820,7 @@ class Orchestrator:
                     self.ui.print_success(
                         f"[{task.label}] QA approved blocked task: {qa_response.feedback[:100]}"
                     )
-                    self._jj_commit_task(task)
+                    self._vcs_commit_task(task)
                     mark_task_done(task, self.phases)
                     update_markdown(self.task_file, self.phases)
                     self.ui.update_phase(phase)
@@ -873,8 +853,8 @@ class Orchestrator:
             self.ui.update_actor(Actor.QA, task.label, f"reviewing iteration {iteration}")
             self.ui.print_info(f"[{task.label}] Iteration {iteration}: calling QA...")
 
-            # Get jj diff for QA context
-            jj_diff = self._jj_get_diff(task)
+            # Get VCS diff for QA context
+            vcs_diff = self._vcs_get_diff(task)
 
             qa_request = QARequest(
                 task_label=task.label,
@@ -883,7 +863,7 @@ class Orchestrator:
                 dev_session_id=self.dev_session_name,
                 qa_session_id=self.qa_session_name,
                 iteration=iteration,
-                project_context=f"## JJ Diff (task changes)\n```\n{jj_diff}\n```" if jj_diff else "",
+                project_context=f"## VCS Diff (task changes)\n```\n{vcs_diff}\n```" if vcs_diff else "",
             )
 
             qa_result = run_goose(
@@ -949,7 +929,7 @@ class Orchestrator:
                 self.ui.print_success(
                     f"[{task.label}] ✓ APPROVED by QA: {qa_response.feedback[:100]}"
                 )
-                self._jj_commit_task(task)
+                self._vcs_commit_task(task)
                 mark_task_done(task, self.phases)
                 update_markdown(self.task_file, self.phases)
                 self.ui.update_phase(phase)
@@ -964,7 +944,7 @@ class Orchestrator:
                 )
                 if not resolved:
                     # User skipped — mark done and move on
-                    self._jj_commit_task(task)
+                    self._vcs_commit_task(task)
                     mark_task_done(task, self.phases)
                     update_markdown(self.task_file, self.phases)
                     self.ui.update_phase(phase)
@@ -1002,7 +982,7 @@ class Orchestrator:
             f"[{task.label}] Max iterations ({self.max_iterations}) reached. "
             f"Marking task done and moving on."
         )
-        self._jj_commit_task(task)
+        self._vcs_commit_task(task)
         mark_task_done(task, self.phases)
         update_markdown(self.task_file, self.phases)
         self.ui.update_phase(phase)

@@ -88,10 +88,10 @@ def main(
         "--start-phase",
         help="Start from a specific phase number (1-based). Earlier phases are marked done.",
     ),
-    jj: bool = typer.Option(
-        False,
-        "--jj",
-        help="Enable Jujutsu (jj) integration for task-scoped version control.",
+    vcs: str = typer.Option(
+        "none",
+        "--vcs",
+        help="VCS integration: 'jj' (Jujutsu), 'git' (feature branch + squash), or 'none' (default).",
     ),
     session_scope: str = typer.Option(
         "subphase",
@@ -133,6 +133,14 @@ def main(
     dev_abs = dev.resolve()
     qa_abs = qa.resolve()
 
+    # Resolve VCS backend
+    from .vcs import create_backend
+    try:
+        vcs_backend = create_backend(vcs)
+    except ValueError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(1)
+
     orchestrator = Orchestrator(
         task_file=task_file,
         dev_recipe=dev_abs,
@@ -145,7 +153,7 @@ def main(
         provider=provider,
         cwd=cwd,
         start_phase=start_phase,
-        enable_jj=jj,
+        vcs=vcs_backend,
         session_scope=SessionScope(session_scope),
         force_new_session=new_session,
     )

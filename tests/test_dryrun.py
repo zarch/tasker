@@ -788,6 +788,255 @@ def test_subphase_labels():
     print("✓ Subphase label derivation tests passed")
 
 
+# ── 20. Test VCSBackend protocol ───────────────────────────────
+
+def test_vcs_backend_protocol():
+    """Test that both backends satisfy the VCSBackend protocol."""
+    from tasker.vcs import VCSBackend, create_backend
+    from tasker.vcs.jj_backend import JJBackend
+    from tasker.vcs.git_backend import GitBackend
+
+    # Protocol check — both classes implement the protocol
+    assert isinstance(JJBackend(), VCSBackend)
+    assert isinstance(GitBackend(), VCSBackend)
+
+    # Factory tests
+    assert create_backend("none") is None
+    assert isinstance(create_backend("jj"), JJBackend)
+    assert isinstance(create_backend("git"), GitBackend)
+
+    # Invalid type raises ValueError
+    try:
+        create_backend("mercurial")
+        assert False, "Should have raised ValueError"
+    except ValueError:
+        pass
+
+    print("✓ VCSBackend protocol tests passed")
+
+
+# ── 21. Test Task VCS fields (base_ref / task_ref) ──────────────
+
+def test_task_vcs_fields():
+    """Test that Task model uses VCS-agnostic base_ref / task_ref fields."""
+    from tasker.models import Task
+
+    task = Task(
+        phase_index=0,
+        task_index=0,
+        text="Create hello world function",
+    )
+
+    # Default VCS fields
+    assert task.base_ref is None
+    assert task.task_ref is None
+
+    # Set via new names
+    task.base_ref = "abc123def456"
+    task.task_ref = "task/P1.T1"
+    assert task.base_ref == "abc123def456"
+    assert task.task_ref == "task/P1.T1"
+
+    # Legacy aliases still work (backward compat)
+    assert task.base_change_id == "abc123def456"
+    assert task.task_change_id == "task/P1.T1"
+
+    # Set via legacy names
+    task.base_change_id = "xyz789"
+    task.task_change_id = "task/P1.T2"
+    assert task.base_ref == "xyz789"
+    assert task.task_ref == "task/P1.T2"
+
+    # vcs_description property
+    assert task.vcs_description == "P1.T1: Create hello world function"
+    # jj_description is an alias
+    assert task.jj_description == task.vcs_description
+
+    print("✓ Task VCS fields tests passed")
+
+
+# ── 22. Test backward-compatible jj re-exports ─────────────────
+
+def test_jj_reexports():
+    """Test that tasker.jj re-exports all public symbols from vcs.jj_backend."""
+    from tasker import jj as jj_mod
+    from tasker.vcs.jj_backend import (
+        JJBackend,
+        JJResult,
+        _run_jj,
+        jj_commit_task,
+        jj_diff,
+        jj_get_current_change_id,
+        jj_has_changes,
+        jj_is_available,
+        jj_log,
+        jj_new_task,
+    )
+
+    # All symbols are accessible through the old location
+    assert jj_mod.jj_is_available is jj_is_available
+    assert jj_mod._run_jj is _run_jj
+    assert jj_mod.JJResult is JJResult
+    assert jj_mod.JJBackend is JJBackend
+    assert jj_mod.jj_new_task is jj_new_task
+    assert jj_mod.jj_commit_task is jj_commit_task
+    assert jj_mod.jj_diff is jj_diff
+    assert jj_mod.jj_get_current_change_id is jj_get_current_change_id
+    assert jj_mod.jj_log is jj_log
+    assert jj_mod.jj_has_changes is jj_has_changes
+
+    print("✓ JJ re-export tests passed")
+
+
+# ── 23. Test git backend helper functions ───────────────────────
+
+def test_git_backend_helpers():
+    """Test git backend helper functions."""
+    from tasker.vcs.git_backend import _sanitize_branch_name, GitBackend
+
+    # Branch name sanitization
+    assert _sanitize_branch_name("P1.T1") == "P1.T1"
+    assert _sanitize_branch_name("P1-2.T3") == "P1-2.T3"
+    assert _sanitize_branch_name("P1-4 · hay-grid — Pixel") == "P1-4-·-hay-grid-—-Pixel"
+    assert _sanitize_branch_name("task with spaces") == "task-with-spaces"
+    assert _sanitize_branch_name("special~chars^here") == "special-chars-here"
+    # Leading dots/dashes stripped
+    assert _sanitize_branch_name("..secret") == "secret"
+    assert _sanitize_branch_name("---leading") == "leading"
+
+    # GitBackend creation
+    backend = GitBackend()
+    assert isinstance(backend, object)
+    assert backend._base_branch is None
+    assert backend._base_commit is None
+
+    # is_available — git should be available
+    assert backend.is_available() is True
+
+    print("✓ Git backend helper tests passed")
+
+
+# ── 24. Test git backend init validation ────────────────────────
+
+def test_git_backend_init_errors():
+    """Test that GitBackend.init() raises on invalid states."""
+    from tasker.vcs.git_backend import GitBackend
+
+    backend = GitBackend()
+
+    # Not a git repo — init should fail
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            backend.init(cwd=tmpdir)
+            assert False, "Should have raised RuntimeError"
+        except RuntimeError as exc:
+            assert "git" in str(exc).lower() or "repository" in str(exc).lower()
+
+    print("✓ Git backend init validation tests passed")
+
+
+# ── 25. Test VCSBackend create_backend factory ──────────────────
+
+def test_create_backend_types():
+    """Test that create_backend returns the correct backend type."""
+    from tasker.vcs import create_backend
+    from tasker.vcs.jj_backend import JJBackend
+    from tasker.vcs.git_backend import GitBackend
+
+    # None
+    assert create_backend("none") is None
+
+    # JJ
+    jj = create_backend("jj")
+    assert isinstance(jj, JJBackend)
+    assert jj.is_available()  # jj should be installed
+
+    # Git
+    git = create_backend("git")
+    assert isinstance(git, GitBackend)
+    assert git.is_available()  # git should be installed
+
+    print("✓ create_backend factory tests passed")
+
+
+# ── 26. Test JJBackend protocol compliance ──────────────────────
+
+def test_jj_backend_protocol():
+    """Test JJBackend implements all VCSBackend protocol methods."""
+    from tasker.vcs.jj_backend import JJBackend
+
+    backend = JJBackend()
+
+    # Has all required methods
+    assert hasattr(backend, 'is_available')
+    assert hasattr(backend, 'init')
+    assert hasattr(backend, 'begin_task')
+    assert hasattr(backend, 'get_diff')
+    assert hasattr(backend, 'commit_task')
+
+    # All are callable
+    assert callable(backend.is_available)
+    assert callable(backend.init)
+    assert callable(backend.begin_task)
+    assert callable(backend.get_diff)
+    assert callable(backend.commit_task)
+
+    # is_available works without init
+    result = backend.is_available()
+    assert isinstance(result, bool)
+
+    print("✓ JJBackend protocol compliance tests passed")
+
+
+# ── 27. Test GitBackend protocol compliance ─────────────────────
+
+def test_git_backend_protocol():
+    """Test GitBackend implements all VCSBackend protocol methods."""
+    from tasker.vcs.git_backend import GitBackend
+
+    backend = GitBackend()
+
+    # Has all required methods
+    assert hasattr(backend, 'is_available')
+    assert hasattr(backend, 'init')
+    assert hasattr(backend, 'begin_task')
+    assert hasattr(backend, 'get_diff')
+    assert hasattr(backend, 'commit_task')
+
+    # All are callable
+    assert callable(backend.is_available)
+    assert callable(backend.init)
+    assert callable(backend.begin_task)
+    assert callable(backend.get_diff)
+    assert callable(backend.commit_task)
+
+    # is_available works without init
+    result = backend.is_available()
+    assert isinstance(result, bool)
+
+    print("✓ GitBackend protocol compliance tests passed")
+
+
+# ── 28. Test Task.vcs_description ───────────────────────────────
+
+def test_task_vcs_description():
+    """Test vcs_description property on Task."""
+    from tasker.models import Task
+
+    task = Task(phase_index=0, task_index=0, text="Build API")
+    assert task.vcs_description == "P1.T1: Build API"
+
+    # With subphase
+    task2 = Task(
+        phase_index=0, task_index=5, text="Add grid cell",
+        subphase="P1-4 Grid System", subphase_index=2,
+    )
+    assert task2.vcs_description == "P1-4.T3: Add grid cell"
+
+    print("✓ Task vcs_description tests passed")
+
+
 # ── Run all ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -810,4 +1059,13 @@ if __name__ == "__main__":
     test_backward_compat_no_subphases()
     test_task_subphase_field()
     test_subphase_labels()
-    print("\n✅ All 19 dry-run tests passed!")
+    test_vcs_backend_protocol()
+    test_task_vcs_fields()
+    test_jj_reexports()
+    test_git_backend_helpers()
+    test_git_backend_init_errors()
+    test_create_backend_types()
+    test_jj_backend_protocol()
+    test_git_backend_protocol()
+    test_task_vcs_description()
+    print("\n✅ All 28 dry-run tests passed!")
