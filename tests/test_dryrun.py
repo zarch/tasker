@@ -425,6 +425,20 @@ def test_envelope_extraction():
     assert "thinking..." in result2
     assert '{"status": "done"}' in result2
 
+    # Envelope with only user messages (goose errored before agent responded)
+    envelope_no_assistant = json.dumps({
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "do task"}]},
+        ]
+    })
+    result_no_asst = _extract_last_assistant_text(envelope_no_assistant)
+    assert result_no_asst == "", f"Expected empty string for envelope with no assistant messages, got: {result_no_asst!r}"
+
+    # Empty messages list
+    envelope_empty = json.dumps({"messages": []})
+    result_empty = _extract_last_assistant_text(envelope_empty)
+    assert result_empty == ""
+
     # Not JSON — fallback to raw
     result3 = _extract_last_assistant_text("plain text output")
     assert result3 == "plain text output"

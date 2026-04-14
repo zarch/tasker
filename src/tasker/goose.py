@@ -62,6 +62,11 @@ def _extract_last_assistant_text(raw_stdout: str) -> str:
     goose run --output-format json returns: {"messages": [...]}
     Each message has {"role": "user|assistant", "content": [{"type": "text", "text": "..."}]}
     We concatenate all assistant texts and return them for JSON extraction.
+
+    Returns empty string when the envelope is valid but contains no assistant
+    messages (e.g. goose errored before the agent responded), so that
+    _extract_json_block correctly returns None instead of parsing the envelope
+    itself as a structured response.
     """
     try:
         envelope = json.loads(raw_stdout)
@@ -76,6 +81,9 @@ def _extract_last_assistant_text(raw_stdout: str) -> str:
                             assistant_texts.append(content["text"])
             if assistant_texts:
                 return "\n\n".join(assistant_texts)
+            # Valid envelope but no assistant messages — return empty so
+            # _extract_json_block returns None (not the envelope itself)
+            return ""
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
     return raw_stdout
