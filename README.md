@@ -1,6 +1,6 @@
 # tasker
 
-Goose-based task orchestration CLI with a QA/Dev feedback loop, interactive issue resolution, graceful error recovery, and optional Jujutsu (jj) version control integration.
+Goose-based task orchestration CLI with a QA/Dev feedback loop, interactive issue resolution, graceful error recovery, and optional version control integration (Jujutsu or Git).
 
 `tasker` reads a markdown task list, assigns each task to a **Developer** goose agent, then sends the result to a **QA Reviewer** goose agent. If QA rejects the work, feedback is routed back to the developer in a loop until the task is approved — then the next task begins. When agents encounter blockers or return malformed output, `tasker` escalates gracefully through multiple recovery strategies, including an interactive chat mode where the user can resolve ambiguities directly.
 
@@ -134,7 +134,13 @@ uv run tasker --dev recipes/recipe-dev.yaml \
 uv run tasker --dev recipes/recipe-dev.yaml \
               --qa recipes/recipe-qa.yaml \
               specs/arch/99-todo.md \
-              --jj
+              --vcs jj
+
+# With Git integration — each task gets a squash-merged commit on a feature branch
+uv run tasker --dev recipes/recipe-dev.yaml \
+              --qa recipes/recipe-qa.yaml \
+              specs/arch/99-todo.md \
+              --vcs git
 
 # Rotate sessions per phase (## heading) instead of default sub-phase
 uv run tasker --dev recipes/recipe-dev.yaml \
@@ -169,36 +175,57 @@ uv run tasker --dev recipes/recipe-dev.yaml \
 | `--model` | *(goose default)* | Override goose model |
 | `--provider` | *(goose default)* | Override goose provider |
 | `--start-phase` | *(none)* | Start from phase N (1-based) |
-| `--jj` | *(off)* | Enable Jujutsu (jj) integration for task-scoped version control |
+| `--vcs` | `none` | VCS integration: `jj` (Jujutsu), `git` (feature branch + squash merge), or `none` (disabled) |
 | `--session-scope` | `subphase` | When to rotate goose sessions: `phase` (per `##`), `subphase` (per `###`), or `task` (per `- [ ]`) |
 | `--new-session` | *(off)* | Force a new goose session on the next task (one-shot) |
 
-## Jujutsu (jj) integration
+## Version control integration
 
-When `--jj` is enabled, `tasker` creates one clean commit per task using [Jujutsu](https://github.com/jj-vcs/jj). The project directory must already be a jj repository (initialized with `jj git init`).
+`tasker` supports optional VCS integration via the `--vcs` flag. When enabled, each approved task produces one clean commit, and the diff is injected into the QA prompt as `project_context` so QA sees exactly what changed.
 
-### Workflow (Option A — single commit per task)
+Two backends are available:
+
+| Backend | Flag | How it works |
+|---------|------|-------------|
+| **Jujutsu** | `--vcs jj` | Each task gets an isolated `jj new` change, committed on approval. Linear history, one commit per task. |
+| **Git** | `--vcs git` | Each task gets a feature branch. On approval, the branch is squash-merged onto the base branch as a single commit. |
+| None | `--vcs none` (default) | No version control — tasks are marked `[x]` in the markdown file only. |
+
+### Jujutsu (jj) backend
+
+When `--vcs jj` is enabled, the project directory must already be a jj repository (initialized with `jj git init`).
 
 ```
-base ──► jj new "Task: P1.T1" ──► dev implements ──► QA reviews jj diff ──► jj commit ──► next task
+base ──► jj new "P1.T1: <task>" ──► dev implements ──► QA reviews diff ──► jj commit ──► next task
 ```
 
 1. **Task begin**: `jj new <parent_change> -m "P1.T1: <task text>"` creates an isolated working-copy change.
 2. **Developer** implements the task (no version control commands needed — jj tracks everything automatically).
-3. **QA review**: `jj diff --from <base_change>` is computed and injected into the QA prompt as `project_context`, so QA sees exactly what changed.
-4. **Task approved**: `jj commit -m "P1.T1: <task text>"` finalizes the change into a single clean commit.
+3. **QA review**: `jj diff --from <base_change>` is computed and injected into the QA prompt as `project_context`.
+4. **Task approved**: The orchestrator marks the task `[x]` in the markdown file, then `jj commit` finalizes the change into a single clean commit.
 5. **Task rejected**: The working-copy change is reused — the developer's next iteration builds on the same change. On approval, only the final state is committed.
 6. **Next task**: `jj new <committed_change>` chains from the previous task's commit.
 
-The result is a **linear history with one meaningful commit per task**, no intermediate checkpoints.
+**Requirements**: `jj` on `PATH`, a jj repository, at least one base commit.
 
-> **Important**: All jj commands use the `-m` flag to avoid opening `$EDITOR`. No manual intervention is ever required.
+### Git backend
 
-### Requirements
+When `--vcs git` is enabled, the working directory must be a clean git repository on a branch.
 
-- `jj` must be installed and on `PATH`
-- The working directory must be a jj repository (`jj git init` or colocated with `.jj/`)
-- At least one base commit must exist before running tasker with `--jj`
+```
+base ──► git checkout -b task/P1.T1 ──► dev implements ──► QA reviews diff ──► squash merge ──► next task
+```
+
+1. **Task begin**: `git checkout -b task/<label>` creates a feature branch from the current HEAD.
+2. **Developer** implements the task (commits freely on the feature branch).
+3. **QA review**: `git diff <base_commit>..<feature_branch>` is computed and injected into the QA prompt as `project_context`.
+4. **Task approved**: The orchestrator marks the task `[x]` in the markdown, then the feature branch is squash-merged onto the base branch as a single commit (`git merge --squash` + `git commit`). The feature branch is deleted.
+5. **Task rejected**: The feature branch is reused — the developer's next iteration builds on the same branch. On approval, only the final state is squash-merged.
+6. **Next task**: A new feature branch is created from the updated base branch HEAD.
+
+**Requirements**: `git` on `PATH`, a git repository on a branch (not detached HEAD), clean working tree at startup.
+
+> **Important**: All VCS commands use flags to avoid opening `$EDITOR`. No manual intervention is ever required.
 
 ## Task file format
 
@@ -320,8 +347,9 @@ Recipe parameters are passed via `--params` and substituted into the `prompt:` t
 | **Dev subprocess crashes** | Logged as error, retried within current recovery stage. (Timeouts are handled separately — see below.) |
 | **Max QA↔Dev iterations reached** | Task is skipped (not marked done — will retry on next run). |
 | **Max chat turns reached** | Best-effort continue — pipeline resumes. |
-| **`--jj` enabled but no jj repo** | JJ integration silently disabled with a warning. Tasks run normally without version control. |
-| **`--jj` enabled but no base commit** | JJ integration silently disabled. A warning is printed suggesting `jj commit` first. |
+| **VCS enabled but tool not found** | VCS silently disabled with a warning. Tasks run normally without version control. |
+| **VCS init fails (no repo, detached HEAD, dirty tree)** | VCS silently disabled with a warning. Tasks run normally without version control. |
+| **Git feature branch has no changes** | Squash merge skipped — empty commit is avoided. Branch is cleaned up. |
 | **Developer times out (default 10min)** | Process is killed. Dev returns a blocked response with timeout context. On next iteration, dev is relaunched with awareness it was stuck and told to finish quickly. |
 | **QA times out (default 10min)** | Treated as rejection. Dev gets feedback explaining QA timed out, so dev can retry without waiting for a review. |
 | **QA times out during chat** | Chat continues — the timeout is logged and QA response falls through to raw text display.
@@ -349,10 +377,14 @@ tools/tasker/
 │   ├── models.py                # Dataclasses (Task, Phase, payloads, RecoveryStage)
 │   ├── parser.py                # Markdown task-list parser
 │   ├── goose.py                 # Goose subprocess runner + JSON extraction
-│   ├── orchestrator.py          # QA↔Dev loop + recovery + chat mode
-│   ├── jj.py                    # Jujutsu (jj) VCS integration helpers
+│   ├── orchestrator.py          # QA↔Dev loop + recovery + chat mode + VCS integration
+│   ├── jj.py                    # Backward-compat re-exports (see vcs/jj_backend.py)
 │   ├── log.py                   # JSONL iteration logger
-│   └── ui.py                    # Rich progress bars + live table + chat input
+│   ├── ui.py                    # Rich progress bars + live table + chat input
+│   └── vcs/
+│       ├── __init__.py          # VCSBackend protocol + create_backend() factory
+│       ├── jj_backend.py        # Jujutsu VCS backend (jj new/commit/diff)
+│       └── git_backend.py       # Git VCS backend (feature branch + squash merge)
 ├── docs/
 │   └── jj-option-b.md           # Option B checkpointing workflow (future)
 └── tests/
