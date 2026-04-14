@@ -152,7 +152,7 @@ class Orchestrator:
         session_scope: SessionScope = SessionScope.SUBPHASE,
         force_new_session: bool = False,
     ) -> None:
-        self.task_file = Path(task_file)
+        self.task_file = Path(task_file).resolve()
         self.dev_recipe = Path(dev_recipe)
         self.qa_recipe = Path(qa_recipe)
         self.log = IterationLog(log_file)
@@ -508,6 +508,20 @@ class Orchestrator:
         except RuntimeError as exc:
             self.ui.print_warning(f"[{task.label}] VCS: failed to commit task: {exc}")
 
+    def _finalize_task(self, phase: Phase, task: Task) -> None:
+        """Mark a task as done, update the markdown file, then VCS-commit.
+
+        The order matters: update_markdown MUST run before _vcs_commit_task
+        so that the [x] checkbox change is included in the VCS commit.
+        Otherwise the markdown change lives only in the working tree and
+        is never committed (git) or is lost on the next task's branch switch.
+        """
+        mark_task_done(task, self.phases)
+        update_markdown(self.task_file, self.phases)
+        self._vcs_commit_task(task)
+        self.ui.update_phase(phase)
+        self.ui.update_project(self.phases, phase)
+
     def _run_dev_with_recovery(
         self,
         task: Task,
@@ -838,11 +852,7 @@ class Orchestrator:
                     )
                     if not resolved:
                         # User skipped — mark done and move on
-                        self._vcs_commit_task(task)
-                        mark_task_done(task, self.phases)
-                        update_markdown(self.task_file, self.phases)
-                        self.ui.update_phase(phase)
-                        self.ui.update_project(self.phases, phase)
+                        self._finalize_task(phase, task)
                         return
                     # Issue resolved via chat — loop back so dev retries
                     feedback = (
@@ -857,11 +867,7 @@ class Orchestrator:
                     self.ui.print_success(
                         f"[{task.label}] QA approved blocked task: {qa_response.feedback[:100]}"
                     )
-                    self._vcs_commit_task(task)
-                    mark_task_done(task, self.phases)
-                    update_markdown(self.task_file, self.phases)
-                    self.ui.update_phase(phase)
-                    self.ui.update_project(self.phases, phase)
+                    self._finalize_task(phase, task)
                     return
 
                 else:
@@ -985,11 +991,7 @@ class Orchestrator:
                 self.ui.print_success(
                     f"[{task.label}] ✓ APPROVED by QA: {qa_response.feedback[:100]}"
                 )
-                self._vcs_commit_task(task)
-                mark_task_done(task, self.phases)
-                update_markdown(self.task_file, self.phases)
-                self.ui.update_phase(phase)
-                self.ui.update_project(self.phases, phase)
+                self._finalize_task(phase, task)
                 return
 
             elif qa_response.decision == "needs_user_input":
@@ -1000,11 +1002,7 @@ class Orchestrator:
                 )
                 if not resolved:
                     # User skipped — mark done and move on
-                    self._vcs_commit_task(task)
-                    mark_task_done(task, self.phases)
-                    update_markdown(self.task_file, self.phases)
-                    self.ui.update_phase(phase)
-                    self.ui.update_project(self.phases, phase)
+                    self._finalize_task(phase, task)
                     return
                 # Issue resolved via chat — loop back so dev retries with updated context
                 feedback = (
@@ -1036,11 +1034,7 @@ class Orchestrator:
             f"[{task.label}] Max iterations ({self.max_iterations}) reached. "
             f"Marking task done and moving on."
         )
-        self._vcs_commit_task(task)
-        mark_task_done(task, self.phases)
-        update_markdown(self.task_file, self.phases)
-        self.ui.update_phase(phase)
-        self.ui.update_project(self.phases, phase)
+        self._finalize_task(phase, task)
         self.log.append(
             IterationEntry(
                 timestamp=_now_iso(),

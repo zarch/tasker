@@ -231,18 +231,42 @@ class GitBackend:
         """Squash-merge the feature branch onto the base branch.
 
         Workflow:
-        1. Switch back to base branch
-        2. `git merge --squash <feature-branch>` — stages all changes without committing
-        3. `git commit -m <message>` — single clean commit
-        4. Delete the feature branch
+        1. Capture any unstaged working-tree changes (e.g. task-file
+           checkbox marks written by the orchestrator) into the feature
+           branch so they survive the branch switch.
+        2. Switch back to base branch
+        3. ``git merge --squash <feature-branch>`` — stages all changes
+        4. ``git commit -m <message>`` — single clean commit
+        5. Delete the feature branch
 
-        If the feature branch has no changes (empty diff), we skip the merge
-        to avoid committing an empty commit.
+        If the feature branch has no changes (empty diff), we skip the
+        merge to avoid committing an empty commit.
         """
         if not self._base_branch or not task.task_ref:
             return
 
         feature_branch = task.task_ref
+
+        # ── Step 0: Capture unstaged changes into the feature branch ──
+        # The orchestrator may have written to the task file (e.g. marking
+        # a checkbox [x]) *after* the developer finished but *before*
+        # calling commit_task.  We must fold those changes into the feature
+        # branch so they survive the upcoming ``git checkout`` of the base.
+        status = _run_git(["status", "--porcelain"], cwd=cwd)
+        if status.success and status.stdout.strip():
+            # There are uncommitted changes — stage them
+            _run_git(["add", "-A"], cwd=cwd)
+            # If the developer made commits on this branch, amend the last
+            # one.  Otherwise (HEAD == base_commit) a regular commit is
+            # needed to avoid amending the base and creating divergent history.
+            head = _get_commit_hash("HEAD", cwd=cwd)
+            if head and head != self._base_commit:
+                _run_git(["commit", "--amend", "--no-edit"], cwd=cwd)
+            else:
+                _run_git(
+                    ["commit", "-m", task.vcs_description],
+                    cwd=cwd,
+                )
 
         # Check if there are any changes to merge
         diff_check = _run_git(
