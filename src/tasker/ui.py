@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass, field
+
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -15,6 +18,60 @@ from .models import Actor, IterationEntry, Phase, TaskStatus
 import structlog
 
 log = structlog.get_logger(__name__)
+
+
+# Braille spinner frames — animated dots that convey "running"
+_SPINNER_FRAMES = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+
+
+@dataclass
+class _PendingIteration:
+    """Tracks a running dev/QA call that should appear as a live row in the table."""
+
+    actor: Actor
+    task_label: str
+    detail: str = ""
+    start: float = field(default_factory=time.monotonic)
+
+
+class _ActivityRenderable:
+    """Rich renderable that shows a pulsing elapsed-time indicator.
+
+    Designed to be placed inside the header panel while a goose subprocess
+    is running.  It updates via the Live refresh loop (no extra thread
+    needed for rendering — we just read ``time.monotonic()`` each refresh).
+    """
+
+    __slots__ = ("_start", "_stopped", "_label")
+
+    def __init__(self, label: str) -> None:
+        self._start = time.monotonic()
+        self._stopped = False
+        self._label = label
+
+    def stop(self) -> None:
+        self._stopped = True
+
+    @property
+    def elapsed_secs(self) -> float:
+        return time.monotonic() - self._start
+
+    def __rich_console__(self, console, options):
+        elapsed = self.elapsed_secs
+        minutes = int(elapsed) // 60
+        seconds = int(elapsed) % 60
+
+        # Cycle through animation frames to show liveness
+        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        frame_idx = int(elapsed * 4) % len(frames)
+        spinner = frames[frame_idx] if not self._stopped else "✔"
+
+        elapsed_str = f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
+
+        yield Text(
+            f"  {spinner} {self._label}  ({elapsed_str})",
+            style="bold yellow" if not self._stopped else "bold green",
+        )
 
 
 class TaskerUI:
@@ -45,6 +102,13 @@ class TaskerUI:
 
         # Accumulated iteration entries for the live table
         self._iteration_entries: list[IterationEntry] = []
+
+        # Activity indicator state
+        self._activity: _ActivityRenderable | None = None
+        self._activity_label: str = ""
+
+        # Pending iteration row — shows animated spinner while dev/QA runs
+        self._pending: _PendingIteration | None = None
 
     def start(self) -> Live:
         log.debug("ui.live_started")
@@ -135,6 +199,74 @@ class TaskerUI:
         self._layout["header"].update(panel)
         self._refresh()
 
+    # ── Activity indicator (header panel) ────────────────────────
+
+    def activity_start(self, label: str) -> None:
+        """Start a live elapsed-time spinner in the header panel.
+
+        Call ``activity_stop()`` when the work is done.  The Rich Live
+        refresh loop will keep the spinner and elapsed time updated
+        automatically (no extra thread needed).
+        """
+        log.debug("ui.activity_started", label=label)
+        self._activity_label = label
+        self._activity = _ActivityRenderable(label)
+        if self._layout:
+            self._layout["header"].update(
+                Panel(self._activity, title="tasker", style="yellow")
+            )
+            self._refresh()
+
+    def activity_stop(self) -> float:
+        """Stop the activity indicator and return elapsed seconds."""
+        if self._activity is not None:
+            elapsed = self._activity.elapsed_secs
+            self._activity.stop()
+            self._activity = None
+            log.debug(
+                "ui.activity_stopped",
+                label=self._activity_label,
+                elapsed=round(elapsed, 2),
+            )
+            self._activity_label = ""
+            return elapsed
+        return 0.0
+
+    def activity_detail(self, detail: str) -> None:
+        """Update the activity label in-place (e.g. add iteration info)."""
+        if self._activity is not None:
+            self._activity._label = detail
+            if self._layout:
+                self._refresh()
+
+    # ── Pending iteration indicator (table row) ──────────────────
+
+    def set_pending_iteration(
+        self, actor: Actor, task_label: str, detail: str = ""
+    ) -> None:
+        """Show an animated "running" row in the iteration table.
+
+        Call ``clear_pending_iteration()`` when the goose call returns.
+        The Rich Live refresh loop keeps the spinner animated automatically.
+        """
+        log.debug(
+            "ui.pending_started",
+            actor=actor.value,
+            task_label=task_label,
+            detail=detail,
+        )
+        self._pending = _PendingIteration(
+            actor=actor, task_label=task_label, detail=detail
+        )
+        self._refresh_table()
+
+    def clear_pending_iteration(self) -> None:
+        """Remove the animated "running" row from the iteration table."""
+        self._pending = None
+        self._refresh_table()
+
+    # ── Iteration table ──────────────────────────────────────────
+
     def add_iteration(self, entry: IterationEntry) -> None:
         """Add a row to the iteration table."""
         self._iteration_entries.append(entry)
@@ -153,24 +285,37 @@ class TaskerUI:
         for entry in self._iteration_entries[-20:]:  # show last 20
             status_color = status_colors.get(entry.status, "white")
             actor_str = "[QA]" if entry.actor == Actor.QA else "[DEV]"
-            summary = ""
-            if entry.payload:
-                if entry.actor == Actor.DEV:
-                    summary = entry.payload.get("summary", "")[:60]
-                elif entry.actor == Actor.QA:
-                    summary = entry.payload.get("decision", "")[:60]
-                    if entry.payload.get("feedback"):
-                        summary += f" — {entry.payload['feedback'][:40]}"
+            summary = _entry_summary(entry)
 
             table.add_row(
                 f"#{entry.iteration}",
-                entry.timestamp.split("T")[1].split(".")[0]
-                if "T" in entry.timestamp
-                else entry.timestamp,
+                _format_timestamp(entry.timestamp),
                 f"[{status_color}]{actor_str}[/{status_color}]",
                 entry.task_label,
                 f"[{status_color}]{entry.status.value}[/{status_color}]",
                 summary[:80],
+            )
+
+        # Animated pending row — shows while dev/QA subprocess is running
+        if self._pending is not None:
+            p = self._pending
+            elapsed = time.monotonic() - p.start
+            frame_idx = int(elapsed * 3) % len(_SPINNER_FRAMES)
+            spinner = _SPINNER_FRAMES[frame_idx]
+            minutes = int(elapsed) // 60
+            seconds = int(elapsed) % 60
+            elapsed_str = f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
+            actor_str = "[QA]" if p.actor == Actor.QA else "[DEV]"
+            now = time.strftime("%H:%M:%S")
+            detail_suffix = f" ({p.detail})" if p.detail else ""
+
+            table.add_row(
+                "…",
+                now,
+                f"[bold yellow]{actor_str}[/bold yellow]",
+                p.task_label,
+                f"[bold yellow]{spinner} running ({elapsed_str})[/bold yellow]",
+                f"[dim]waiting{detail_suffix}[/dim]",
             )
 
         if self._layout:
@@ -189,7 +334,7 @@ class TaskerUI:
         table.add_column("Time", style="dim", width=10)
         table.add_column("Actor", width=8)
         table.add_column("Task", width=10)
-        table.add_column("Status", width=14)
+        table.add_column("Status", width=20)
         table.add_column("Summary", max_width=80)
         return table
 
@@ -230,7 +375,7 @@ class TaskerUI:
             "[dim]Type your answer and press Enter. "
             "The QA agent will process your response.\n"
             "Type /done when you believe the issue is resolved to exit chat mode.\n"
-            "Type /skip to mark the task as done and move on.[/dim]"
+            "Type /skip to mark the as done and move on.[/dim]"
         )
         self.console.print()
 
@@ -267,3 +412,49 @@ class TaskerUI:
         self.console.print("[yellow]Task skipped by user.[/yellow]")
         self.console.rule()
         self.console.print()
+
+
+# ── Module-level helpers ──────────────────────────────────────────
+
+
+def _format_timestamp(ts: str) -> str:
+    """Extract HH:MM:SS from an ISO timestamp."""
+    if "T" in ts:
+        return ts.split("T")[1].split(".")[0][:8]
+    return ts[:8]
+
+
+def _entry_summary(entry: IterationEntry) -> str:
+    """Build a human-readable summary string for an iteration entry."""
+    if not entry.payload:
+        return ""
+    if entry.actor == Actor.DEV:
+        # Check for error payloads
+        error = entry.payload.get("error", "")
+        if error:
+            if error == "timeout":
+                return f"⏱ Timeout after {entry.payload.get('duration', '?')}s"
+            if error == "subprocess_failed":
+                return (
+                    f"💥 Subprocess failed (rc={entry.payload.get('return_code', '?')})"
+                )
+            if error == "malformed_output":
+                stage = entry.payload.get("stage", "")
+                return f"⚠ Malformed JSON (stage={stage})"
+            return f"Error: {error}"
+        summary = entry.payload.get("summary", "")[:60]
+        if entry.payload.get("status") == "blocked":
+            blocker = entry.payload.get("blocker_description", "")[:50]
+            return f"🚫 Blocked: {blocker}" if blocker else summary
+        return summary
+    if entry.actor == Actor.QA:
+        decision = entry.payload.get("decision", "")[:60]
+        feedback = entry.payload.get("feedback", "")[:40]
+        if decision:
+            prefix = {"approve": "✓", "reject": "✗", "needs_user_input": "❓"}.get(
+                decision, ""
+            )
+            suffix = f" — {feedback}" if feedback else ""
+            return f"{prefix} {decision}{suffix}"
+        return feedback
+    return ""

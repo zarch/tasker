@@ -40,12 +40,12 @@ tools/tasker/
 │   ├── main.py               # Typer CLI app definition
 │   ├── models.py             # All dataclasses & enums (Task, Phase, payloads, RecoveryStage, SessionScope)
 │   ├── parser.py             # Markdown task-list parser (Phase/Task extraction)
-│   ├── goose.py              # Goose subprocess runner + JSON extraction
+│   ├── goose.py              # Goose subprocess runner, JSON extraction, heartbeat thread
 │   ├── orchestrator.py       # Core QA↔Dev loop, recovery, chat mode, VCS integration
 │   ├── jj.py                 # Backward-compat re-exports (see vcs/jj_backend.py)
 │   ├── log.py                # Append-only JSONL iteration logger
 │   ├── monitoring.py         # structlog configuration + setup (observability)
-│   ├── ui.py                 # Rich Live UI (progress bars, iteration table, chat input)
+│   ├── ui.py                 # Rich Live UI (progress bars, iteration table, chat input, activity indicators)
 │   └── vcs/
 │       ├── __init__.py       # VCSBackend protocol + create_backend() factory
 │       ├── jj_backend.py     # Jujutsu VCS backend (jj new/commit/diff)
@@ -76,13 +76,13 @@ main.py
            ├── jj_backend.py (Jujutsu backend)
            └── git_backend.py(Git backend)
 
-goose.py          ← depends on structlog (subprocess lifecycle)
+goose.py          ← depends on structlog (subprocess lifecycle, heartbeat thread)
 parser.py         ← depends on models.py, structlog (parse events)
 log.py            ← depends on models.py
 monitoring.py     ← depends on structlog (configures root logger)
 models.py         ← standalone, no internal deps
 jj.py             ← backward-compat shim, re-exports from vcs.jj_backend
-ui.py             ← depends on models.py, structlog (lifecycle events)
+ui.py             ← depends on models.py, structlog (lifecycle events, activity indicators, pending iterations)
 ```
 
 ## Key Architecture Concepts
@@ -150,7 +150,27 @@ Both backends implement the `VCSBackend` protocol (`vcs/__init__.py`):
 
 The `jj.py` module is a backward-compatibility shim that re-exports from `vcs.jj_backend` — new code should import from `tasker.vcs` directly.
 
-## Common Tasks
+The `jj.py` module is a backward-compatibility shim that re-exports from `vcs.jj_backend` — new code should import from `tasker.vcs` directly.
+
+### 7. UI Activity Indicators & Live Feedback
+
+When a dev or QA goose subprocess is running, the UI provides two layers of real-time feedback:
+
+**Header panel** (`_ActivityRenderable`): Shows the actor icon, name, and task label with a pulsing elapsed-time counter. Managed via `ui.activity_start(label)` / `ui.activity_stop()`. The `_run_goose_with_ui()` wrapper calls these automatically around every `run_goose()` invocation.
+
+**Iteration table pending row** (`_PendingIteration`): Shows an animated braille spinner (`⣾⣽⣻⢿⡿⣟⣯⣷`) in the Status column with elapsed time, making it clear that the orchestrator is waiting for a subprocess. Managed via `ui.set_pending_iteration(actor, task_label)` / `ui.clear_pending_iteration()`. The `_run_goose_with_ui()` wrapper calls these as well.
+
+**Heartbeat thread** (`goose.py`): A background daemon thread emits `goose.heartbeat` log events every 30 seconds during subprocess waits, so the monitor log shows liveness even during long-running agent calls.
+
+**Iteration log completeness**: All iteration entries are now added to the UI table — not just successful dev responses and QA decisions. Error entries (timeout, subprocess_failed, malformed_output, blocked) and special events (max_iterations_reached, needs_user_input) all appear with human-readable summaries via `_entry_summary()` (e.g. "⏱ Timeout after 600s", "💥 Subprocess failed (rc=-1)", "⚠ Malformed JSON (stage=continue)").
+
+### 8. `_run_goose_with_ui()` Wrapper
+
+All goose subprocess calls go through `_run_goose_with_ui()` (in `orchestrator.py`), which wraps `run_goose()` with:
+- `activity_start()` / `activity_stop()` — header panel elapsed timer
+- `set_pending_iteration()` / `clear_pending_iteration()` — animated table row
+
+There are 4 call sites: chat loop QA, dev agent, QA blocker triage, and QA review. Never call `run_goose()` directly from the orchestrator — always use the wrapper.
 
 ### Running Tests
 
@@ -227,7 +247,7 @@ This updates both `pyproject.toml` and `uv.lock`.
 6. **Do NOT reorder `_finalize_task`** — the sequence `mark_task_done → update_markdown → _vcs_commit_task` is critical. The markdown `[x]` must be on disk before the VCS commit runs, or it will be lost on branch switches (git) or excluded from the commit.
 7. **Do NOT let agents run version control commands** — VCS operations are handled by the orchestrator via the `VCSBackend` protocol
 
-### 7. Structured Monitoring (`--monitor-log`)
+### 9. Structured Monitoring (`--monitor-log`)
 
 The `--monitor-log` flag controls a separate structured log file that captures **all orchestration events** (not just QA↔Dev exchanges). This complements the JSONL iteration log.
 
@@ -309,10 +329,14 @@ Accepted values (case-insensitive): `debug`, `info`, `warning` (or `warn`), `err
 | `parser.updating_markdown` | parser | debug | Rewriting checkboxes |
 | `jj.run` | vcs/jj_backend | debug | JJ subprocess command |
 | `git.run` | vcs/git_backend | debug | Git subprocess command |
+| `goose.heartbeat` | goose | debug | Periodic liveness ping during subprocess wait (every 30s) |
 | `ui.live_started` | ui | debug | Rich Live display started |
 | `ui.live_stopped` | ui | debug | Rich Live display stopped |
 | `ui.live_paused` | ui | debug | Live paused for chat input |
-| `ui.live_resumed` | ui | debug | Live resumed after chat |
+| `ui.live_resumed` | ui | debug | Rich Live resumed after chat |
+| `ui.activity_started` | ui | debug | Header panel activity indicator started |
+| `ui.activity_stopped` | ui | debug | Header panel activity indicator stopped |
+| `ui.pending_started` | ui | debug | Animated pending row added to iteration table |
 
 **When adding new log events:** Use dot-separated names (e.g. `module.action`), include `task_label` when available, and choose the appropriate level (`debug` for verbose/noisy, `info` for milestones, `warning` for recoverable issues, `error` for failures).
 
@@ -342,5 +366,9 @@ Tests in `test_dryrun.py` cover:
 - `_finalize_task` ordering invariant (markdown [x] must be on disk before VCS commit)
 - Monitoring setup (structlog configuration, file output, idempotency, get_logger helper)
 - Monitoring integration (parser events captured in monitor log, orchestrator task lifecycle captured)
+- UI activity indicators (`_ActivityRenderable`, header panel start/stop, elapsed timer)
+- Goose heartbeat thread (background liveness pings, structlog stdlib integration)
+- `_run_goose_with_ui` wiring (activity start/stop, pending iteration lifecycle)
+- Iteration table entries (`_format_timestamp`, `_entry_summary`, pending row with braille spinner)
 
 When adding new features, add corresponding dry-run tests — no real Goose subprocess calls.

@@ -1640,6 +1640,482 @@ def test_monitoring_invalid_level():
     print("✓ Invalid log level tests passed")
 
 
+# ── 39. Test _ActivityRenderable ──────────────────────────────────
+
+
+def test_activity_renderable():
+    """Test that the _ActivityRenderable produces elapsed time output."""
+    import time
+    from tasker.ui import _ActivityRenderable
+
+    # Create and let it run briefly
+    activity = _ActivityRenderable("🛠️ Developer — Task P1.T1")
+    assert activity._stopped is False
+    assert activity._label == "🛠️ Developer — Task P1.T1"
+
+    # Wait a tiny bit so elapsed > 0
+    time.sleep(0.05)
+    elapsed = activity.elapsed_secs
+    assert elapsed >= 0.04, f"Expected elapsed >= 0.04s, got {elapsed}"
+
+    # Stop it
+    activity.stop()
+    assert activity._stopped is True
+    # Elapsed should still be readable
+    assert activity.elapsed_secs >= 0.04
+
+    # Test label update
+    activity2 = _ActivityRenderable("initial label")
+    activity2._label = "updated label"
+    assert activity2._label == "updated label"
+
+    print("✓ _ActivityRenderable tests passed")
+
+
+# ── 40. Test TaskerUI activity_start / activity_stop ─────────────
+
+
+def test_ui_activity_indicator():
+    """Test that activity_start/activity_stop integrate with the layout."""
+    from tasker.ui import TaskerUI
+
+    ui = TaskerUI()
+    ui.init_progress()
+
+    # activity_stop when nothing started returns 0
+    elapsed = ui.activity_stop()
+    assert elapsed == 0.0
+
+    # activity_start sets internal state
+    ui.activity_start("🛠️ Developer — Task P1.T1")
+    assert ui._activity is not None
+    assert ui._activity._label == "🛠️ Developer — Task P1.T1"
+    assert ui._activity_label == "🛠️ Developer — Task P1.T1"
+
+    # activity_detail updates the label
+    ui.activity_detail("🛠️ Developer — Task P1.T1 (stage=normal)")
+    assert ui._activity._label == "🛠️ Developer — Task P1.T1 (stage=normal)"
+
+    # activity_stop clears state and returns elapsed
+    elapsed = ui.activity_stop()
+    assert elapsed >= 0.0
+    assert ui._activity is None
+    assert ui._activity_label == ""
+
+    print("✓ TaskerUI activity indicator tests passed")
+
+
+# ── 41. Test goose heartbeat thread ──────────────────────────────
+
+
+def test_goose_heartbeat_thread():
+    """Test that _heartbeat_logger emits periodic log events and stops cleanly."""
+    import structlog
+    import logging
+    import threading
+    import time
+    from tasker.goose import _heartbeat_logger
+
+    # Configure structlog to route through stdlib so our CapturingHandler
+    # can intercept heartbeat events.  Without this, structlog's default
+    # configuration (no stdlib factory) silently drops events before they
+    # reach stdlib handlers.
+    structlog.configure(
+        processors=[
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=False,
+    )
+
+    class CapturingHandler(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.DEBUG)
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    handler = CapturingHandler()
+    test_logger = logging.getLogger("tasker.goose")
+    test_logger.addHandler(handler)
+    test_logger.setLevel(logging.DEBUG)
+
+    try:
+        stop = threading.Event()
+        # Use very short interval for testing (0.1s)
+        t = threading.Thread(
+            target=_heartbeat_logger,
+            args=("test_session", stop, 0.1),
+            daemon=True,
+        )
+        t.start()
+
+        # Wait for at least one heartbeat
+        time.sleep(0.35)
+        stop.set()
+        t.join(timeout=2)
+
+        # Should have emitted at least 1 heartbeat via stdlib
+        heartbeat_records = [
+            r for r in handler.records if "goose.heartbeat" in r.getMessage()
+        ]
+        assert len(heartbeat_records) >= 1, (
+            f"Expected at least 1 heartbeat record, got {len(heartbeat_records)}. "
+            f"Records: {[r.getMessage() for r in handler.records]}"
+        )
+
+        # Thread should have stopped
+        assert not t.is_alive(), "Heartbeat thread should have stopped"
+
+        print("✓ Goose heartbeat thread tests passed")
+    finally:
+        test_logger.removeHandler(handler)
+
+
+# ── 42. Test _run_goose_with_ui wiring ───────────────────────────
+
+
+def test_run_goose_with_ui_wiring():
+    """Test that _run_goose_with_ui starts/stops activity indicator."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.goose import GooseRunResult
+    from tasker.models import Actor
+
+    with tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w") as f:
+        f.write("## Phase 1\n\n- [ ] Task A\n")
+        md_path = f.name
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+        iter_log_path = f.name
+
+    try:
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=iter_log_path,
+        )
+
+        # Mock run_goose to return immediately
+        fake_result = GooseRunResult(
+            success=True,
+            raw_stdout='{"status": "done", "summary": "ok", "files_modified": []}',
+            raw_stderr="",
+            return_code=0,
+            parsed_json={"status": "done", "summary": "ok", "files_modified": []},
+        )
+
+        activity_start_called = []
+        activity_stop_called = []
+
+        original_start = orch.ui.activity_start
+        original_stop = orch.ui.activity_stop
+
+        def spy_start(label):
+            activity_start_called.append(label)
+            original_start(label)
+
+        def spy_stop():
+            activity_stop_called.append(True)
+            return original_stop()
+
+        with patch.object(orch.ui, "activity_start", side_effect=spy_start):
+            with patch.object(orch.ui, "activity_stop", side_effect=spy_stop):
+                with patch("tasker.orchestrator.run_goose", return_value=fake_result):
+                    result = orch._run_goose_with_ui(
+                        Actor.DEV,
+                        "P1.T1",
+                        recipe_path="/dev/null",
+                        session_name="dev_test",
+                        detail="stage=normal",
+                    )
+
+        # Verify activity indicator was started and stopped
+        assert len(activity_start_called) == 1
+        assert (
+            "Developer" in activity_start_called[0] or "🛠️" in activity_start_called[0]
+        )
+        assert "P1.T1" in activity_start_called[0]
+        assert len(activity_stop_called) == 1
+
+        # Verify result was returned correctly
+        assert result.success is True
+        assert result.parsed_json is not None
+
+        print("✓ _run_goose_with_ui wiring tests passed")
+    finally:
+        Path(md_path).unlink(missing_ok=True)
+        Path(iter_log_path).unlink(missing_ok=True)
+
+
+# ── 43. Test _format_timestamp ────────────────────────────────────
+
+
+def test_format_timestamp():
+    """Test _format_timestamp extracts HH:MM:SS from ISO timestamps."""
+    from tasker.ui import _format_timestamp
+
+    # Full ISO timestamp
+    assert _format_timestamp("2026-04-15T09:30:45.123456") == "09:30:45"
+    # Without fractional seconds
+    assert _format_timestamp("2026-04-15T09:30:45") == "09:30:45"
+    # Short timestamp (no T separator)
+    assert _format_timestamp("09:30:45") == "09:30:45"
+    # Longer fractional
+    assert _format_timestamp("2026-04-15T09:30:45.1") == "09:30:45"
+
+    print("✓ _format_timestamp tests passed")
+
+
+# ── 44. Test _entry_summary ───────────────────────────────────────
+
+
+def test_entry_summary():
+    """Test _entry_summary builds human-readable summaries for all entry types."""
+    from tasker.ui import _entry_summary
+    from tasker.models import IterationEntry, Actor, TaskStatus
+    from datetime import datetime, timezone
+
+    ts = datetime.now(timezone.utc).isoformat()
+
+    # Dev: timeout
+    e = IterationEntry(
+        iteration=1,
+        timestamp=ts,
+        actor=Actor.DEV,
+        task_label="P1.T1",
+        status=TaskStatus.ERROR,
+        payload={"error": "timeout", "duration": 600},
+    )
+    assert "Timeout" in _entry_summary(e)
+    assert "600" in _entry_summary(e)
+    assert "⏱" in _entry_summary(e)
+
+    # Dev: subprocess_failed
+    e = IterationEntry(
+        iteration=2,
+        timestamp=ts,
+        actor=Actor.DEV,
+        task_label="P1.T1",
+        status=TaskStatus.ERROR,
+        payload={"error": "subprocess_failed", "return_code": -1},
+    )
+    assert "Subprocess failed" in _entry_summary(e)
+    assert "-1" in _entry_summary(e)
+    assert "💥" in _entry_summary(e)
+
+    # Dev: malformed_output
+    e = IterationEntry(
+        iteration=3,
+        timestamp=ts,
+        actor=Actor.DEV,
+        task_label="P1.T1",
+        status=TaskStatus.ERROR,
+        payload={"error": "malformed_output", "stage": "continue"},
+    )
+    assert "Malformed JSON" in _entry_summary(e)
+    assert "continue" in _entry_summary(e)
+    assert "⚠" in _entry_summary(e)
+
+    # Dev: blocked
+    e = IterationEntry(
+        iteration=4,
+        timestamp=ts,
+        actor=Actor.DEV,
+        task_label="P1.T1",
+        status=TaskStatus.IN_PROGRESS,
+        payload={
+            "status": "blocked",
+            "summary": "working",
+            "blocker_description": "can't reach API",
+        },
+    )
+    s = _entry_summary(e)
+    assert "🚫" in s
+    assert "Blocked" in s
+    assert "can't reach API" in s
+
+    # Dev: done (normal)
+    e = IterationEntry(
+        iteration=5,
+        timestamp=ts,
+        actor=Actor.DEV,
+        task_label="P1.T1",
+        status=TaskStatus.IN_PROGRESS,
+        payload={"status": "done", "summary": "Implemented feature X"},
+    )
+    assert _entry_summary(e) == "Implemented feature X"
+
+    # QA: approve
+    e = IterationEntry(
+        iteration=6,
+        timestamp=ts,
+        actor=Actor.QA,
+        task_label="P1.T1",
+        status=TaskStatus.APPROVED,
+        payload={"decision": "approve", "feedback": "LGTM"},
+    )
+    s = _entry_summary(e)
+    assert "✓" in s
+    assert "approve" in s
+    assert "LGTM" in s
+
+    # QA: reject
+    e = IterationEntry(
+        iteration=7,
+        timestamp=ts,
+        actor=Actor.QA,
+        task_label="P1.T1",
+        status=TaskStatus.FEEDBACK,
+        payload={"decision": "reject", "feedback": "Missing error handling"},
+    )
+    s = _entry_summary(e)
+    assert "✗" in s
+    assert "reject" in s
+    assert "Missing error handling" in s
+
+    # QA: needs_user_input
+    e = IterationEntry(
+        iteration=8,
+        timestamp=ts,
+        actor=Actor.QA,
+        task_label="P1.T1",
+        status=TaskStatus.IN_PROGRESS,
+        payload={"decision": "needs_user_input", "feedback": "Which API version?"},
+    )
+    s = _entry_summary(e)
+    assert "❓" in s
+    assert "needs_user_input" in s
+
+    # Empty payload
+    e = IterationEntry(
+        iteration=9,
+        timestamp=ts,
+        actor=Actor.DEV,
+        task_label="P1.T1",
+        status=TaskStatus.IN_PROGRESS,
+        payload={},
+    )
+    assert _entry_summary(e) == ""
+
+    # None payload
+    e = IterationEntry(
+        iteration=10,
+        timestamp=ts,
+        actor=Actor.DEV,
+        task_label="P1.T1",
+        status=TaskStatus.IN_PROGRESS,
+        payload=None,
+    )
+    assert _entry_summary(e) == ""
+
+    print("✓ _entry_summary tests passed")
+
+
+# ── 45. Test pending iteration lifecycle ──────────────────────────
+
+
+def test_pending_iteration_lifecycle():
+    """Test set/clear_pending_iteration manages UI state correctly."""
+    import tempfile
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Actor
+
+    with tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w") as f:
+        f.write("## Phase 1\n\n- [ ] Task A\n")
+        md_path = f.name
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+        iter_log_path = f.name
+
+    try:
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=iter_log_path,
+        )
+
+        # Initially no pending iteration
+        assert orch.ui._pending is None
+
+        # Set pending for DEV
+        orch.ui.set_pending_iteration(Actor.DEV, "P1.T1", detail="stage=normal")
+        assert orch.ui._pending is not None
+        assert orch.ui._pending.actor == Actor.DEV
+        assert orch.ui._pending.task_label == "P1.T1"
+        assert orch.ui._pending.detail == "stage=normal"
+
+        # Clear it
+        orch.ui.clear_pending_iteration()
+        assert orch.ui._pending is None
+
+        # Set pending for QA
+        orch.ui.set_pending_iteration(Actor.QA, "P1.T2")
+        assert orch.ui._pending is not None
+        assert orch.ui._pending.actor == Actor.QA
+        assert orch.ui._pending.detail == ""
+
+        orch.ui.clear_pending_iteration()
+
+        print("✓ Pending iteration lifecycle tests passed")
+    finally:
+        Path(md_path).unlink(missing_ok=True)
+        Path(iter_log_path).unlink(missing_ok=True)
+
+
+# ── 46. Test _SPINNER_FRAMES constant ─────────────────────────────
+
+
+def test_spinner_frames():
+    """Test _SPINNER_FRAMES contains expected braille characters."""
+    from tasker.ui import _SPINNER_FRAMES
+
+    assert len(_SPINNER_FRAMES) == 8
+    # Should contain braille dot characters
+    assert "⣾" in _SPINNER_FRAMES
+    assert "⣽" in _SPINNER_FRAMES
+    assert "⣻" in _SPINNER_FRAMES
+    assert "⢿" in _SPINNER_FRAMES
+    assert "⡿" in _SPINNER_FRAMES
+    assert "⣟" in _SPINNER_FRAMES
+    assert "⣯" in _SPINNER_FRAMES
+    assert "⣷" in _SPINNER_FRAMES
+
+    # All frames should be single characters
+    for frame in _SPINNER_FRAMES:
+        assert len(frame) == 1, f"Frame {frame!r} is not a single character"
+
+    print("✓ _SPINNER_FRAMES tests passed")
+
+
+# ── 47. Test _PendingIteration dataclass ──────────────────────────
+
+
+def test_pending_iteration_dataclass():
+    """Test _PendingIteration dataclass construction."""
+    import time
+    from tasker.ui import _PendingIteration
+    from tasker.models import Actor
+
+    before = time.monotonic()
+    p = _PendingIteration(actor=Actor.DEV, task_label="P1.T1", detail="test")
+    after = time.monotonic()
+
+    assert p.actor == Actor.DEV
+    assert p.task_label == "P1.T1"
+    assert p.detail == "test"
+    assert before <= p.start <= after
+
+    # Default detail should be empty
+    p2 = _PendingIteration(actor=Actor.QA, task_label="P1.T2")
+    assert p2.detail == ""
+
+    print("✓ _PendingIteration dataclass tests passed")
+
+
 # ── Run all ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1681,4 +2157,13 @@ if __name__ == "__main__":
     test_resolve_level()
     test_monitoring_log_levels()
     test_monitoring_invalid_level()
-    print("\n✅ All 38 dry-run tests passed!")
+    test_activity_renderable()
+    test_ui_activity_indicator()
+    test_goose_heartbeat_thread()
+    test_run_goose_with_ui_wiring()
+    test_format_timestamp()
+    test_entry_summary()
+    test_pending_iteration_lifecycle()
+    test_spinner_frames()
+    test_pending_iteration_dataclass()
+    print("\n✅ All 47 dry-run tests passed!")

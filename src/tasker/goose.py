@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,6 +139,25 @@ def build_goose_command(
     return cmd
 
 
+def _heartbeat_logger(
+    session: str,
+    stop_event: threading.Event,
+    interval: float = 30.0,
+) -> None:
+    """Background thread that emits periodic heartbeat log events.
+
+    Runs until ``stop_event`` is set.  Emits one ``goose.heartbeat`` event
+    every *interval* seconds so the monitor log shows the orchestrator is
+    still alive while waiting for a subprocess.
+    """
+    while not stop_event.wait(timeout=interval):
+        log.debug(
+            "goose.heartbeat",
+            session=session,
+            waiting_secs=interval,
+        )
+
+
 def run_goose(
     recipe_path: str | Path,
     session_name: str,
@@ -153,6 +173,9 @@ def run_goose(
     Uses Popen + communicate(timeout) so we can explicitly kill the
     goose process (and its children) when the timeout expires, rather
     than relying on subprocess.run which may leave orphans.
+
+    A background heartbeat thread emits periodic ``goose.heartbeat``
+    log events so the monitor log shows liveness during the wait.
 
     Returns a GooseRunResult with timed_out=True when the process is killed.
     """
@@ -183,6 +206,16 @@ def run_goose(
     env["GOOSE_AUTO_COMPACT_THRESHOLD"] = "0.35"
 
     start = time.monotonic()
+
+    # Start heartbeat thread for monitor-log liveness
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_logger,
+        args=(session_name, heartbeat_stop),
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -261,3 +294,7 @@ def run_goose(
             duration_secs=round(duration, 2),
             timed_out=False,
         )
+    finally:
+        # Always stop the heartbeat thread
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2)

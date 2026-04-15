@@ -9,7 +9,7 @@ from pathlib import Path
 
 import structlog
 
-from .goose import run_goose
+from .goose import GooseRunResult, run_goose
 from .log import IterationLog
 from .models import (
     Actor,
@@ -437,7 +437,9 @@ class Orchestrator:
                 dev_session_id=self.dev_session_name,
             )
 
-            chat_result = run_goose(
+            chat_result = self._run_goose_with_ui(
+                Actor.QA,
+                task.label,
                 recipe_path=self.qa_recipe,
                 session_name=self.qa_session_name,
                 params=chat_request.to_params(),
@@ -446,6 +448,7 @@ class Orchestrator:
                 model=self.model,
                 provider=self.provider,
                 cwd=self.cwd,
+                detail="chat response",
             )
 
             chat_qa_response = _parse_qa_response(
@@ -453,23 +456,23 @@ class Orchestrator:
             )
 
             # Log the chat exchange
-            self.log.append(
-                IterationEntry(
-                    timestamp=_now_iso(),
-                    iteration=self.global_iteration,
-                    actor=Actor.QA,
-                    task_label=task.label,
-                    status=TaskStatus.NEEDS_USER_INPUT,
-                    payload={
-                        "chat_turn": chat_turn,
-                        "user_message": user_input,
-                        "qa_response": chat_qa_response.to_dict()
-                        if chat_qa_response
-                        else None,
-                        "raw": chat_result.raw_stdout[:300],
-                    },
-                )
+            chat_entry = IterationEntry(
+                timestamp=_now_iso(),
+                iteration=self.global_iteration,
+                actor=Actor.QA,
+                task_label=task.label,
+                status=TaskStatus.NEEDS_USER_INPUT,
+                payload={
+                    "chat_turn": chat_turn,
+                    "user_message": user_input,
+                    "qa_response": chat_qa_response.to_dict()
+                    if chat_qa_response
+                    else None,
+                    "raw": chat_result.raw_stdout[:300],
+                },
             )
+            self.log.append(chat_entry)
+            self.ui.add_iteration(chat_entry)
 
             # QA timed out during chat — inform user and continue
             if chat_result.timed_out:
@@ -522,6 +525,52 @@ class Orchestrator:
         )
         self.ui.resume()
         return True  # best effort — continue
+
+    # ── Goose subprocess UI wrapper ────────────────────────────
+
+    def _run_goose_with_ui(
+        self,
+        actor: Actor,
+        task_label: str,
+        *,
+        recipe_path: str | Path,
+        session_name: str,
+        params: dict[str, str] | None = None,
+        max_turns: int = 80,
+        timeout_secs: int = 600,
+        model: str | None = None,
+        provider: str | None = None,
+        cwd: str | Path | None = None,
+        detail: str = "",
+    ) -> GooseRunResult:
+        """Run goose with UI activity indicator and pending iteration row.
+
+        Wraps :func:`run_goose` so every agent launch gets visual feedback
+        in both the header panel (elapsed timer) and the iteration log table
+        (animated spinner row).
+        """
+        icon = "🧪" if actor == Actor.QA else "🛠️"
+        name = "QA Reviewer" if actor == Actor.QA else "Developer"
+        label = f"{icon} {name} — Task {task_label}"
+        if detail:
+            label += f"  ({detail})"
+        self.ui.activity_start(label)
+        self.ui.set_pending_iteration(actor, task_label, detail=detail)
+        try:
+            result = run_goose(
+                recipe_path=recipe_path,
+                session_name=session_name,
+                params=params,
+                max_turns=max_turns,
+                timeout_secs=timeout_secs,
+                model=model,
+                provider=provider,
+                cwd=cwd,
+            )
+        finally:
+            self.ui.clear_pending_iteration()
+            self.ui.activity_stop()
+        return result
 
     # ── VCS integration methods ────────────────────────────────
 
@@ -672,7 +721,9 @@ class Orchestrator:
                 recovery_instruction=recovery_instruction,
             )
 
-            dev_result = run_goose(
+            dev_result = self._run_goose_with_ui(
+                Actor.DEV,
+                task.label,
                 recipe_path=self.dev_recipe,
                 session_name=self.dev_session_name,
                 params=dev_request.to_params(),
@@ -700,20 +751,20 @@ class Orchestrator:
                         f"[{task.label}] Dev timed out after {timeout_minutes:.0f}min — "
                         f"will relaunch with timeout context"
                     )
-                    self.log.append(
-                        IterationEntry(
-                            timestamp=_now_iso(),
-                            iteration=self.global_iteration,
-                            actor=Actor.DEV,
-                            task_label=task.label,
-                            status=TaskStatus.ERROR,
-                            payload={
-                                "error": "timeout",
-                                "duration": dev_result.duration_secs,
-                            },
-                            raw_output=dev_result.raw_stderr[:500],
-                        )
+                    dev_timeout_entry = IterationEntry(
+                        timestamp=_now_iso(),
+                        iteration=self.global_iteration,
+                        actor=Actor.DEV,
+                        task_label=task.label,
+                        status=TaskStatus.ERROR,
+                        payload={
+                            "error": "timeout",
+                            "duration": dev_result.duration_secs,
+                        },
+                        raw_output=dev_result.raw_stderr[:500],
                     )
+                    self.log.append(dev_timeout_entry)
+                    self.ui.add_iteration(dev_timeout_entry)
                     return DevResponse(
                         status="blocked",
                         summary=f"Developer agent timed out after {timeout_minutes:.0f} minutes.",
@@ -738,17 +789,17 @@ class Orchestrator:
                     f"[{task.label}] Dev subprocess failed (rc={dev_result.return_code}): "
                     f"{dev_result.raw_stderr[:200]}"
                 )
-                self.log.append(
-                    IterationEntry(
-                        timestamp=_now_iso(),
-                        iteration=self.global_iteration,
-                        actor=Actor.DEV,
-                        task_label=task.label,
-                        status=TaskStatus.ERROR,
-                        payload={"error": "subprocess_failed", "stage": stage.value},
-                        raw_output=dev_result.raw_stderr[:500],
-                    )
+                dev_crash_entry = IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.DEV,
+                    task_label=task.label,
+                    status=TaskStatus.ERROR,
+                    payload={"error": "subprocess_failed", "stage": stage.value},
+                    raw_output=dev_result.raw_stderr[:500],
                 )
+                self.log.append(dev_crash_entry)
+                self.ui.add_iteration(dev_crash_entry)
                 # Subprocess failures don't count as malformed — try again in same stage
                 if attempts_in_stage < stage.max_attempts:
                     self.ui.print_warning(
@@ -808,17 +859,17 @@ class Orchestrator:
                 f"[{task.label}] Dev did not return valid JSON (stage={stage.value}, "
                 f"attempt={attempts_in_stage}/{stage.max_attempts})"
             )
-            self.log.append(
-                IterationEntry(
-                    timestamp=_now_iso(),
-                    iteration=self.global_iteration,
-                    actor=Actor.DEV,
-                    task_label=task.label,
-                    status=TaskStatus.ERROR,
-                    payload={"error": "malformed_output", "stage": stage.value},
-                    raw_output=dev_result.raw_stdout[:500],
-                )
+            malformed_entry = IterationEntry(
+                timestamp=_now_iso(),
+                iteration=self.global_iteration,
+                actor=Actor.DEV,
+                task_label=task.label,
+                status=TaskStatus.ERROR,
+                payload={"error": "malformed_output", "stage": stage.value},
+                raw_output=dev_result.raw_stdout[:500],
             )
+            self.log.append(malformed_entry)
+            self.ui.add_iteration(malformed_entry)
 
             # Escalation logic
             if attempts_in_stage >= stage.max_attempts:
@@ -865,16 +916,16 @@ class Orchestrator:
             blocker_suggestion="Consider breaking this task into smaller, more specific subtasks. "
             "Or review if the task description is clear and complete.",
         )
-        self.log.append(
-            IterationEntry(
-                timestamp=_now_iso(),
-                iteration=self.global_iteration,
-                actor=Actor.DEV,
-                task_label=task.label,
-                status=TaskStatus.BLOCKED,
-                payload=synthetic.to_dict(),
-            )
+        synthetic_blocked_entry = IterationEntry(
+            timestamp=_now_iso(),
+            iteration=self.global_iteration,
+            actor=Actor.DEV,
+            task_label=task.label,
+            status=TaskStatus.BLOCKED,
+            payload=synthetic.to_dict(),
         )
+        self.log.append(synthetic_blocked_entry)
+        self.ui.add_iteration(synthetic_blocked_entry)
         return synthetic
 
     def _process_task(self, phase: Phase, task: Task) -> None:
@@ -936,7 +987,9 @@ class Orchestrator:
                     blocker_description=dev_response.blocker_description,
                 )
 
-                qa_result = run_goose(
+                qa_result = self._run_goose_with_ui(
+                    Actor.QA,
+                    task.label,
                     recipe_path=self.qa_recipe,
                     session_name=self.qa_session_name,
                     params=qa_blocked_request.to_params(),
@@ -945,6 +998,7 @@ class Orchestrator:
                     model=self.model,
                     provider=self.provider,
                     cwd=self.cwd,
+                    detail="blocker triage",
                 )
 
                 qa_response = _parse_qa_response(
@@ -964,20 +1018,20 @@ class Orchestrator:
                     self.ui.print_warning(
                         f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during blocker triage — treating as rejection"
                     )
-                    self.log.append(
-                        IterationEntry(
-                            timestamp=_now_iso(),
-                            iteration=self.global_iteration,
-                            actor=Actor.QA,
-                            task_label=task.label,
-                            status=TaskStatus.ERROR,
-                            payload={
-                                "error": "timeout",
-                                "duration": qa_result.duration_secs,
-                            },
-                            raw_output=qa_result.raw_stderr[:500],
-                        )
+                    qa_triage_timeout_entry = IterationEntry(
+                        timestamp=_now_iso(),
+                        iteration=self.global_iteration,
+                        actor=Actor.QA,
+                        task_label=task.label,
+                        status=TaskStatus.ERROR,
+                        payload={
+                            "error": "timeout",
+                            "duration": qa_result.duration_secs,
+                        },
+                        raw_output=qa_result.raw_stderr[:500],
                     )
+                    self.log.append(qa_triage_timeout_entry)
+                    self.ui.add_iteration(qa_triage_timeout_entry)
                     qa_response = QAResponse(
                         decision="reject",
                         feedback=_timeout_feedback("QA", self.timeout_secs),
@@ -1100,7 +1154,9 @@ class Orchestrator:
                 else "",
             )
 
-            qa_result = run_goose(
+            qa_result = self._run_goose_with_ui(
+                Actor.QA,
+                task.label,
                 recipe_path=self.qa_recipe,
                 session_name=self.qa_session_name,
                 params=qa_request.to_params(),
@@ -1128,20 +1184,20 @@ class Orchestrator:
                 self.ui.print_warning(
                     f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during review — treating as rejection"
                 )
-                self.log.append(
-                    IterationEntry(
-                        timestamp=_now_iso(),
-                        iteration=self.global_iteration,
-                        actor=Actor.QA,
-                        task_label=task.label,
-                        status=TaskStatus.ERROR,
-                        payload={
-                            "error": "timeout",
-                            "duration": qa_result.duration_secs,
-                        },
-                        raw_output=qa_result.raw_stderr[:500],
-                    )
+                qa_review_timeout_entry = IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.QA,
+                    task_label=task.label,
+                    status=TaskStatus.ERROR,
+                    payload={
+                        "error": "timeout",
+                        "duration": qa_result.duration_secs,
+                    },
+                    raw_output=qa_result.raw_stderr[:500],
                 )
+                self.log.append(qa_review_timeout_entry)
+                self.ui.add_iteration(qa_review_timeout_entry)
                 qa_response = QAResponse(
                     decision="reject",
                     feedback=_timeout_feedback("QA", self.timeout_secs),
@@ -1245,13 +1301,13 @@ class Orchestrator:
             f"Marking task done and moving on."
         )
         self._finalize_task(phase, task)
-        self.log.append(
-            IterationEntry(
-                timestamp=_now_iso(),
-                iteration=self.global_iteration,
-                actor=Actor.QA,
-                task_label=task.label,
-                status=TaskStatus.ERROR,
-                payload={"error": "max_iterations_reached"},
-            )
+        max_iter_entry = IterationEntry(
+            timestamp=_now_iso(),
+            iteration=self.global_iteration,
+            actor=Actor.QA,
+            task_label=task.label,
+            status=TaskStatus.ERROR,
+            payload={"error": "max_iterations_reached"},
         )
+        self.log.append(max_iter_entry)
+        self.ui.add_iteration(max_iter_entry)
