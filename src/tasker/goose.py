@@ -13,8 +13,44 @@ from pathlib import Path
 
 import structlog
 
+from .models import RateLimitConfig
 
 log = structlog.get_logger(__name__)
+
+
+# -- Patterns that indicate a transient connection / rate-limit error -------
+
+_CONNECTION_ERROR_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"error:\s*not connected",
+        r"connection\s+(refused|reset|timed?\s*out|closed|dropped)",
+        r"rate\s*limit",
+        r"too\s+many\s+requests",
+        r"429",
+        r"503\s+service\s+unavailable",
+        r"502\s+bad\s+gateway",
+        r"quota\s+(exceeded|limit)",
+        r"temporarily\s+unavailable",
+        r"epoll\s+wait",
+        r"broken\s+pipe",
+    )
+]
+
+
+def is_connection_error(stderr: str, return_code: int | None = None) -> bool:
+    """Return True if the failure looks like a transient connection/rate-limit issue.
+
+    Heuristic: the goose subprocess exited with a non-zero code (typically 1)
+    and its stderr contains a known transient-error phrase.
+    """
+    if not stderr:
+        return False
+    # Fast path: check against known patterns
+    for pat in _CONNECTION_ERROR_PATTERNS:
+        if pat.search(stderr):
+            return True
+    return False
 
 
 @dataclass
@@ -113,6 +149,7 @@ def build_goose_command(
     cmd = [
         "goose",
         "run",
+        "--no-profile",
         "--recipe",
         str(recipe_path),
         "--name",
@@ -122,8 +159,6 @@ def build_goose_command(
         "--quiet",
         "--max-turns",
         str(max_turns),
-        "--with-builtin",
-        "developer",
     ]
     if params:
         for key, value in params.items():
@@ -203,7 +238,7 @@ def run_goose(
     # Merge required env vars with the current process environment
     env = os.environ.copy()
     env["GOOSE_CONTEXT_STRATEGY"] = "summarize"
-    env["GOOSE_AUTO_COMPACT_THRESHOLD"] = "0.35"
+    env["GOOSE_AUTO_COMPACT_THRESHOLD"] = "0.55"
 
     start = time.monotonic()
 
@@ -276,7 +311,7 @@ def run_goose(
                 success=False,
                 raw_stdout="",
                 raw_stderr=(
-                    f"TIMEOUT after {timeout_secs}s ({timeout_minutes:.0f}min) — "
+                    f"TIMEOUT after {timeout_secs}s ({timeout_minutes:.0f}min) \u2014 "
                     f"goose process killed"
                 ),
                 return_code=-1,
@@ -298,3 +333,86 @@ def run_goose(
         # Always stop the heartbeat thread
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=2)
+
+
+def run_goose_with_backoff(
+    recipe_path: str | Path,
+    session_name: str,
+    params: dict[str, str] | None = None,
+    max_turns: int = 80,
+    timeout_secs: int = 600,
+    model: str | None = None,
+    provider: str | None = None,
+    cwd: str | Path | None = None,
+    rate_limit: RateLimitConfig | None = None,
+) -> GooseRunResult:
+    """Run goose with automatic retry on transient connection errors.
+
+    Wraps :func:`run_goose` and adds exponential backoff when the subprocess
+    fails with a detected connection/rate-limit error (e.g. "Error: not
+    connected").  Non-connection failures and successful runs are returned
+    immediately without any retry.
+
+    The backoff delay is controlled by *rate_limit* (defaults to sensible
+    values when ``None``).
+
+    Returns the last :class:`GooseRunResult` -- either a successful run or
+    the final failure after exhausting retries.
+    """
+    if rate_limit is None:
+        rate_limit = RateLimitConfig()
+    if not rate_limit.enabled:
+        return run_goose(
+            recipe_path=recipe_path,
+            session_name=session_name,
+            params=params,
+            max_turns=max_turns,
+            timeout_secs=timeout_secs,
+            model=model,
+            provider=provider,
+            cwd=cwd,
+        )
+
+    attempt = 0
+    while True:
+        attempt += 1
+        result = run_goose(
+            recipe_path=recipe_path,
+            session_name=session_name,
+            params=params,
+            max_turns=max_turns,
+            timeout_secs=timeout_secs,
+            model=model,
+            provider=provider,
+            cwd=cwd,
+        )
+
+        # --- Success or non-connection failure: return immediately ---
+        if result.success or result.timed_out:
+            return result
+
+        if not is_connection_error(result.raw_stderr, result.return_code):
+            return result
+
+        # --- Transient connection error detected ---
+        if attempt >= rate_limit.max_retries:
+            log.warning(
+                "goose.backoff.exhausted",
+                session=session_name,
+                attempt=attempt,
+                max_retries=rate_limit.max_retries,
+                stderr=result.raw_stderr[:200],
+            )
+            return result  # give up, let the caller/recovery pipeline handle it
+
+        delay = rate_limit.next_delay(attempt)
+        log.warning(
+            "goose.backoff.retry",
+            session=session_name,
+            attempt=attempt,
+            max_retries=rate_limit.max_retries,
+            delay_secs=round(delay, 1),
+            stderr=result.raw_stderr[:200],
+        )
+        # TODO: emit a UI-visible message so the user sees the wait
+        time.sleep(delay)

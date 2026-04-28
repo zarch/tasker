@@ -19,8 +19,8 @@ from .models import Phase, Task
 log = structlog.get_logger(__name__)
 
 
-_PHASE_RE = re.compile(r"^##\s+(?:Phase\s+)?(\d+)[^\n]*$", re.IGNORECASE)
-_SUBPHASE_RE = re.compile(r"^###\s+(.+)$")
+_PHASE_RE = re.compile(r"^##\s+Phase\s+(\w[\w.-]*)[^\n]*$", re.IGNORECASE)
+_SUBPHASE_RE = re.compile(r"^#{3,4}\s+(.+)$")
 _TASK_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+)$")
 
 
@@ -40,7 +40,9 @@ def parse_task_file(path: str | Path) -> list[Phase]:
 
     phases: list[Phase] = []
     current_phase: Phase | None = None
-    current_subphase: str = ""  # tracks the latest ### heading text within a phase
+    current_subphase: str = (
+        ""  # tracks the latest ### / #### heading text within a phase
+    )
     subphase_task_counter: int = 0  # 0-based task index within current ### group
     task_counter = 0
 
@@ -52,7 +54,9 @@ def parse_task_file(path: str | Path) -> list[Phase]:
         # ── Phase heading (##) ──
         m = _PHASE_RE.match(stripped)
         if m:
-            idx = int(m.group(1)) - 1  # 0-based
+            # Use sequential 0-based index rather than parsing the literal identifier,
+            # so non-numeric IDs like "HG" are handled the same as "4".
+            idx = len(phases)
             current_phase = Phase(index=idx, title=stripped.lstrip("# ").strip())
             phases.append(current_phase)
             current_subphase = ""

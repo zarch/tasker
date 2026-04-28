@@ -9,7 +9,7 @@ from pathlib import Path
 
 import structlog
 
-from .goose import GooseRunResult, run_goose
+from .goose import GooseRunResult, run_goose_with_backoff
 from .log import IterationLog
 from .models import (
     Actor,
@@ -17,12 +17,14 @@ from .models import (
     DevResponse,
     IterationEntry,
     Phase,
+    QARecoveryStage,
     QAResponse,
     QARequest,
     RecoveryStage,
     SessionScope,
     Task,
     TaskStatus,
+    RateLimitConfig,
     UserChatRequest,
 )
 from .parser import find_next_task, mark_task_done, parse_task_file, update_markdown
@@ -79,25 +81,54 @@ def _parse_qa_response(raw: str, parsed: dict | None) -> QAResponse | None:
 # ── Recovery instructions for graceful degradation ────────────────
 
 _RECOVERY_CONTINUE = (
-    "Your previous response did not include the required JSON block. "
-    "Continue from exactly where you left off and finish the task. "
-    "You MUST end your response with the JSON block in the exact format specified."
+    "⚠️ FORMAT RECOVERY — your last response had no JSON block.\n\n"
+    "You have already completed the implementation in previous turns. "
+    "DO NOT re-read specs, explore code, or start over. "
+    "Output ONLY the JSON response block now:\n"
+    '{"status": "done"|"blocked", "summary": "...", "files_modified": [...], ...}'
 )
 
 _RECOVERY_SUBTASK = (
-    "Your previous responses did not include the required JSON block. "
-    "The task may be too large. Break it into smaller subtasks. "
-    "Implement just the FIRST subtask now, then respond with the JSON block. "
-    "In your summary, list all subtasks you identified and which one you completed."
+    "⚠️ FORMAT RECOVERY — your last responses had no JSON block.\n\n"
+    "The task may be too large. Pick the single most important piece of work, "
+    "implement it now (keep it small), then output ONLY the JSON block.\n"
+    '{"status": "done", "summary": "Implemented: <what you did>", "files_modified": [...]}'
 )
 
 _RECOVERY_SUMMARIZE = (
-    "Your previous responses have not produced the required JSON block. "
-    "STOP implementing. Instead, write a brief summary of: "
-    "1) What progress you have made so far, "
-    "2) What difficulties you are encountering, "
-    "3) What still needs to be done. "
-    "Then respond with the JSON block using status 'blocked'."
+    "⚠️ FORMAT RECOVERY — stop implementing immediately.\n\n"
+    "Output ONLY this JSON block with your progress:\n"
+    '{"status": "blocked", "summary": "<what you did so far>", '
+    '"files_modified": [...], "blocker_description": "<what remains>"}'
+)
+
+_RECOVERY_RESTART = (
+    "⚠️ FRESH START — previous attempts produced no JSON block.\n\n"
+    "You are in a new session with no prior context. "
+    "Implement the task concisely and output the JSON block when done."
+)
+
+
+# ── QA recovery instructions for graceful degradation ─────────────
+
+_QA_RECOVERY_CONTINUE = (
+    "⚠️ FORMAT RECOVERY — your last response had no JSON decision block.\n\n"
+    "You already completed the review. DO NOT re-read files or re-investigate. "
+    "Output ONLY the JSON decision block now:\n"
+    '{"decision": "approve"|"reject"|"needs_user_input", "feedback": "...", '
+    '"concerns": [...]}'
+)
+
+_QA_RECOVERY_SUMMARIZE = (
+    "⚠️ FORMAT RECOVERY — stop reading files immediately.\n\n"
+    "Based on what you already know, output ONLY the JSON decision block:\n"
+    '{"decision": "approve"|"reject"|"needs_user_input", "feedback": "...", '
+    '"concerns": [...]}'
+)
+
+_QA_RECOVERY_RESTART = (
+    "⚠️ FRESH START — previous review attempts produced no JSON block.\n\n"
+    "You are in a new session. Review concisely and output the JSON block."
 )
 
 
@@ -156,6 +187,7 @@ class Orchestrator:
         vcs: VCSBackend | None = None,
         session_scope: SessionScope = SessionScope.SUBPHASE,
         force_new_session: bool = False,
+        rate_limit: RateLimitConfig | None = None,
     ) -> None:
         self.task_file = Path(task_file).resolve()
         self.dev_recipe = Path(dev_recipe)
@@ -177,6 +209,9 @@ class Orchestrator:
         self.session_scope = session_scope
         self._current_scope_key: str = ""  # tracks the current scope boundary
         self._force_new_session = force_new_session  # one-shot flag
+
+        # Rate-limit / connection-error backoff
+        self.rate_limit = rate_limit or RateLimitConfig()
 
         # goose run uses --name for session persistence and auto-resumes
         # when the same name is used again.
@@ -545,7 +580,7 @@ class Orchestrator:
     ) -> GooseRunResult:
         """Run goose with UI activity indicator and pending iteration row.
 
-        Wraps :func:`run_goose` so every agent launch gets visual feedback
+        Wraps :func:`run_goose_with_backoff` so every agent launch gets visual feedback
         in both the header panel (elapsed timer) and the iteration log table
         (animated spinner row).
         """
@@ -557,7 +592,7 @@ class Orchestrator:
         self.ui.activity_start(label)
         self.ui.set_pending_iteration(actor, task_label, detail=detail)
         try:
-            result = run_goose(
+            result = run_goose_with_backoff(
                 recipe_path=recipe_path,
                 session_name=session_name,
                 params=params,
@@ -566,6 +601,7 @@ class Orchestrator:
                 model=model,
                 provider=provider,
                 cwd=cwd,
+                rate_limit=self.rate_limit,
             )
         finally:
             self.ui.clear_pending_iteration()
@@ -692,6 +728,8 @@ class Orchestrator:
                 recovery_instruction = _RECOVERY_SUBTASK
             elif stage == RecoveryStage.SUMMARIZE:
                 recovery_instruction = _RECOVERY_SUMMARIZE
+            elif stage == RecoveryStage.RESTART:
+                recovery_instruction = _RECOVERY_RESTART
 
             self.ui.update_actor(
                 Actor.DEV,
@@ -711,9 +749,19 @@ class Orchestrator:
                 iteration=iteration,
             )
 
+            # On CONTINUE recovery, suppress task_text to prevent the agent
+            # from re-engaging with the full task. It has session history and
+            # already knows what to do — it just needs to output the JSON block.
+            effective_task_text = task.text
+            if stage == RecoveryStage.CONTINUE:
+                effective_task_text = (
+                    f"[Recovery mode — see your session history for the full task. "
+                    f"Task: {task.label}]"
+                )
+
             dev_request = DevRequest(
                 task_label=task.label,
-                task_text=task.text,
+                task_text=effective_task_text,
                 qa_session_id=self.qa_session_name,
                 dev_session_id=self.dev_session_name,
                 iteration=iteration,
@@ -807,13 +855,29 @@ class Orchestrator:
                     )
                     continue
                 # Exhausted this stage, escalate
-                if stage == RecoveryStage.SUMMARIZE:
+                if stage == RecoveryStage.RESTART:
                     break
-                stage = (
-                    RecoveryStage.SUBTASK
-                    if stage == RecoveryStage.CONTINUE
-                    else RecoveryStage.SUMMARIZE
-                )
+                if stage == RecoveryStage.SUMMARIZE:
+                    stage = RecoveryStage.RESTART
+                elif stage == RecoveryStage.CONTINUE:
+                    stage = RecoveryStage.SUBTASK
+                else:
+                    stage = RecoveryStage.SUMMARIZE
+                # Rotate dev session when entering RESTART to clear stale context
+                if stage == RecoveryStage.RESTART:
+                    old_dev_session = self.dev_session_name
+                    self.dev_session_name = _generate_session_id("dev")
+                    log.info(
+                        "session.rotated",
+                        task_label=task.label,
+                        reason="recovery_restart",
+                        dev_session=self.dev_session_name,
+                        qa_session=self.qa_session_name,
+                    )
+                    self.ui.print_info(
+                        f"[{task.label}] Dev session rotated for RESTART stage: "
+                        f"{old_dev_session} → {self.dev_session_name}"
+                    )
                 attempts_in_stage = 0
                 continue
 
@@ -873,7 +937,7 @@ class Orchestrator:
 
             # Escalation logic
             if attempts_in_stage >= stage.max_attempts:
-                if stage == RecoveryStage.SUMMARIZE:
+                if stage == RecoveryStage.RESTART:
                     break  # all stages exhausted
                 # Move to next stage
                 old_stage = stage
@@ -883,7 +947,24 @@ class Orchestrator:
                     stage = RecoveryStage.SUBTASK
                 elif stage == RecoveryStage.SUBTASK:
                     stage = RecoveryStage.SUMMARIZE
+                elif stage == RecoveryStage.SUMMARIZE:
+                    stage = RecoveryStage.RESTART
                 attempts_in_stage = 0
+                # Rotate dev session when entering RESTART to clear stale context
+                if stage == RecoveryStage.RESTART:
+                    old_dev_session = self.dev_session_name
+                    self.dev_session_name = _generate_session_id("dev")
+                    log.info(
+                        "session.rotated",
+                        task_label=task.label,
+                        reason="recovery_restart",
+                        dev_session=self.dev_session_name,
+                        qa_session=self.qa_session_name,
+                    )
+                    self.ui.print_info(
+                        f"[{task.label}] Dev session rotated for RESTART stage: "
+                        f"{old_dev_session} → {self.dev_session_name}"
+                    )
                 self.ui.print_warning(
                     f"[{task.label}] Escalating to stage: {stage.value}"
                 )
@@ -909,7 +990,7 @@ class Orchestrator:
             summary="Developer failed to produce a valid response after multiple recovery attempts.",
             files_modified=[],
             notes="The developer agent could not complete the task. "
-            "All recovery stages (continue, subtask, summarize) were exhausted.",
+            "All recovery stages (continue, subtask, summarize, restart) were exhausted.",
             blocker_description="Developer agent returned malformed output across all recovery attempts. "
             "The task may be too complex, poorly specified, or the agent may be "
             "encountering tooling issues.",
@@ -926,6 +1007,323 @@ class Orchestrator:
         )
         self.log.append(synthetic_blocked_entry)
         self.ui.add_iteration(synthetic_blocked_entry)
+        return synthetic
+
+    def _run_qa_with_recovery(
+        self,
+        task: Task,
+        iteration: int,
+        qa_request: QARequest,
+        *,
+        detail: str = "",
+    ) -> QAResponse:
+        """Run the QA agent with graceful degradation on malformed output.
+
+        Escalation: NORMAL(1) → CONTINUE×3 → SUMMARIZE×3 → RESTART(1)
+        Returns the final QAResponse (may be a synthetic reject if all retries fail).
+        """
+        stage = QARecoveryStage.NORMAL
+        attempts_in_stage = 0
+
+        log.info(
+            "qa.recovery_start",
+            task_label=task.label,
+            iteration=iteration,
+            detail=detail,
+        )
+
+        while True:
+            attempts_in_stage += 1
+
+            # Pick recovery instruction based on stage
+            recovery_instruction: str | None = None
+            if stage == QARecoveryStage.NORMAL and attempts_in_stage == 1:
+                recovery_instruction = None  # first call, no recovery needed
+            elif stage == QARecoveryStage.CONTINUE:
+                recovery_instruction = _QA_RECOVERY_CONTINUE
+            elif stage == QARecoveryStage.SUMMARIZE:
+                recovery_instruction = _QA_RECOVERY_SUMMARIZE
+            elif stage == QARecoveryStage.RESTART:
+                recovery_instruction = _QA_RECOVERY_RESTART
+
+            # Inject recovery instruction into QA params
+            params = qa_request.to_params()
+            if recovery_instruction:
+                # QA recipe doesn't have a dedicated recovery_instruction param,
+                # so we append it to the dev_notes field which QA reads.
+                params["dev_notes"] = (
+                    f"{params.get('dev_notes', '')}\n\n"
+                    f"## ⚠️ Format Recovery ({stage.value})\n"
+                    f"{recovery_instruction}"
+                ).strip()
+                # On CONTINUE, suppress task_text to prevent re-reading specs.
+                # QA already has session history with the full review context.
+                if stage == QARecoveryStage.CONTINUE:
+                    params["task_text"] = (
+                        f"[Recovery mode — see your session history. Task: {task.label}]"
+                    )
+
+            self.ui.update_actor(
+                Actor.QA,
+                task.label,
+                f"reviewing iteration {iteration}"
+                + (f" [{stage.value}]" if stage != QARecoveryStage.NORMAL else ""),
+            )
+            self.ui.print_info(
+                f"[{task.label}] QA call (stage={stage.value}, "
+                f"attempt={attempts_in_stage}, detail={detail or 'review'})..."
+            )
+
+            log.debug(
+                "qa.call",
+                task_label=task.label,
+                stage=stage.value,
+                attempt=f"{attempts_in_stage}/{stage.max_attempts}",
+                iteration=iteration,
+                detail=detail,
+            )
+
+            qa_result = self._run_goose_with_ui(
+                Actor.QA,
+                task.label,
+                recipe_path=self.qa_recipe,
+                session_name=self.qa_session_name,
+                params=params,
+                max_turns=self.max_turns,
+                timeout_secs=self.timeout_secs,
+                model=self.model,
+                provider=self.provider,
+                cwd=self.cwd,
+                detail=detail or f"review [{stage.value}]",
+            )
+
+            # Check for subprocess failure (crash, timeout)
+            if not qa_result.success:
+                if qa_result.timed_out:
+                    timeout_minutes = self.timeout_secs / 60
+                    log.warning(
+                        "qa.timeout",
+                        task_label=task.label,
+                        iteration=iteration,
+                        context=detail,
+                        duration=qa_result.duration_secs,
+                    )
+                    self.ui.print_warning(
+                        f"[{task.label}] QA timed out after {timeout_minutes:.0f}min "
+                        f"(detail={detail}) — treating as rejection"
+                    )
+                    qa_timeout_entry = IterationEntry(
+                        timestamp=_now_iso(),
+                        iteration=self.global_iteration,
+                        actor=Actor.QA,
+                        task_label=task.label,
+                        status=TaskStatus.ERROR,
+                        payload={
+                            "error": "timeout",
+                            "duration": qa_result.duration_secs,
+                            "stage": stage.value,
+                        },
+                        raw_output=qa_result.raw_stderr[:500],
+                    )
+                    self.log.append(qa_timeout_entry)
+                    self.ui.add_iteration(qa_timeout_entry)
+                    # Timeout doesn't escalate — return synthetic reject
+                    return QAResponse(
+                        decision="reject",
+                        feedback=_timeout_feedback("QA", self.timeout_secs),
+                        concerns=["QA agent timed out during review"],
+                    )
+
+                # Other subprocess failures (crash, etc.)
+                log.error(
+                    "qa.subprocess_failed",
+                    task_label=task.label,
+                    return_code=qa_result.return_code,
+                    stderr=qa_result.raw_stderr[:200],
+                    stage=stage.value,
+                )
+                self.ui.print_error(
+                    f"[{task.label}] QA subprocess failed (rc={qa_result.return_code}): "
+                    f"{qa_result.raw_stderr[:200]}"
+                )
+                qa_crash_entry = IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.QA,
+                    task_label=task.label,
+                    status=TaskStatus.ERROR,
+                    payload={
+                        "error": "subprocess_failed",
+                        "stage": stage.value,
+                    },
+                    raw_output=qa_result.raw_stderr[:500],
+                )
+                self.log.append(qa_crash_entry)
+                self.ui.add_iteration(qa_crash_entry)
+                # Subprocess failures don't count as malformed — retry in same stage
+                if attempts_in_stage < stage.max_attempts:
+                    self.ui.print_warning(
+                        f"[{task.label}] QA retrying "
+                        f"({attempts_in_stage}/{stage.max_attempts})..."
+                    )
+                    continue
+                # Exhausted this stage, escalate
+                if stage == QARecoveryStage.RESTART:
+                    break
+                old_stage = stage
+                stage = (
+                    QARecoveryStage.RESTART
+                )  # skip SUMMARIZE on crash, go straight to RESTART
+                attempts_in_stage = 0
+                # Rotate QA session when entering RESTART
+                old_qa_session = self.qa_session_name
+                self.qa_session_name = _generate_session_id("qa")
+                log.info(
+                    "session.rotated",
+                    task_label=task.label,
+                    reason="qa_recovery_restart",
+                    dev_session=self.dev_session_name,
+                    qa_session=self.qa_session_name,
+                )
+                self.ui.print_info(
+                    f"[{task.label}] QA session rotated for RESTART stage: "
+                    f"{old_qa_session} → {self.qa_session_name}"
+                )
+                self.ui.print_warning(
+                    f"[{task.label}] QA escalating to stage: {stage.value}"
+                )
+                log.warning(
+                    "qa.escalating",
+                    task_label=task.label,
+                    from_stage=old_stage.value,
+                    to_stage=stage.value,
+                )
+                continue
+
+            # Try to parse the structured response
+            qa_response = _parse_qa_response(
+                qa_result.raw_stdout, qa_result.parsed_json
+            )
+
+            if qa_response is not None:
+                # Parsed successfully — log and return
+                log.info(
+                    "qa.response_parsed",
+                    task_label=task.label,
+                    decision=qa_response.decision,
+                    feedback=qa_response.feedback[:100],
+                    stage=stage.value,
+                    attempt=attempts_in_stage,
+                )
+                qa_entry = IterationEntry(
+                    timestamp=_now_iso(),
+                    iteration=self.global_iteration,
+                    actor=Actor.QA,
+                    task_label=task.label,
+                    status=(
+                        TaskStatus.APPROVED
+                        if qa_response.decision == "approve"
+                        else TaskStatus.FEEDBACK
+                    ),
+                    payload=qa_response.to_dict(),
+                    raw_output=qa_result.raw_stdout[:500],
+                )
+                self.log.append(qa_entry)
+                self.ui.add_iteration(qa_entry)
+                return qa_response
+
+            # Malformed output — log the failure
+            log.warning(
+                "qa.malformed_output",
+                task_label=task.label,
+                stage=stage.value,
+                attempt=f"{attempts_in_stage}/{stage.max_attempts}",
+            )
+            self.ui.print_warning(
+                f"[{task.label}] QA did not return valid JSON (stage={stage.value}, "
+                f"attempt={attempts_in_stage}/{stage.max_attempts})"
+            )
+            malformed_entry = IterationEntry(
+                timestamp=_now_iso(),
+                iteration=self.global_iteration,
+                actor=Actor.QA,
+                task_label=task.label,
+                status=TaskStatus.ERROR,
+                payload={"error": "malformed_output", "stage": stage.value},
+                raw_output=qa_result.raw_stdout[:500],
+            )
+            self.log.append(malformed_entry)
+            self.ui.add_iteration(malformed_entry)
+
+            # Escalation logic
+            if attempts_in_stage >= stage.max_attempts:
+                if stage == QARecoveryStage.RESTART:
+                    break  # all stages exhausted
+                # Move to next stage
+                old_stage = stage
+                if stage == QARecoveryStage.NORMAL:
+                    stage = QARecoveryStage.CONTINUE
+                elif stage == QARecoveryStage.CONTINUE:
+                    stage = QARecoveryStage.SUMMARIZE
+                elif stage == QARecoveryStage.SUMMARIZE:
+                    stage = QARecoveryStage.RESTART
+                attempts_in_stage = 0
+                # Rotate QA session when entering RESTART to clear stale context
+                if stage == QARecoveryStage.RESTART:
+                    old_qa_session = self.qa_session_name
+                    self.qa_session_name = _generate_session_id("qa")
+                    log.info(
+                        "session.rotated",
+                        task_label=task.label,
+                        reason="qa_recovery_restart",
+                        dev_session=self.dev_session_name,
+                        qa_session=self.qa_session_name,
+                    )
+                    self.ui.print_info(
+                        f"[{task.label}] QA session rotated for RESTART stage: "
+                        f"{old_qa_session} → {self.qa_session_name}"
+                    )
+                self.ui.print_warning(
+                    f"[{task.label}] QA escalating to stage: {stage.value}"
+                )
+                log.warning(
+                    "qa.escalating",
+                    task_label=task.label,
+                    from_stage=old_stage.value,
+                    to_stage=stage.value,
+                )
+
+        # All stages exhausted — return a synthetic reject with any raw output as feedback
+        log.error(
+            "qa.recovery_exhausted",
+            task_label=task.label,
+            iteration=iteration,
+        )
+        self.ui.print_error(
+            f"[{task.label}] All QA recovery attempts exhausted. "
+            f"Returning synthetic reject response."
+        )
+        synthetic = QAResponse(
+            decision="reject",
+            feedback=(
+                "QA agent failed to produce a valid structured response after "
+                "multiple recovery attempts. Please review your work carefully "
+                "and ensure it meets the task requirements."
+            ),
+            concerns=[
+                "QA agent could not complete its review — all recovery stages exhausted"
+            ],
+        )
+        synthetic_reject_entry = IterationEntry(
+            timestamp=_now_iso(),
+            iteration=self.global_iteration,
+            actor=Actor.QA,
+            task_label=task.label,
+            status=TaskStatus.FEEDBACK,
+            payload=synthetic.to_dict(),
+        )
+        self.log.append(synthetic_reject_entry)
+        self.ui.add_iteration(synthetic_reject_entry)
         return synthetic
 
     def _process_task(self, phase: Phase, task: Task) -> None:
@@ -987,78 +1385,25 @@ class Orchestrator:
                     blocker_description=dev_response.blocker_description,
                 )
 
-                qa_result = self._run_goose_with_ui(
-                    Actor.QA,
-                    task.label,
-                    recipe_path=self.qa_recipe,
-                    session_name=self.qa_session_name,
-                    params=qa_blocked_request.to_params(),
-                    max_turns=self.max_turns,
-                    timeout_secs=self.timeout_secs,
-                    model=self.model,
-                    provider=self.provider,
-                    cwd=self.cwd,
+                qa_response = self._run_qa_with_recovery(
+                    task=task,
+                    iteration=iteration,
+                    qa_request=qa_blocked_request,
                     detail="blocker triage",
                 )
 
-                qa_response = _parse_qa_response(
-                    qa_result.raw_stdout, qa_result.parsed_json
-                )
-
-                # QA timed out — treat as rejection with timeout context
-                if qa_result.timed_out:
-                    timeout_minutes = self.timeout_secs / 60
-                    log.warning(
-                        "qa.timeout",
-                        task_label=task.label,
-                        iteration=iteration,
-                        context="blocker_triage",
-                        duration=qa_result.duration_secs,
-                    )
-                    self.ui.print_warning(
-                        f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during blocker triage — treating as rejection"
-                    )
-                    qa_triage_timeout_entry = IterationEntry(
-                        timestamp=_now_iso(),
-                        iteration=self.global_iteration,
-                        actor=Actor.QA,
-                        task_label=task.label,
-                        status=TaskStatus.ERROR,
-                        payload={
-                            "error": "timeout",
-                            "duration": qa_result.duration_secs,
-                        },
-                        raw_output=qa_result.raw_stderr[:500],
-                    )
-                    self.log.append(qa_triage_timeout_entry)
-                    self.ui.add_iteration(qa_triage_timeout_entry)
-                    qa_response = QAResponse(
-                        decision="reject",
-                        feedback=_timeout_feedback("QA", self.timeout_secs),
-                        concerns=["QA agent timed out during blocker triage"],
-                    )
-
-                if qa_response is None:
-                    qa_response = QAResponse(
-                        decision="reject",
-                        feedback="QA could not triage the blocker — no structured response.",
-                        concerns=[
-                            "QA did not return structured JSON for blocker triage"
-                        ],
-                    )
-
-                # Log QA triage
-                qa_entry = IterationEntry(
+                # Log QA triage (already logged inside _run_qa_with_recovery,
+                # but add a BLOCKED status entry for the iteration table)
+                qa_blocked_entry = IterationEntry(
                     timestamp=_now_iso(),
                     iteration=self.global_iteration,
                     actor=Actor.QA,
                     task_label=task.label,
                     status=TaskStatus.BLOCKED,
                     payload=qa_response.to_dict(),
-                    raw_output=qa_result.raw_stdout[:500],
                 )
-                self.log.append(qa_entry)
-                self.ui.add_iteration(qa_entry)
+                self.log.append(qa_blocked_entry)
+                self.ui.add_iteration(qa_blocked_entry)
 
                 if qa_response.decision == "needs_user_input":
                     log.info(
@@ -1154,86 +1499,12 @@ class Orchestrator:
                 else "",
             )
 
-            qa_result = self._run_goose_with_ui(
-                Actor.QA,
-                task.label,
-                recipe_path=self.qa_recipe,
-                session_name=self.qa_session_name,
-                params=qa_request.to_params(),
-                max_turns=self.max_turns,
-                timeout_secs=self.timeout_secs,
-                model=self.model,
-                provider=self.provider,
-                cwd=self.cwd,
+            qa_response = self._run_qa_with_recovery(
+                task=task,
+                iteration=iteration,
+                qa_request=qa_request,
+                detail="review",
             )
-
-            qa_response = _parse_qa_response(
-                qa_result.raw_stdout, qa_result.parsed_json
-            )
-
-            # QA timed out — treat as rejection with timeout context
-            if qa_result.timed_out:
-                timeout_minutes = self.timeout_secs / 60
-                log.warning(
-                    "qa.timeout",
-                    task_label=task.label,
-                    iteration=iteration,
-                    context="review",
-                    duration=qa_result.duration_secs,
-                )
-                self.ui.print_warning(
-                    f"[{task.label}] QA timed out after {timeout_minutes:.0f}min during review — treating as rejection"
-                )
-                qa_review_timeout_entry = IterationEntry(
-                    timestamp=_now_iso(),
-                    iteration=self.global_iteration,
-                    actor=Actor.QA,
-                    task_label=task.label,
-                    status=TaskStatus.ERROR,
-                    payload={
-                        "error": "timeout",
-                        "duration": qa_result.duration_secs,
-                    },
-                    raw_output=qa_result.raw_stderr[:500],
-                )
-                self.log.append(qa_review_timeout_entry)
-                self.ui.add_iteration(qa_review_timeout_entry)
-                qa_response = QAResponse(
-                    decision="reject",
-                    feedback=_timeout_feedback("QA", self.timeout_secs),
-                    concerns=["QA agent timed out during review"],
-                )
-
-            # QA returned unparsable output — treat as rejection with raw feedback
-            if qa_response is None:
-                self.ui.print_warning(
-                    f"[{task.label}] QA did not return valid JSON, treating as rejection."
-                )
-                qa_response = QAResponse(
-                    decision="reject",
-                    feedback=qa_result.raw_stdout[:300]
-                    if qa_result.raw_stdout
-                    else "QA returned no structured response",
-                    concerns=["QA did not return structured JSON"],
-                )
-
-            # Log QA iteration
-            qa_status = (
-                TaskStatus.APPROVED
-                if qa_response.decision == "approve"
-                else TaskStatus.FEEDBACK
-            )
-            qa_entry = IterationEntry(
-                timestamp=_now_iso(),
-                iteration=self.global_iteration,
-                actor=Actor.QA,
-                task_label=task.label,
-                status=qa_status,
-                payload=qa_response.to_dict(),
-                raw_output=qa_result.raw_stdout[:500],
-            )
-            self.log.append(qa_entry)
-            self.ui.add_iteration(qa_entry)
 
             if qa_response.decision == "approve":
                 log.info(

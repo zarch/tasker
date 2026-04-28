@@ -171,8 +171,8 @@ def test_command_builder():
     assert "50" in cmd
     assert "--model" in cmd
     assert "claude-sonnet-4-20250514" in cmd
-    assert "--with-builtin" in cmd
-    assert "developer" in cmd
+    assert "--no-profile" in cmd
+    assert "--with-builtin" not in cmd  # recipe declares extensions
     assert "--resume" not in cmd  # should NOT be present
     assert "--session-id" not in cmd  # we use --name instead
 
@@ -341,6 +341,8 @@ def test_models():
     assert RecoveryStage.CONTINUE.max_attempts == 3
     assert RecoveryStage.SUBTASK.max_attempts == 3
     assert RecoveryStage.SUMMARIZE.max_attempts == 3
+    assert RecoveryStage.RESTART.max_attempts == 1
+    assert RecoveryStage.RESTART.value == "restart"
 
     print("✓ Model tests passed")
 
@@ -1824,7 +1826,7 @@ def test_run_goose_with_ui_wiring():
 
         with patch.object(orch.ui, "activity_start", side_effect=spy_start):
             with patch.object(orch.ui, "activity_stop", side_effect=spy_stop):
-                with patch("tasker.orchestrator.run_goose", return_value=fake_result):
+                with patch("tasker.goose.run_goose", return_value=fake_result):
                     result = orch._run_goose_with_ui(
                         Actor.DEV,
                         "P1.T1",

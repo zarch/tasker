@@ -14,7 +14,7 @@ from rich.console import Console
 
 from .monitoring import setup_monitoring
 from .orchestrator import Orchestrator
-from .models import SessionScope
+from .models import RateLimitConfig, SessionScope
 
 # Default recipes shipped with tasker, resolved relative to this file.
 _RECIPES_DIR = Path(__file__).resolve().parent.parent.parent / "recipes"
@@ -103,6 +103,26 @@ def main(
         False,
         "--new-session",
         help="Force creation of a new goose session on the next task (one-shot).",
+    ),
+    rate_limit_base_delay: float = typer.Option(
+        30.0,
+        "--rate-limit-base-delay",
+        help="Base delay in seconds for exponential backoff on connection errors. Default: 30.",
+    ),
+    rate_limit_max_delay: float = typer.Option(
+        300.0,
+        "--rate-limit-max-delay",
+        help="Maximum backoff delay in seconds for connection errors. Default: 300.",
+    ),
+    rate_limit_max_retries: int = typer.Option(
+        5,
+        "--rate-limit-max-retries",
+        help="Max retries on transient connection/rate-limit errors. Default: 5.",
+    ),
+    rate_limit_disabled: bool = typer.Option(
+        False,
+        "--no-rate-limit",
+        help="Disable automatic backoff on connection errors entirely.",
     ),
     monitor_log: Path = typer.Option(
         None,
@@ -199,6 +219,12 @@ def main(
         vcs=vcs_backend,
         session_scope=SessionScope(session_scope),
         force_new_session=new_session,
+        rate_limit=RateLimitConfig(
+            enabled=not rate_limit_disabled,
+            base_delay_secs=rate_limit_base_delay,
+            max_delay_secs=rate_limit_max_delay,
+            max_retries=rate_limit_max_retries,
+        ),
     )
 
     orchestrator.run()

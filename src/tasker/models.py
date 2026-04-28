@@ -132,16 +132,77 @@ class SessionScope(str, enum.Enum):
 
 
 class RecoveryStage(str, enum.Enum):
-    """Escalation stages when goose returns malformed output."""
+    """Escalation stages when the developer agent returns malformed output."""
 
     NORMAL = "normal"  # first attempt, no special instruction
     CONTINUE = "continue"  # "continue from where you left off"
     SUBTASK = "subtask"  # "break into subtasks and implement one at a time"
     SUMMARIZE = "summarize"  # "summarize progress and difficulties"
+    RESTART = "restart"  # "fresh session, start over from scratch"
 
     @property
     def max_attempts(self) -> int:
-        return 3
+        return 1 if self == RecoveryStage.RESTART else 3
+
+
+class QARecoveryStage(str, enum.Enum):
+    """Escalation stages when the QA agent returns malformed output.
+
+    Mirrors RecoveryStage but without SUBTASK (QA doesn't split work into
+    subtasks — its failure mode is producing overly long reviews without
+    the required JSON decision block).
+    """
+
+    NORMAL = "normal"  # first attempt, no special instruction
+    CONTINUE = "continue"  # "keep review focused, output the JSON block"
+    SUMMARIZE = "summarize"  # "stop investigating, just output JSON"
+    RESTART = "restart"  # "fresh QA session, review from scratch"
+
+    @property
+    def max_attempts(self) -> int:
+        return 1 if self == QARecoveryStage.RESTART else 3
+
+
+# -- Rate-limit / connection-error resilience ---------------------
+
+
+@dataclass
+class RateLimitConfig:
+    """Controls exponential backoff when the goose subprocess fails with
+    a connection / rate-limit error (e.g. "Error: not connected").
+    The tasker detects transient connection failures and waits an
+    exponentially growing delay before retrying instead of burning
+    through the recovery-stage budget.
+
+    Attributes:
+        enabled:            Master switch.  False disables backoff entirely.
+        base_delay_secs:    First retry delay (doubles each attempt).
+        max_delay_secs:     Hard ceiling on any single backoff delay.
+        max_retries:        Max consecutive connection-error retries before
+                            giving up and letting recovery handle it.
+        jitter:             Fractional jitter (0-1) to avoid thundering herd.
+    """
+
+    enabled: bool = True
+    base_delay_secs: float = 30.0
+    max_delay_secs: float = 300.0
+    max_retries: int = 5
+    jitter: float = 0.25
+
+    def next_delay(self, attempt: int) -> float:
+        """Compute the backoff delay for *attempt* (1-based).
+
+        Uses capped exponential backoff with jitter.
+        """
+        import random
+
+        ceiling = min(self.base_delay_secs * (2 ** (attempt - 1)), self.max_delay_secs)
+        return random.uniform(ceiling * (1 - self.jitter), ceiling)
+
+    @classmethod
+    def disabled(cls) -> "RateLimitConfig":
+        """Return a config that skips all backoff logic."""
+        return cls(enabled=False)
 
 
 # ── JSONL iteration log entry ─────────────────────────────────────
