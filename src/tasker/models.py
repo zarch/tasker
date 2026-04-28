@@ -132,16 +132,35 @@ class SessionScope(str, enum.Enum):
 
 
 class RecoveryStage(str, enum.Enum):
-    """Escalation stages when goose returns malformed output."""
+    """Escalation stages when the developer agent returns malformed output."""
 
     NORMAL = "normal"  # first attempt, no special instruction
     CONTINUE = "continue"  # "continue from where you left off"
     SUBTASK = "subtask"  # "break into subtasks and implement one at a time"
     SUMMARIZE = "summarize"  # "summarize progress and difficulties"
+    RESTART = "restart"  # "fresh session, start over from scratch"
 
     @property
     def max_attempts(self) -> int:
-        return 3
+        return 1 if self == RecoveryStage.RESTART else 3
+
+
+class QARecoveryStage(str, enum.Enum):
+    """Escalation stages when the QA agent returns malformed output.
+
+    Mirrors RecoveryStage but without SUBTASK (QA doesn't split work into
+    subtasks — its failure mode is producing overly long reviews without
+    the required JSON decision block).
+    """
+
+    NORMAL = "normal"  # first attempt, no special instruction
+    CONTINUE = "continue"  # "keep review focused, output the JSON block"
+    SUMMARIZE = "summarize"  # "stop investigating, just output JSON"
+    RESTART = "restart"  # "fresh QA session, review from scratch"
+
+    @property
+    def max_attempts(self) -> int:
+        return 1 if self == QARecoveryStage.RESTART else 3
 
 
 # ── JSONL iteration log entry ─────────────────────────────────────

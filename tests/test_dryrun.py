@@ -341,6 +341,8 @@ def test_models():
     assert RecoveryStage.CONTINUE.max_attempts == 3
     assert RecoveryStage.SUBTASK.max_attempts == 3
     assert RecoveryStage.SUMMARIZE.max_attempts == 3
+    assert RecoveryStage.RESTART.max_attempts == 1
+    assert RecoveryStage.RESTART.value == "restart"
 
     print("✓ Model tests passed")
 

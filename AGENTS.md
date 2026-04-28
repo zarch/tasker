@@ -55,7 +55,7 @@ tools/tasker/
 │   │   ├── sample_tasks.md   # Test task file (basic ## phases)
 │   │   ├── e2e_test.md       # E2E test task file
 │   │   └── subphase_tasks.md # Test task file with ### sub-phases
-│   └── test_dryrun.py        # 38 unit/integration tests (no goose subprocess)
+│   └── test_dryrun.py        # 47 unit/integration tests (no goose subprocess)
 └── docs/
     └── jj-option-b.md        # Future design doc (not yet implemented)
 ```
@@ -106,9 +106,20 @@ All communication between the orchestrator and Goose agents uses **structured JS
 ### 2. Graceful Degradation (Recovery Stages)
 
 When the Developer returns malformed output, the orchestrator escalates through stages:
-`NORMAL (1×) → CONTINUE (3×) → SUBTASK (3×) → SUMMARIZE (3×)`
+`NORMAL (1×) → CONTINUE (3×) → SUBTASK (3×) → SUMMARIZE (3×) → RESTART (1×)`
+
+Each stage sends a progressively more directive recovery instruction to the agent. The **RESTART** stage also rotates the dev session to a fresh Goose session, clearing all accumulated stale context so the agent can approach the task from scratch.
 
 If all stages are exhausted, a synthetic `blocked` response is created and sent to QA for triage.
+
+**QA recovery** follows the same pattern but with fewer stages (QA doesn't have a subtask equivalent):
+`NORMAL (1×) → CONTINUE (3×) → SUMMARIZE (3×) → RESTART (1×)`
+
+- `CONTINUE` — "Keep your review focused, put findings in the JSON block"
+- `SUMMARIZE` — "Stop investigating, just output the JSON decision block"
+- `RESTART` — Fresh QA session, review from scratch
+
+The **RESTART** stage rotates the QA session. If all stages are exhausted, a synthetic `reject` response is created so the developer gets another chance to iterate.
 
 ### 3. Interactive Chat Mode
 
@@ -298,7 +309,7 @@ Accepted values (case-insensitive): `debug`, `info`, `warning` (or `warn`), `err
 | `task.finalized` | orchestrator | info | Task fully complete |
 | `feedback_loop.start` | orchestrator | info | QA↔Dev loop begins for a task |
 | `feedback_loop.max_iterations` | orchestrator | error | Hit iteration limit |
-| `session.rotated` | orchestrator | info | New dev/qa sessions created |
+| `session.rotated` | orchestrator | info | New dev/qa sessions created (reason: `scope_boundary`, `force_new_session`, or `recovery_restart`) |
 | `dev.recovery_start` | orchestrator | info | Recovery loop begins |
 | `dev.call` | orchestrator | debug | Before goose subprocess launch |
 | `dev.response_parsed` | orchestrator | info | Dev returned valid JSON |
@@ -310,10 +321,16 @@ Accepted values (case-insensitive): `debug`, `info`, `warning` (or `warn`), `err
 | `dev.timeout` | orchestrator | warning | Dev process killed |
 | `dev.subprocess_failed` | orchestrator | error | Dev process crashed |
 | `qa.call` | orchestrator | debug | Before QA goose subprocess |
+| `qa.response_parsed` | orchestrator | info | QA returned valid JSON |
 | `qa.approved` | orchestrator | info | QA decision=approve |
 | `qa.rejected` | orchestrator | info | QA decision=reject |
 | `qa.needs_user_input` | orchestrator | info | QA needs user chat |
+| `qa.malformed_output` | orchestrator | warning | QA JSON unparsable |
+| `qa.escalating` | orchestrator | warning | QA recovery stage advancing |
+| `qa.recovery_start` | orchestrator | info | QA recovery loop begins |
+| `qa.recovery_exhausted` | orchestrator | error | All QA recovery stages failed |
 | `qa.timeout` | orchestrator | warning | QA process killed |
+| `qa.subprocess_failed` | orchestrator | error | QA process crashed |
 | `vcs.initialized` | orchestrator | info | VCS backend init success |
 | `vcs.task_started` | orchestrator | info | Task workspace created |
 | `vcs.diff_obtained` | orchestrator | debug | Diff retrieved for QA |
