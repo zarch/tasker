@@ -171,8 +171,9 @@ def test_command_builder():
     assert "50" in cmd
     assert "--model" in cmd
     assert "claude-sonnet-4-20250514" in cmd
-    assert "--no-profile" in cmd
-    assert "--with-builtin" not in cmd  # recipe declares extensions
+    assert "--with-builtin" in cmd
+    assert "developer" in cmd
+    # --with-builtin is now used instead of --no-profile
     assert "--resume" not in cmd  # should NOT be present
     assert "--session-id" not in cmd  # we use --name instead
 

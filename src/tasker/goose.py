@@ -149,7 +149,8 @@ def build_goose_command(
     cmd = [
         "goose",
         "run",
-        "--no-profile",
+        "--with-builtin",
+        "developer",
         "--recipe",
         str(recipe_path),
         "--name",
