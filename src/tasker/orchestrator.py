@@ -117,6 +117,14 @@ _RECOVERY_SUBTASK = (
     '{"status": "done", "summary": "Implemented: <what you did>", "files_modified": [...]}'
 )
 
+_RECOVERY_TRUNCATION = (
+    "⚠️ OUTPUT TRUNCATED — your previous tool call was cut off mid-execution.\n\n"
+    "The file you tried to write was too large for a single response. "
+    "Write ONLY a skeleton (struct/enum/fn signatures with TODO bodies), "
+    "then output the JSON block. Do NOT write full implementations in one tool call.\n"
+    '{"status": "done", "summary": "Wrote skeleton: <file>", "files_modified": [...]}'
+)
+
 _RECOVERY_SUMMARIZE = (
     "⚠️ FORMAT RECOVERY — stop implementing immediately.\n\n"
     "Output ONLY this JSON block with your progress:\n"
@@ -152,6 +160,19 @@ _QA_RECOVERY_RESTART = (
     "⚠️ FRESH START — previous review attempts produced no JSON block.\n\n"
     "You are in a new session. Review concisely and output the JSON block."
 )
+
+
+_TRUNCATION_MARKER = "A tool call could not be parsed"
+
+
+def _is_truncated_output(raw_stdout: str | None) -> bool:
+    """Detect goose truncation errors in agent output.
+
+    When the LLM output exceeds the model max tokens, goose truncates the
+    response mid-tool-call and inserts this error message. The agent then
+    cannot produce a JSON response because the file write never completed.
+    """
+    return _TRUNCATION_MARKER in raw_stdout if raw_stdout else False
 
 
 def _timeout_feedback(actor: str, timeout_secs: int) -> str:
@@ -819,6 +840,7 @@ class Orchestrator:
             has_feedback=feedback is not None,
         )
 
+        truncation_detected = False
         while True:
             attempts_in_stage += 1
 
@@ -829,7 +851,9 @@ class Orchestrator:
             elif stage == RecoveryStage.CONTINUE:
                 recovery_instruction = _RECOVERY_CONTINUE
             elif stage == RecoveryStage.SUBTASK:
-                recovery_instruction = _RECOVERY_SUBTASK
+                recovery_instruction = (
+                    _RECOVERY_TRUNCATION if truncation_detected else _RECOVERY_SUBTASK
+                )
             elif stage == RecoveryStage.SUMMARIZE:
                 recovery_instruction = _RECOVERY_SUMMARIZE
             elif stage == RecoveryStage.RESTART:
@@ -1040,6 +1064,28 @@ class Orchestrator:
             )
             self.log.append(malformed_entry)
             self.ui.add_iteration(malformed_entry)
+
+            # Truncation fast-forward: if the output was cut off mid-tool-call,
+            # skip ahead to SUBTASK stage with truncation-specific guidance.
+            if _is_truncated_output(dev_result.raw_stdout):
+                if stage not in (
+                    RecoveryStage.SUBTASK,
+                    RecoveryStage.SUMMARIZE,
+                    RecoveryStage.RESTART,
+                ):
+                    log.warning(
+                        "dev.truncation_detected",
+                        task_label=task.label,
+                        from_stage=stage.value,
+                    )
+                    self.ui.print_warning(
+                        f"[{task.label}] Truncation detected — "
+                        f"fast-forwarding to SUBTASK stage"
+                    )
+                    stage = RecoveryStage.SUBTASK
+                    truncation_detected = True
+                    attempts_in_stage = 0
+                    continue
 
             # Escalation logic
             if attempts_in_stage >= stage.max_attempts:
@@ -1360,6 +1406,22 @@ class Orchestrator:
             )
             self.log.append(malformed_entry)
             self.ui.add_iteration(malformed_entry)
+
+            # Truncation fast-forward: if QA output was truncated, skip to SUMMARIZE
+            if _is_truncated_output(qa_result.raw_stdout):
+                if stage not in (QARecoveryStage.SUMMARIZE, QARecoveryStage.RESTART):
+                    log.warning(
+                        "qa.truncation_detected",
+                        task_label=task.label,
+                        from_stage=stage.value,
+                    )
+                    self.ui.print_warning(
+                        f"[{task.label}] QA truncation detected — "
+                        f"fast-forwarding to SUMMARIZE stage"
+                    )
+                    stage = QARecoveryStage.SUMMARIZE
+                    attempts_in_stage = 0
+                    continue
 
             # Escalation logic
             if attempts_in_stage >= stage.max_attempts:

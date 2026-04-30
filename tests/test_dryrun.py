@@ -2412,7 +2412,8 @@ def test_feedback_loop_subtask_label():
     import tempfile
     from unittest.mock import patch
     from tasker.orchestrator import Orchestrator
-    from tasker.models import Task, Phase, DevResponse, QAResponse
+    from tasker.models import Task
+    from tasker.models import Phase, DevResponse, QAResponse
 
     task = Task(phase_index=0, task_index=2, text="Big task spanning modules")
     phase = Phase(index=0, title="Phase 1", tasks=[task])
@@ -2493,7 +2494,8 @@ def test_run_subtask_loop():
     import tempfile
     from unittest.mock import patch
     from tasker.orchestrator import Orchestrator
-    from tasker.models import Task, Phase, Subtask
+    from tasker.models import Task
+    from tasker.models import Phase, Subtask
 
     task = Task(phase_index=0, task_index=2, text="Big task")
     phase = Phase(index=0, title="Phase 1", tasks=[task])
@@ -2553,7 +2555,8 @@ def test_process_task_decomposition():
     import tempfile
     from unittest.mock import patch
     from tasker.orchestrator import Orchestrator
-    from tasker.models import Task, Phase, Subtask, DecomposeResponse
+    from tasker.models import Task
+    from tasker.models import Phase, Subtask, DecomposeResponse
 
     task = Task(phase_index=0, task_index=2, text="Build GridCell and SpatialIndex")
     phase = Phase(index=0, title="Phase 1", tasks=[task])
@@ -2641,7 +2644,8 @@ def test_process_task_vcs_once_per_task():
     import tempfile
     from unittest.mock import patch
     from tasker.orchestrator import Orchestrator
-    from tasker.models import Task, Phase, Subtask, DecomposeResponse
+    from tasker.models import Task
+    from tasker.models import Phase, Subtask, DecomposeResponse
 
     task = Task(phase_index=0, task_index=2, text="Build GridCell and SpatialIndex")
     phase = Phase(index=0, title="Phase 1", tasks=[task])
@@ -2682,6 +2686,104 @@ def test_process_task_vcs_once_per_task():
         mock_sub.assert_called_once()
 
         print("✓ _process_task VCS once-per-task tests passed")
+
+
+# ── Test 56: truncation detection helper ────────────────────────────
+
+
+def test_truncation_detection():
+    """_is_truncated_output detects goose truncation markers."""
+    from tasker.orchestrator import _is_truncated_output
+
+    assert _is_truncated_output(
+        "I'll implement the file now.\n\n"
+        "A tool call could not be parsed — the response may have been truncated."
+    )
+    assert _is_truncated_output("") is False
+    assert _is_truncated_output(None) is False
+    assert _is_truncated_output("normal dev output with JSON block") is False
+    assert (
+        _is_truncated_output(
+            '{"status": "done", "summary": "ok", "files_modified": []}'
+        )
+        is False
+    )
+    print("✓ _is_truncated_output tests passed")
+
+
+# ── Test 57: dev truncation fast-forward ────────────────────────────
+
+
+def test_dev_truncation_fast_forward():
+    """Truncation in dev output fast-forwards to SUBTASK stage."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.models import Task
+    from tasker.orchestrator import Orchestrator
+    from tasker.goose import GooseRunResult
+
+    task = Task(
+        phase_index=0, task_index=0, text="Implement mapping.rs with full types"
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = f"{td}/test57.jsonl"
+        md_path = f"{td}/test57.md"
+        Path(md_path).write_text("# P4-2\n- [ ] T4: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+        )
+        iteration = 1
+
+        truncation_raw = (
+            "I'll start by reading the spec file.\n\n"
+            "Now I have all the context. Let me write the complete implementation:\n\n"
+            "A tool call could not be parsed — the response may have been truncated. "
+            "Try breaking the task into smaller steps or resending your message."
+        )
+
+        call_count = 0
+
+        def mock_run_goose(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call: truncation in NORMAL stage
+                return GooseRunResult(
+                    success=True,
+                    raw_stdout=truncation_raw,
+                    raw_stderr="",
+                    return_code=0,
+                    parsed_json=None,
+                )
+            else:
+                # Second call: SUBTASK stage with truncation instruction → skeleton
+                return GooseRunResult(
+                    success=True,
+                    raw_stdout='{"status": "done", "summary": "Wrote skeleton: mapping.rs", "files_modified": ["crates/hay-style/src/mapping.rs"]}',
+                    raw_stderr="",
+                    return_code=0,
+                    parsed_json={
+                        "status": "done",
+                        "summary": "Wrote skeleton: mapping.rs",
+                        "files_modified": ["crates/hay-style/src/mapping.rs"],
+                    },
+                )
+
+        with patch(
+            "tasker.orchestrator.run_goose_with_backoff", side_effect=mock_run_goose
+        ):
+            result = orch._run_dev_with_recovery(task, iteration, feedback=None)
+
+        assert result is not None
+        assert result.status == "done"
+        assert "skeleton" in result.summary.lower()
+        assert call_count == 2  # truncation detected → fast-forward → 1 retry
+        print("✓ dev truncation fast-forward tests passed")
 
 
 # ── Run all ───────────────────────────────────────────────────────
@@ -2742,4 +2844,6 @@ if __name__ == "__main__":
     test_run_subtask_loop()
     test_process_task_decomposition()
     test_process_task_vcs_once_per_task()
-    print("\n✅ All 55 dry-run tests passed!")
+    test_truncation_detection()
+    test_dev_truncation_fast_forward()
+    print("\n✅ All 57 dry-run tests passed!")
