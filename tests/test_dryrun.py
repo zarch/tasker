@@ -2786,6 +2786,100 @@ def test_dev_truncation_fast_forward():
         print("✓ dev truncation fast-forward tests passed")
 
 
+def test_dev_truncation_suppresses_task_text():
+    """When truncation is detected, SUBTASK/SUMMARIZE stages suppress task_text
+    to prevent the agent from re-reading specs and burning output tokens."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.models import Task
+    from tasker.orchestrator import Orchestrator
+    from tasker.goose import GooseRunResult
+
+    full_task = (
+        "Implement mapping.rs per arch/11-gis-renderer.md \u00a7Attribute Mapping. "
+        "Create AttributeRow, evaluate_rule, evaluate_continuous, evaluate_categorical, "
+        "normalize, quantile_position. See arch/11-gis-renderer.md for full Rust code examples."
+    )
+
+    task = Task(phase_index=0, task_index=0, text=full_task)
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = f"{td}/test58.jsonl"
+        md_path = f"{td}/test58.md"
+        Path(md_path).write_text("# P4-2\n- [ ] T4: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+        )
+        iteration = 1
+
+        truncation_raw = (
+            "I'll read the spec file and implement everything.\n\n"
+            "A tool call could not be parsed \u2014 the response may have been truncated."
+        )
+
+        call_count = 0
+        captured_params: list[dict] = []
+
+        def mock_run_goose(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            captured_params.append(kwargs.get("params", {}))
+            if call_count <= 3:
+                return GooseRunResult(
+                    success=True,
+                    raw_stdout=truncation_raw,
+                    raw_stderr="",
+                    return_code=0,
+                    parsed_json=None,
+                )
+            else:
+                return GooseRunResult(
+                    success=True,
+                    raw_stdout=(
+                        '{"status": "blocked", "summary": "Partial skeleton", '
+                        '"files_modified": [], "blocker_description": "File too large"}'
+                    ),
+                    raw_stderr="",
+                    return_code=0,
+                    parsed_json={
+                        "status": "blocked",
+                        "summary": "Partial skeleton",
+                        "files_modified": [],
+                        "blocker_description": "File too large",
+                    },
+                )
+
+        with patch(
+            "tasker.orchestrator.run_goose_with_backoff", side_effect=mock_run_goose
+        ):
+            result = orch._run_dev_with_recovery(task, iteration, feedback=None)
+
+        assert result is not None
+        assert result.status == "blocked"
+        assert call_count == 4
+
+        # First call (NORMAL): full task text should be present
+        assert full_task in captured_params[0].get("task_text", ""), (
+            "Call 1 (NORMAL) should have full task text"
+        )
+
+        # Calls after fast-forward (SUBTASK+): task_text should be suppressed
+        for i, params in enumerate(captured_params[1:], start=2):
+            task_text = params.get("task_text", "")
+            assert "arch/11-gis-renderer.md" not in task_text, (
+                f"Call {i}: task_text should be suppressed, got: {task_text[:200]}"
+            )
+            assert "Recovery mode" in task_text, (
+                f"Call {i}: task_text should say Recovery mode, got: {task_text[:200]}"
+            )
+
+        print("\u2713 dev truncation suppresses task_text in SUBTASK/SUMMARIZE stages")
+
+
 # ── Run all ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -2846,4 +2940,5 @@ if __name__ == "__main__":
     test_process_task_vcs_once_per_task()
     test_truncation_detection()
     test_dev_truncation_fast_forward()
-    print("\n✅ All 57 dry-run tests passed!")
+    test_dev_truncation_suppresses_task_text()
+    print("\n✅ All 58 dry-run tests passed!")

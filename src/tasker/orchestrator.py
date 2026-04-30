@@ -118,10 +118,12 @@ _RECOVERY_SUBTASK = (
 )
 
 _RECOVERY_TRUNCATION = (
-    "⚠️ OUTPUT TRUNCATED — your previous tool call was cut off mid-execution.\n\n"
-    "The file you tried to write was too large for a single response. "
-    "Write ONLY a skeleton (struct/enum/fn signatures with TODO bodies), "
-    "then output the JSON block. Do NOT write full implementations in one tool call.\n"
+    "⚠️ OUTPUT TRUNCATED — your previous response was cut off.\n\n"
+    "CRITICAL RULES — you MUST follow these in order:\n"
+    "1. DO NOT read any files, specs, or explore the codebase. You already have context.\n"
+    "2. DO NOT write more than 30 lines of code in a single tool call.\n"
+    "3. Write a MINIMAL skeleton (struct/enum/fn signatures with TODO bodies only).\n"
+    "4. Immediately after the skeleton, output the JSON block below.\n\n"
     '{"status": "done", "summary": "Wrote skeleton: <file>", "files_modified": [...]}'
 )
 
@@ -886,6 +888,11 @@ class Orchestrator:
             if stage == RecoveryStage.CONTINUE:
                 effective_task_text = (
                     f"[Recovery mode — see your session history for the full task. "
+                    f"Task: {task.label}]"
+                )
+            elif stage in (RecoveryStage.SUBTASK, RecoveryStage.SUMMARIZE):
+                effective_task_text = (
+                    f"[Recovery mode ({stage.value}) — do NOT re-read task or specs. "
                     f"Task: {task.label}]"
                 )
 
