@@ -378,3 +378,36 @@ class UserChatRequest:
             "dev_blocked": "true" if self.blocker_description else "false",
             "blocker_suggestion": "",
         }
+
+
+# ── Task decomposition ────────────────────────────────────────────
+
+
+@dataclass
+class Subtask:
+    """A single piece of work extracted from a larger task by QA decomposition."""
+
+    label: str  # e.g. "P1.T3.1" or "P1.T3 — Part A"
+    text: str  # focused, self-contained description
+
+
+@dataclass
+class DecomposeResponse:
+    """QA → Orchestrator: task decomposition result.
+
+    The QA agent either decides the task is small enough to pass through
+    as-is (``should_decompose=False``) or returns a list of focused subtasks.
+    """
+
+    should_decompose: bool
+    reason: str  # brief explanation of the decision
+    subtasks: list[Subtask] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "should_decompose": self.should_decompose,
+            "reason": self.reason,
+        }
+        if self.subtasks:
+            d["subtasks"] = [{"label": s.label, "text": s.text} for s in self.subtasks]
+        return d

@@ -7,6 +7,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import typer
@@ -48,6 +49,11 @@ def main(
         _DEFAULT_QA,
         "--qa",
         help="Path to the QA goose recipe (YAML). Default: recipe-qa.yaml",
+    ),
+    decompose: Path = typer.Option(
+        None,
+        "--decompose",
+        help="Path to a task decomposition recipe. When set, QA reviews each task before passing to DEV and may split it into subtasks.",
     ),
     task_file: Path = typer.Argument(
         ...,
@@ -139,6 +145,11 @@ def main(
         "--no-monitor-log",
         help="Disable the monitor log file (only console output).",
     ),
+    cwd: Path | None = typer.Option(
+        None,
+        "--cwd",
+        help="Project root for goose agents. Default: current working directory (where you run tasker from).",
+    ),
     log_level: str = typer.Option(
         "WARNING",
         "--log-level",
@@ -171,9 +182,10 @@ def main(
 
     log_path = log_file or task_file.with_suffix(".iterations.jsonl")
 
-    # Default cwd to the task file's parent so goose agents operate
-    # in the correct project context.
-    cwd = task_file.resolve().parent
+    # Use --cwd if provided, otherwise default to the current working directory
+    # (where the user invoked tasker from).  This ensures goose agents can
+    # resolve project-relative paths like specs/... and crates/... correctly.
+    cwd = Path(cwd).resolve() if cwd else Path(os.getcwd()).resolve()
 
     # ── Configure structured monitoring log ──────────────────────
     if no_monitor_log:
@@ -225,6 +237,7 @@ def main(
             max_delay_secs=rate_limit_max_delay,
             max_retries=rate_limit_max_retries,
         ),
+        decompose_recipe=str(decompose.resolve()) if decompose else None,
     )
 
     orchestrator.run()

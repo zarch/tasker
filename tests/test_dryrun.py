@@ -2118,6 +2118,571 @@ def test_pending_iteration_dataclass():
     print("✓ _PendingIteration dataclass tests passed")
 
 
+# ── 48. Test Subtask and DecomposeResponse models ────────────────
+
+
+def test_decompose_models():
+    """Test Subtask and DecomposeResponse construction and serialization."""
+    from tasker.models import Subtask, DecomposeResponse
+
+    # Subtask construction
+    st = Subtask(label="P1.T3.1", text="Implement GridCell struct")
+    assert st.label == "P1.T3.1"
+    assert st.text == "Implement GridCell struct"
+
+    # DecomposeResponse — no decomposition
+    resp_no = DecomposeResponse(
+        should_decompose=False,
+        reason="Single focused change in one module.",
+    )
+    d = resp_no.to_dict()
+    assert d["should_decompose"] is False
+    assert d["reason"] == "Single focused change in one module."
+    assert "subtasks" not in d  # empty subtasks list is omitted
+
+    # DecomposeResponse — with subtasks
+    st1 = Subtask(
+        label="P1.T3.1",
+        text="Implement GridCell struct — arch/02-grid-system.md §GridCell",
+    )
+    st2 = Subtask(
+        label="P1.T3.2",
+        text="Implement SpatialIndex trait — arch/02-grid-system.md §SpatialIndex",
+    )
+    resp_yes = DecomposeResponse(
+        should_decompose=True,
+        reason="Task spans 2 modules with distinct deliverables.",
+        subtasks=[st1, st2],
+    )
+    d2 = resp_yes.to_dict()
+    assert d2["should_decompose"] is True
+    assert d2["reason"] == "Task spans 2 modules with distinct deliverables."
+    assert len(d2["subtasks"]) == 2
+    assert d2["subtasks"][0]["label"] == "P1.T3.1"
+    assert "GridCell struct" in d2["subtasks"][0]["text"]
+    assert d2["subtasks"][1]["label"] == "P1.T3.2"
+    assert "SpatialIndex" in d2["subtasks"][1]["text"]
+
+    # DecomposeResponse — default subtasks is empty list
+    resp_default = DecomposeResponse(should_decompose=False, reason="simple")
+    assert resp_default.subtasks == []
+
+    print("✓ DecomposeResponse and Subtask model tests passed")
+
+
+# ── 49. Test _parse_decompose_response ───────────────────────────
+
+
+def test_parse_decompose_response():
+    """Test _parse_decompose_response with valid and invalid inputs."""
+    from tasker.orchestrator import _parse_decompose_response
+
+    # Valid: no decomposition
+    parsed = {"should_decompose": False, "reason": "Simple task", "subtasks": []}
+    result = _parse_decompose_response("", parsed)
+    assert result is not None
+    assert result.should_decompose is False
+    assert result.reason == "Simple task"
+    assert result.subtasks == []
+
+    # Valid: decomposition with subtasks
+    parsed2 = {
+        "should_decompose": True,
+        "reason": "3 modules involved",
+        "subtasks": [
+            {"label": "P1.T1.1", "text": "Build struct A"},
+            {"label": "P1.T1.2", "text": "Implement trait B"},
+        ],
+    }
+    result2 = _parse_decompose_response("some output", parsed2)
+    assert result2 is not None
+    assert result2.should_decompose is True
+    assert result2.reason == "3 modules involved"
+    assert len(result2.subtasks) == 2
+    assert result2.subtasks[0].label == "P1.T1.1"
+    assert result2.subtasks[1].text == "Implement trait B"
+
+    # String boolean ("true")
+    parsed3 = {"should_decompose": "true", "reason": "yes", "subtasks": []}
+    result3 = _parse_decompose_response("", parsed3)
+    assert result3 is not None
+    assert result3.should_decompose is True
+
+    # String boolean ("false")
+    parsed4 = {"should_decompose": "false", "reason": "no", "subtasks": []}
+    result4 = _parse_decompose_response("", parsed4)
+    assert result4 is not None
+    assert result4.should_decompose is False
+
+    # Missing should_decompose key → None
+    result5 = _parse_decompose_response("", {"reason": "no key"})
+    assert result5 is None
+
+    # parsed is None → None
+    result6 = _parse_decompose_response("garbage", None)
+    assert result6 is None
+
+    # Subtask missing label → skipped
+    parsed7 = {
+        "should_decompose": True,
+        "reason": "test",
+        "subtasks": [{"text": "only text, no label"}],
+    }
+    result7 = _parse_decompose_response("", parsed7)
+    assert result7 is not None
+    assert result7.should_decompose is True
+    assert result7.subtasks == []  # malformed subtask was skipped
+
+    # Extra fields in subtask are ignored (only label+text used)
+    parsed8 = {
+        "should_decompose": True,
+        "reason": "test",
+        "subtasks": [{"label": "S1", "text": "Do thing", "priority": "high"}],
+    }
+    result8 = _parse_decompose_response("", parsed8)
+    assert result8 is not None
+    assert len(result8.subtasks) == 1
+    assert result8.subtasks[0].label == "S1"
+
+    print("✓ _parse_decompose_response tests passed")
+
+
+# ── 50. Test _decompose_task ─────────────────────────────────────
+
+
+def test_decompose_task():
+    """Test _decompose_task: disabled, valid response, parse failure fallback."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.goose import GooseRunResult
+    from tasker.models import Task
+
+    task = Task(
+        phase_index=0, task_index=2, text="Build GridCell and SpatialIndex — arch/02.md"
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = f"{td}/iter.jsonl"
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("# Phase 1\n- [ ] T1: dummy\n")
+
+        # --- Case 1: disabled (no decompose_recipe) → returns None ---
+        orch_disabled = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+        )
+        result_none = orch_disabled._decompose_task(task)
+        assert result_none is None, "Should return None when decompose is disabled"
+
+        # --- Case 2: enabled, valid decompose response ---
+        orch_enabled = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+            decompose_recipe="/dev/null",
+        )
+        fake_decompose = GooseRunResult(
+            success=True,
+            raw_stdout='{"should_decompose": true, "reason": "2 modules", '
+            '"subtasks": [{"label": "P1.T3.1", "text": "Build GridCell"}, '
+            '{"label": "P1.T3.2", "text": "Build SpatialIndex"}]}',
+            raw_stderr="",
+            return_code=0,
+        )
+        with patch("tasker.goose.run_goose", return_value=fake_decompose):
+            result_yes = orch_enabled._decompose_task(task)
+        assert result_yes is not None
+        assert result_yes.should_decompose is True
+        assert result_yes.reason == "2 modules"
+        assert len(result_yes.subtasks) == 2
+        assert result_yes.subtasks[0].label == "P1.T3.1"
+        assert result_yes.subtasks[1].text == "Build SpatialIndex"
+
+        # --- Case 3: enabled, valid no-decompose response ---
+        fake_no_split = GooseRunResult(
+            success=True,
+            raw_stdout='{"should_decompose": false, "reason": "Simple task", "subtasks": []}',
+            raw_stderr="",
+            return_code=0,
+        )
+        with patch("tasker.goose.run_goose", return_value=fake_no_split):
+            result_no = orch_enabled._decompose_task(task)
+        assert result_no is not None
+        assert result_no.should_decompose is False
+        assert result_no.reason == "Simple task"
+        assert result_no.subtasks == []
+
+        # --- Case 4: enabled, parse failure → fallback should_decompose=False ---
+        fake_garbage = GooseRunResult(
+            success=True,
+            raw_stdout="I could not determine the complexity.",
+            raw_stderr="",
+            return_code=0,
+        )
+        with patch("tasker.goose.run_goose", return_value=fake_garbage):
+            result_fallback = orch_enabled._decompose_task(task)
+        assert result_fallback is not None
+        assert result_fallback.should_decompose is False
+        assert "failed" in result_fallback.reason.lower()
+
+        print("✓ _decompose_task tests passed")
+
+
+# ── 51. Test _run_dev_with_recovery override_task_text ───────────
+
+
+def test_dev_override_task_text():
+    """Test that override_task_text replaces task.text in the DevRequest params."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.goose import GooseRunResult
+    from tasker.models import Task
+
+    task = Task(phase_index=0, task_index=0, text="Original full task description")
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = f"{td}/iter.jsonl"
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("# Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+        )
+
+        fake_done = GooseRunResult(
+            success=True,
+            raw_stdout='{"status": "done", "summary": "Implemented subtask A", "files_modified": ["src/a.rs"]}',
+            raw_stderr="",
+            return_code=0,
+            parsed_json={
+                "status": "done",
+                "summary": "Implemented subtask A",
+                "files_modified": ["src/a.rs"],
+            },
+        )
+
+        with patch("tasker.goose.run_goose", return_value=fake_done) as mock_goose:
+            result = orch._run_dev_with_recovery(
+                task=task,
+                iteration=1,
+                feedback=None,
+                override_task_text="Focused subtask: implement GridCell struct only",
+            )
+
+        assert result.status == "done"
+        assert result.summary == "Implemented subtask A"
+
+        # Verify the params passed to goose contained the override text
+        call_args = mock_goose.call_args
+        params = call_args.kwargs.get("params") or call_args[1].get("params")
+        assert params["task_text"] == "Focused subtask: implement GridCell struct only"
+        assert "GridCell" in params["task_text"]
+
+        # --- Without override → uses task.text ---
+        mock_goose.reset_mock()
+        with patch("tasker.goose.run_goose", return_value=fake_done) as mock_goose:
+            orch._run_dev_with_recovery(
+                task=task,
+                iteration=1,
+                feedback=None,
+                override_task_text=None,
+            )
+
+        call_args2 = mock_goose.call_args
+        params2 = call_args2.kwargs.get("params") or call_args2[1].get("params")
+        assert params2["task_text"] == "Original full task description"
+
+        print("✓ _run_dev_with_recovery override_task_text tests passed")
+
+
+# ── 52. Test _run_feedback_loop work_label with subtask_label ─────
+
+
+def test_feedback_loop_subtask_label():
+    """Test that work_label uses subtask_label when provided."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, Phase, DevResponse, QAResponse
+
+    task = Task(phase_index=0, task_index=2, text="Big task spanning modules")
+    phase = Phase(index=0, title="Phase 1", tasks=[task])
+
+    fake_dev = DevResponse(
+        status="done",
+        summary="Implemented GridCell struct",
+        files_modified=["src/grid.rs"],
+    )
+    fake_qa = QAResponse(decision="approve", feedback="Looks correct")
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = f"{td}/iter.jsonl"
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("# Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+        )
+
+        printed_msgs = []
+        original_print_info = orch.ui.print_info
+        original_print_success = orch.ui.print_success
+
+        def capture_info(msg):
+            printed_msgs.append(("info", msg))
+            original_print_info(msg)
+
+        def capture_success(msg):
+            printed_msgs.append(("success", msg))
+            original_print_success(msg)
+
+        with patch.object(orch.ui, "print_info", side_effect=capture_info):
+            with patch.object(orch.ui, "print_success", side_effect=capture_success):
+                with patch.object(
+                    orch, "_run_dev_with_recovery", return_value=fake_dev
+                ):
+                    with patch.object(
+                        orch, "_run_qa_with_recovery", return_value=fake_qa
+                    ):
+                        orch._run_feedback_loop(
+                            phase=phase,
+                            task=task,
+                            effective_task_text="Implement GridCell struct only",
+                            feedback=None,
+                            subtask_label="P1.T3.1",
+                            subtask_index="1/2",
+                        )
+
+        # Verify work_label (subtask_label) appears in UI messages
+        info_msgs = [m[1] for m in printed_msgs if m[0] == "info"]
+        success_msgs = [m[1] for m in printed_msgs if m[0] == "success"]
+
+        # At least one info message should reference P1.T3.1 (the subtask_label)
+        subtask_msgs = [m for m in info_msgs if "P1.T3.1" in m]
+        assert len(subtask_msgs) > 0, (
+            f"Expected subtask_label P1.T3.1 in UI messages, got: {info_msgs}"
+        )
+
+        # The QA approval message should use work_label
+        approve_msgs = [m for m in success_msgs if "APPROVED" in m]
+        assert len(approve_msgs) == 1
+        assert "P1.T3.1" in approve_msgs[0], (
+            f"Expected P1.T3.1 in approval message, got: {approve_msgs[0]}"
+        )
+
+        print("✓ _run_feedback_loop subtask_label work_label tests passed")
+
+
+# ── 53. Test _run_subtask_loop iterates over subtasks ────────────
+
+
+def test_run_subtask_loop():
+    """Test _run_subtask_loop calls _run_feedback_loop for each subtask."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, Phase, Subtask
+
+    task = Task(phase_index=0, task_index=2, text="Big task")
+    phase = Phase(index=0, title="Phase 1", tasks=[task])
+
+    subtasks = [
+        Subtask(label="P1.T3.1", text="Implement GridCell struct"),
+        Subtask(label="P1.T3.2", text="Implement SpatialIndex trait"),
+        Subtask(label="P1.T3.3", text="Add unit tests"),
+    ]
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = f"{td}/iter.jsonl"
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("# Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+        )
+
+        with patch.object(orch, "_run_feedback_loop") as mock_loop:
+            orch._run_subtask_loop(phase, task, subtasks)
+
+        assert mock_loop.call_count == 3
+
+        # Verify first call: subtask 1
+        c1 = mock_loop.call_args_list[0]
+        assert c1[0][0] is phase  # positional arg: phase
+        assert c1[0][1] is task  # positional arg: task
+        assert c1[0][2] == "Implement GridCell struct"  # effective_task_text
+        assert c1[1].get("feedback") is None
+        assert c1[1].get("subtask_label") == "P1.T3.1"
+        assert c1[1].get("subtask_index") == "1/3"
+
+        # Verify second call: subtask 2
+        c2 = mock_loop.call_args_list[1]
+        assert c2[0][2] == "Implement SpatialIndex trait"
+        assert c2[1].get("subtask_label") == "P1.T3.2"
+        assert c2[1].get("subtask_index") == "2/3"
+
+        # Verify third call: subtask 3
+        c3 = mock_loop.call_args_list[2]
+        assert c3[0][2] == "Add unit tests"
+        assert c3[1].get("subtask_label") == "P1.T3.3"
+        assert c3[1].get("subtask_index") == "3/3"
+
+        print("✓ _run_subtask_loop tests passed")
+
+
+# ── 54. Test _process_task with and without decomposition ────────
+
+
+def test_process_task_decomposition():
+    """Test _process_task routes to subtask loop or direct feedback loop."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, Phase, Subtask, DecomposeResponse
+
+    task = Task(phase_index=0, task_index=2, text="Build GridCell and SpatialIndex")
+    phase = Phase(index=0, title="Phase 1", tasks=[task])
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = f"{td}/iter.jsonl"
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("# Phase 1\n- [ ] T1: dummy\n")
+
+        # --- Case 1: No decomposition (decompose_recipe not set) ---
+        orch_no_decompose = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+        )
+        with patch.object(orch_no_decompose, "_run_feedback_loop") as mock_direct:
+            with patch.object(orch_no_decompose, "_vcs_begin_task"):
+                orch_no_decompose._process_task(phase, task)
+
+        mock_direct.assert_called_once()
+        c = mock_direct.call_args
+        assert c[0][0] is phase
+        assert c[0][1] is task
+        assert c[0][2] == task.text  # effective_task_text = original task.text
+        assert c[1].get("feedback") is None
+
+        # --- Case 2: Decomposition enabled, should_decompose=False ---
+        orch_decompose = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+            decompose_recipe="/dev/null",
+        )
+        no_split = DecomposeResponse(should_decompose=False, reason="Simple task")
+        with patch.object(orch_decompose, "_decompose_task", return_value=no_split):
+            with patch.object(orch_decompose, "_run_feedback_loop") as mock_direct2:
+                with patch.object(orch_decompose, "_vcs_begin_task"):
+                    orch_decompose._process_task(phase, task)
+
+        mock_direct2.assert_called_once()
+
+        # --- Case 3: Decomposition enabled, should_decompose=True → subtask loop ---
+        subtasks = [
+            Subtask(label="P1.T3.1", text="Build GridCell"),
+            Subtask(label="P1.T3.2", text="Build SpatialIndex"),
+        ]
+        with_split = DecomposeResponse(
+            should_decompose=True,
+            reason="2 modules",
+            subtasks=subtasks,
+        )
+        with patch.object(orch_decompose, "_decompose_task", return_value=with_split):
+            with patch.object(orch_decompose, "_run_subtask_loop") as mock_sub:
+                with patch.object(orch_decompose, "_run_feedback_loop") as mock_direct3:
+                    with patch.object(orch_decompose, "_vcs_begin_task"):
+                        orch_decompose._process_task(phase, task)
+
+        mock_sub.assert_called_once()
+        mock_direct3.assert_not_called()  # should NOT call direct feedback loop
+        # Verify subtask_loop received the subtasks
+        c_sub = mock_sub.call_args
+        assert c_sub[0][0] is phase
+        assert c_sub[0][1] is task
+        assert len(c_sub[0][2]) == 2
+        assert c_sub[0][2][0].label == "P1.T3.1"
+
+        # --- Case 4: Decompose returns None (disabled) → direct loop ---
+        with patch.object(orch_no_decompose, "_decompose_task", return_value=None):
+            with patch.object(orch_no_decompose, "_run_feedback_loop") as mock_direct4:
+                with patch.object(orch_no_decompose, "_vcs_begin_task"):
+                    orch_no_decompose._process_task(phase, task)
+
+        mock_direct4.assert_called_once()
+
+        print("✓ _process_task decomposition routing tests passed")
+
+
+# ── 55. Test _process_task VCS is called once per task ───────────
+
+
+def test_process_task_vcs_once_per_task():
+    """Test that _vcs_begin_task is called exactly once even with 3 subtasks."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, Phase, Subtask, DecomposeResponse
+
+    task = Task(phase_index=0, task_index=2, text="Build GridCell and SpatialIndex")
+    phase = Phase(index=0, title="Phase 1", tasks=[task])
+
+    subtasks = [
+        Subtask(label="P1.T3.1", text="Build GridCell"),
+        Subtask(label="P1.T3.2", text="Build SpatialIndex"),
+        Subtask(label="P1.T3.3", text="Add tests"),
+    ]
+    with_split = DecomposeResponse(
+        should_decompose=True,
+        reason="3 modules",
+        subtasks=subtasks,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = f"{td}/iter.jsonl"
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("# Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+            decompose_recipe="/dev/null",
+        )
+
+        with patch.object(orch, "_decompose_task", return_value=with_split):
+            with patch.object(orch, "_run_subtask_loop") as mock_sub:
+                with patch.object(orch, "_vcs_begin_task") as mock_vcs:
+                    orch._process_task(phase, task)
+
+        # VCS begin must be called exactly once for the parent task
+        mock_vcs.assert_called_once_with(task)
+
+        # Subtask loop must be called once
+        mock_sub.assert_called_once()
+
+        print("✓ _process_task VCS once-per-task tests passed")
+
+
 # ── Run all ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -2168,4 +2733,12 @@ if __name__ == "__main__":
     test_pending_iteration_lifecycle()
     test_spinner_frames()
     test_pending_iteration_dataclass()
-    print("\n✅ All 47 dry-run tests passed!")
+    test_decompose_models()
+    test_parse_decompose_response()
+    test_decompose_task()
+    test_dev_override_task_text()
+    test_feedback_loop_subtask_label()
+    test_run_subtask_loop()
+    test_process_task_decomposition()
+    test_process_task_vcs_once_per_task()
+    print("\n✅ All 55 dry-run tests passed!")

@@ -13,6 +13,7 @@ from .goose import GooseRunResult, run_goose_with_backoff
 from .log import IterationLog
 from .models import (
     Actor,
+    DecomposeResponse,
     DevRequest,
     DevResponse,
     IterationEntry,
@@ -22,6 +23,7 @@ from .models import (
     QARequest,
     RecoveryStage,
     SessionScope,
+    Subtask,
     Task,
     TaskStatus,
     RateLimitConfig,
@@ -74,6 +76,26 @@ def _parse_qa_response(raw: str, parsed: dict | None) -> QAResponse | None:
             feedback=parsed.get("feedback", ""),
             concerns=parsed.get("concerns", []),
             user_question=parsed.get("user_question", ""),
+        )
+    return None
+
+
+def _parse_decompose_response(
+    raw: str, parsed: dict | None
+) -> DecomposeResponse | None:
+    """Extract DecomposeResponse from goose output. Returns None if unparsable."""
+    if parsed and "should_decompose" in parsed:
+        should = parsed["should_decompose"]
+        if not isinstance(should, bool):
+            should = str(should).lower() == "true"
+        subtasks: list[Subtask] = []
+        for st in parsed.get("subtasks", []):
+            if isinstance(st, dict) and st.get("label") and st.get("text"):
+                subtasks.append(Subtask(label=st["label"], text=st["text"]))
+        return DecomposeResponse(
+            should_decompose=should,
+            reason=parsed.get("reason", ""),
+            subtasks=subtasks,
         )
     return None
 
@@ -188,10 +210,12 @@ class Orchestrator:
         session_scope: SessionScope = SessionScope.SUBPHASE,
         force_new_session: bool = False,
         rate_limit: RateLimitConfig | None = None,
+        decompose_recipe: str | Path | None = None,
     ) -> None:
         self.task_file = Path(task_file).resolve()
         self.dev_recipe = Path(dev_recipe)
         self.qa_recipe = Path(qa_recipe)
+        self.decompose_recipe = Path(decompose_recipe) if decompose_recipe else None
         self.log = IterationLog(log_file)
         self.ui = TaskerUI()
         self.max_iterations = max_iterations_per_task
@@ -694,11 +718,91 @@ class Orchestrator:
         self.ui.update_project(self.phases, phase)
         log.info("task.finalized", task_label=task.label)
 
+    def _decompose_task(self, task: Task) -> DecomposeResponse | None:
+        """Ask the decomposer agent whether *task* should be split.
+
+        Returns ``None`` when decomposition is disabled (no ``decompose_recipe``
+        configured).  On parse failure after all recovery attempts, returns a
+        fallback ``DecomposeResponse(should_decompose=False, ...)`` so that the
+        task proceeds as a single unit rather than stalling.
+        """
+        if not self.decompose_recipe:
+            return None
+
+        from .goose import _extract_json_block
+
+        self.ui.update_actor(Actor.QA, task.label, "analyzing task complexity")
+        self.ui.print_info(f"[{task.label}] Decompose: analyzing task complexity...")
+
+        decompose_session = _generate_session_id("decompose")
+
+        # We give the decomposer fewer turns — it only needs to read specs
+        # and output a JSON decision, not implement anything.
+        max_turns = min(self.max_turns, 30)
+
+        result = self._run_goose_with_ui(
+            Actor.QA,
+            task.label,
+            recipe_path=self.decompose_recipe,
+            session_name=decompose_session,
+            params={
+                "task_label": task.label,
+                "task_text": task.text,
+                "decompose_session_id": decompose_session,
+            },
+            max_turns=max_turns,
+            detail="decompose",
+        )
+
+        parsed = _extract_json_block(result.raw_stdout)
+        response = _parse_decompose_response(result.raw_stdout, parsed)
+
+        if response is None:
+            log.warning(
+                "decompose.parse_failed",
+                task_label=task.label,
+                stderr=result.raw_stderr[:200] if result.raw_stderr else "",
+            )
+            self.ui.print_warning(
+                f"[{task.label}] Decompose agent returned unparsable output — "
+                f"proceeding with full task."
+            )
+            return DecomposeResponse(
+                should_decompose=False,
+                reason="Decompose agent failed to produce valid JSON.",
+            )
+
+        if response.should_decompose:
+            self.ui.print_info(
+                f"[{task.label}] Decompose: splitting into "
+                f"{len(response.subtasks)} subtask(s): "
+                + ", ".join(s.label for s in response.subtasks)
+            )
+        else:
+            self.ui.print_info(
+                f"[{task.label}] Decompose: no split needed — {response.reason}"
+            )
+
+        # Log the decomposition decision
+        decompose_entry = IterationEntry(
+            timestamp=_now_iso(),
+            iteration=self.global_iteration,
+            actor=Actor.QA,
+            task_label=task.label,
+            status=TaskStatus.ASSIGNED,
+            payload=response.to_dict(),
+        )
+        self.log.append(decompose_entry)
+        self.ui.add_iteration(decompose_entry)
+
+        return response
+
     def _run_dev_with_recovery(
         self,
         task: Task,
         iteration: int,
         feedback: str | None,
+        override_task_text: str | None = None,
     ) -> DevResponse:
         """Run the dev agent with graceful degradation on malformed output.
 
@@ -752,7 +856,9 @@ class Orchestrator:
             # On CONTINUE recovery, suppress task_text to prevent the agent
             # from re-engaging with the full task. It has session history and
             # already knows what to do — it just needs to output the JSON block.
-            effective_task_text = task.text
+            effective_task_text = (
+                override_task_text if override_task_text else task.text
+            )
             if stage == RecoveryStage.CONTINUE:
                 effective_task_text = (
                     f"[Recovery mode — see your session history for the full task. "
@@ -1327,9 +1433,69 @@ class Orchestrator:
         return synthetic
 
     def _process_task(self, phase: Phase, task: Task) -> None:
-        """Run QA→Dev feedback loop for a single task."""
-        # Begin jj change for this task
+        """Run QA→Dev feedback loop for a single task.
+
+        If decomposition is enabled, the task is first analyzed by the
+        decomposer agent.  When it returns subtasks, each subtask is run
+        through its own DEV→QA loop.  Otherwise the original task text is
+        passed to DEV unchanged.
+        """
+        # Begin jj change for this task (covers all subtasks)
         self._vcs_begin_task(task)
+
+        # ── Pre-scan: ask decomposer whether to split ──
+        decomposition = self._decompose_task(task)
+        if decomposition and decomposition.should_decompose and decomposition.subtasks:
+            self._run_subtask_loop(phase, task, decomposition.subtasks)
+        else:
+            self._run_feedback_loop(phase, task, task.text, feedback=None)
+
+    def _run_subtask_loop(
+        self, phase: Phase, task: Task, subtasks: list[Subtask]
+    ) -> None:
+        """Run DEV→QA loop for each subtask in sequence.
+
+        All subtasks share the same DEV and QA sessions so context
+        accumulates across subtasks (important for dependencies).
+        Feedback from a rejected subtask does NOT carry over to the
+        next subtask — each is independently verified.
+        """
+        total = len(subtasks)
+        for idx, subtask in enumerate(subtasks, 1):
+            self.ui.print_info(f"[{task.label}] Subtask {idx}/{total}: {subtask.label}")
+            log.info(
+                "subtask.start",
+                task_label=task.label,
+                subtask_label=subtask.label,
+                subtask_index=f"{idx}/{total}",
+            )
+
+            self._run_feedback_loop(
+                phase,
+                task,
+                subtask.text,
+                feedback=None,
+                subtask_label=subtask.label,
+                subtask_index=f"{idx}/{total}",
+            )
+
+    def _run_feedback_loop(
+        self,
+        phase: Phase,
+        task: Task,
+        effective_task_text: str,
+        feedback: str | None,
+        subtask_label: str | None = None,
+        subtask_index: str | None = None,
+    ) -> None:
+        """Run the DEV→QA feedback loop for a single task or subtask.
+
+        *effective_task_text* is the text sent to DEV (either the original
+        task text or a focused subtask description).  The *task* object
+        itself is used for VCS tracking, markdown marking, and logging.
+        """
+        # The label shown to the user and agents for this unit of work
+        work_label = subtask_label or task.label
 
         feedback: str | None = None  # None on first iteration
 
@@ -1347,6 +1513,7 @@ class Orchestrator:
                 task=task,
                 iteration=iteration,
                 feedback=feedback,
+                override_task_text=effective_task_text,
             )
 
             # ── Handle dev blocked ──
@@ -1361,22 +1528,22 @@ class Orchestrator:
                     else None,
                 )
                 self.ui.print_warning(
-                    f"[{task.label}] Developer BLOCKED: {dev_response.blocker_description[:200]}"
+                    f"[{work_label}] Developer BLOCKED: {dev_response.blocker_description[:200]}"
                 )
                 if dev_response.blocker_suggestion:
                     self.ui.print_info(
-                        f"[{task.label}] Dev suggestion: {dev_response.blocker_suggestion[:200]}"
+                        f"[{work_label}] Dev suggestion: {dev_response.blocker_suggestion[:200]}"
                     )
 
                 # Send blocker to QA for triage
                 self.ui.update_actor(
-                    Actor.QA, task.label, f"triaging blocker (iteration {iteration})"
+                    Actor.QA, work_label, f"triaging blocker (iteration {iteration})"
                 )
-                self.ui.print_info(f"[{task.label}] Asking QA to triage blocker...")
+                self.ui.print_info(f"[{work_label}] Asking QA to triage blocker...")
 
                 qa_blocked_request = QARequest(
-                    task_label=task.label,
-                    task_text=task.text,
+                    task_label=work_label,
+                    task_text=effective_task_text,
                     dev_response=dev_response,
                     dev_session_id=self.dev_session_name,
                     qa_session_id=self.qa_session_name,
@@ -1435,7 +1602,7 @@ class Orchestrator:
                 elif qa_response.decision == "approve":
                     # QA decided the blocker is acceptable (e.g., task is already partially done)
                     self.ui.print_success(
-                        f"[{task.label}] QA approved blocked task: {qa_response.feedback[:100]}"
+                        f"[{work_label}] QA approved blocked task: {qa_response.feedback[:100]}"
                     )
                     self._finalize_task(phase, task)
                     return
@@ -1443,7 +1610,7 @@ class Orchestrator:
                 else:
                     # reject — QA gave guidance to unblock the dev, loop back
                     self.ui.print_warning(
-                        f"[{task.label}] QA triage: try again with guidance: "
+                        f"[{work_label}] QA triage: try again with guidance: "
                         f"{qa_response.feedback[:200]}"
                     )
                     feedback = (
@@ -1461,7 +1628,7 @@ class Orchestrator:
                     continue  # back to top of iteration loop → dev retry
 
             self.ui.print_info(
-                f"[{task.label}] Developer done: {dev_response.summary[:100]}"
+                f"[{work_label}] Developer done: {dev_response.summary[:100]}"
             )
 
             log.info(
@@ -1473,9 +1640,9 @@ class Orchestrator:
 
             # ── 2. Send to QA for review ──
             self.ui.update_actor(
-                Actor.QA, task.label, f"reviewing iteration {iteration}"
+                Actor.QA, work_label, f"reviewing iteration {iteration}"
             )
-            self.ui.print_info(f"[{task.label}] Iteration {iteration}: calling QA...")
+            self.ui.print_info(f"[{work_label}] Iteration {iteration}: calling QA...")
 
             # Get VCS diff for QA context
             vcs_diff = self._vcs_get_diff(task)
@@ -1488,8 +1655,8 @@ class Orchestrator:
             )
 
             qa_request = QARequest(
-                task_label=task.label,
-                task_text=task.text,
+                task_label=work_label,
+                task_text=effective_task_text,
                 dev_response=dev_response,
                 dev_session_id=self.dev_session_name,
                 qa_session_id=self.qa_session_name,
@@ -1514,7 +1681,7 @@ class Orchestrator:
                     feedback=qa_response.feedback[:100],
                 )
                 self.ui.print_success(
-                    f"[{task.label}] ✓ APPROVED by QA: {qa_response.feedback[:100]}"
+                    f"[{work_label}] ✓ APPROVED by QA: {qa_response.feedback[:100]}"
                 )
                 self._finalize_task(phase, task)
                 return
@@ -1547,7 +1714,7 @@ class Orchestrator:
                     num_concerns=len(qa_response.concerns),
                 )
                 self.ui.print_warning(
-                    f"[{task.label}] ✗ REJECTED by QA: {qa_response.feedback[:200]}"
+                    f"[{work_label}] ✗ REJECTED by QA: {qa_response.feedback[:200]}"
                 )
                 if qa_response.concerns:
                     for c in qa_response.concerns[:5]:
@@ -1568,7 +1735,7 @@ class Orchestrator:
             max_iterations=self.max_iterations,
         )
         self.ui.print_error(
-            f"[{task.label}] Max iterations ({self.max_iterations}) reached. "
+            f"[{work_label}] Max iterations ({self.max_iterations}) reached. "
             f"Marking task done and moving on."
         )
         self._finalize_task(phase, task)
