@@ -13,6 +13,9 @@ from .goose import GooseRunResult, run_goose_with_backoff
 from .log import IterationLog
 from .models import (
     Actor,
+    ArchAction,
+    ArchRequest,
+    ArchResponse,
     DecomposeResponse,
     DevRequest,
     DevResponse,
@@ -29,7 +32,14 @@ from .models import (
     RateLimitConfig,
     UserChatRequest,
 )
-from .parser import find_next_task, mark_task_done, parse_task_file, update_markdown
+from .parser import (
+    find_next_task,
+    insert_subtasks,
+    mark_task_done,
+    parse_task_file,
+    rewrite_task_text,
+    update_markdown,
+)
 from .ui import TaskerUI
 from .vcs import VCSBackend
 
@@ -100,6 +110,26 @@ def _parse_decompose_response(
     return None
 
 
+def _parse_arch_response(raw: str, parsed: dict | None) -> ArchResponse | None:
+    """Extract ArchResponse from goose output. Returns None if unparsable."""
+    if parsed and "action" in parsed:
+        action = parsed["action"]
+        if action not in ("recompose", "clarify", "skip", "retry"):
+            return None
+        subtasks: list[Subtask] = []
+        for st in parsed.get("subtasks", []):
+            if isinstance(st, dict) and st.get("label") and st.get("text"):
+                subtasks.append(Subtask(label=st["label"], text=st["text"]))
+        return ArchResponse(
+            action=action,
+            reason=parsed.get("reason", ""),
+            subtasks=subtasks,
+            new_task_text=parsed.get("new_task_text", ""),
+            max_iterations_override=parsed.get("max_iterations_override"),
+        )
+    return None
+
+
 # ── Recovery instructions for graceful degradation ────────────────
 
 _RECOVERY_CONTINUE = (
@@ -162,6 +192,16 @@ _QA_RECOVERY_RESTART = (
     "⚠️ FRESH START — previous review attempts produced no JSON block.\n\n"
     "You are in a new session. Review concisely and output the JSON block."
 )
+
+# ── Stuckness detection constants ──────────────────────────────────
+# Consecutive full-recovery exhaustions before invoking ARCH
+_STUCK_EXHAUSTION_THRESHOLD = 3
+# Max feedback-loop iterations without QA approval before invoking ARCH
+_STUCK_ITERATION_THRESHOLD = 10
+# Maximum feedback text length (chars) — prevents ARG_MAX overflow
+_MAX_FEEDBACK_LENGTH = 2000
+# Keep only the last N feedback rounds when truncating
+_MAX_FEEDBACK_ROUNDS = 3
 
 
 _TRUNCATION_MARKER = "A tool call could not be parsed"
@@ -234,11 +274,13 @@ class Orchestrator:
         force_new_session: bool = False,
         rate_limit: RateLimitConfig | None = None,
         decompose_recipe: str | Path | None = None,
+        arch_recipe: str | Path | None = None,
     ) -> None:
         self.task_file = Path(task_file).resolve()
         self.dev_recipe = Path(dev_recipe)
         self.qa_recipe = Path(qa_recipe)
         self.decompose_recipe = Path(decompose_recipe) if decompose_recipe else None
+        self.arch_recipe = Path(arch_recipe) if arch_recipe else None
         self.log = IterationLog(log_file)
         self.ui = TaskerUI()
         self.max_iterations = max_iterations_per_task
@@ -270,6 +312,11 @@ class Orchestrator:
         self.current_phase: Phase | None = None
         self.global_iteration = 0
 
+        # Stuckness tracking — per-task counters reset when task changes
+        self._stuck_task_label: str = ""
+        self._consecutive_exhaustions: int = 0
+        self._iterations_without_approval: int = 0
+
     def run(self) -> None:
         """Main entry point — run all tasks."""
         log.info(
@@ -286,11 +333,14 @@ class Orchestrator:
             provider=self.provider,
             cwd=str(self.cwd),
             vcs="enabled" if self.vcs else "disabled",
+            arch="enabled" if self.arch_recipe else "disabled",
         )
         self.ui.print_info(f"Developer session: {self.dev_session_name}")
         self.ui.print_info(f"QA session:       {self.qa_session_name}")
         self.ui.print_info(f"Session scope:    {self.session_scope.value}")
         self.ui.print_info(f"Iteration log:    {self.log._path}")
+        if self.arch_recipe:
+            self.ui.print_info(f"Architect recipe: {self.arch_recipe}")
         self.ui.print_info("")
 
         # Initialize VCS integration
@@ -373,7 +423,28 @@ class Orchestrator:
 
     def _run_loop(self) -> None:
         """Process tasks one by one until all are done."""
+        self._needs_reparse = False
+
         while True:
+            # Re-parse markdown if ARCH restructured tasks
+            if self._needs_reparse:
+                log.info(
+                    "tasks.reloading",
+                    reason="arch_redecompose",
+                    task_file=str(self.task_file),
+                )
+                self.ui.print_info("🏗️ ARCHITECT restructured tasks — reloading...")
+                self.phases = parse_task_file(self.task_file)
+                self._needs_reparse = False
+
+                total_tasks = sum(p.total for p in self.phases)
+                done_tasks = sum(p.completed for p in self.phases)
+                self.ui.update_project(self.phases, self.phases[0])
+                self.ui.print_info(
+                    f"Reloaded: {total_tasks} tasks ({done_tasks} done, "
+                    f"{total_tasks - done_tasks} remaining)"
+                )
+
             pair = find_next_task(self.phases)
             if pair is None:
                 log.info("all_tasks.complete")
@@ -385,6 +456,12 @@ class Orchestrator:
             self.current_phase = phase
             self.ui.update_project(self.phases, phase)
             self.ui.update_phase(phase)
+
+            # Reset stuckness counters for new task
+            if self._stuck_task_label != task.label:
+                self._stuck_task_label = task.label
+                self._consecutive_exhaustions = 0
+                self._iterations_without_approval = 0
 
             log.info(
                 "task.starting",
@@ -631,8 +708,12 @@ class Orchestrator:
         in both the header panel (elapsed timer) and the iteration log table
         (animated spinner row).
         """
-        icon = "🧪" if actor == Actor.QA else "🛠️"
-        name = "QA Reviewer" if actor == Actor.QA else "Developer"
+        icon = "🧪" if actor == Actor.QA else ("🛠️" if actor == Actor.DEV else "🏗️")
+        name = (
+            "QA Reviewer"
+            if actor == Actor.QA
+            else ("Developer" if actor == Actor.DEV else "Architect")
+        )
         label = f"{icon} {name} — Task {task_label}"
         if detail:
             label += f"  ({detail})"
@@ -820,6 +901,349 @@ class Orchestrator:
 
         return response
 
+        return response
+
+    # ── Architect (ARCH) agent integration ──────────────────────
+
+    def _build_error_summary(self, task: Task) -> str:
+        """Build a concise summary of errors for the ARCH agent.
+
+        Reads recent entries from the iteration log for this task and
+        summarizes the failure patterns.
+        """
+        entries = self.log.read_all()
+        task_entries = [e for e in entries if e.get("task_label") == task.label]
+
+        if not task_entries:
+            return "No iteration log entries found for this task."
+
+        # Count by error type
+        error_counts: dict[str, int] = {}
+        last_errors: list[str] = []
+        for entry in task_entries[-50:]:  # last 50 entries
+            payload = entry.get("payload", {})
+            status = entry.get("status", "")
+            if status == "error":
+                error_type = payload.get("error", "unknown")
+                error_counts[error_type] = error_counts.get(error_type, 0) + 1
+                if len(last_errors) < 5:
+                    stage = payload.get("stage", "")
+                    raw = entry.get("raw_output", "")[:100]
+                    last_errors.append(f"  - {error_type} (stage={stage}): {raw}")
+
+        total = len(task_entries)
+        errors = sum(1 for e in task_entries if e.get("status") == "error")
+        blocked = sum(1 for e in task_entries if e.get("status") == "blocked")
+
+        summary_lines = [
+            f"Total attempts: {total} ({errors} errors, {blocked} blocked)",
+            "",
+            "Error breakdown:",
+        ]
+        for error_type, count in sorted(error_counts.items(), key=lambda x: -x[1]):
+            summary_lines.append(f"  - {error_type}: {count}")
+
+        if last_errors:
+            summary_lines.append("")
+            summary_lines.append("Last errors:")
+            summary_lines.extend(last_errors)
+
+        return "\n".join(summary_lines)
+
+    def _build_code_state_summary(self, task: Task) -> str:
+        """Build a summary of what code exists on disk for the ARCH agent.
+
+        Uses `find` and `wc` to count source files in the project's crates/
+        directory. Keeps it brief so it doesn't blow up the CLI params.
+        """
+        import subprocess
+
+        cwd = self.cwd or Path(".")
+        crates_dir = cwd / "crates"
+
+        if not crates_dir.exists():
+            return "No crates/ directory found — project may not be scaffolded yet."
+
+        try:
+            # Count .rs files modified recently (last 30 min)
+            result = subprocess.run(
+                [
+                    "find",
+                    str(crates_dir),
+                    "-name",
+                    "*.rs",
+                    "-mmin",
+                    "-30",
+                    "-type",
+                    "f",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            recent_files = (
+                result.stdout.strip().split("\n") if result.stdout.strip() else []
+            )
+            # Make paths relative to cwd
+            recent_rel = [
+                str(Path(f).relative_to(cwd)) for f in recent_files if f.strip()
+            ]
+        except (subprocess.TimeoutExpired, Exception):
+            recent_rel = []
+
+        try:
+            # Count total .rs files
+            result = subprocess.run(
+                ["find", str(crates_dir), "-name", "*.rs", "-type", "f"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            total_rs = (
+                len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
+            )
+        except (subprocess.TimeoutExpired, Exception):
+            total_rs = 0
+
+        lines = [
+            f"Project has {total_rs} .rs files under crates/.",
+        ]
+        if recent_rel:
+            lines.append(f"\nRecently modified files ({len(recent_rel)}):")
+            for f in recent_rel[:10]:
+                lines.append(f"  - {f}")
+        else:
+            lines.append("\nNo recently modified files.")
+
+        return "\n".join(lines)
+
+    def _run_arch(self, task: Task) -> ArchResponse | None:
+        """Run the Architect agent to diagnose and unblock a stuck task.
+
+        Returns None if ARCH is disabled or if the agent fails to produce
+        a valid response.
+        """
+        if not self.arch_recipe:
+            return None
+
+        self.ui.update_actor(Actor.ARCH, task.label, "diagnosing stuck task")
+        self.ui.print_info(f"[{task.label}] 🏗️ ARCHITECT: diagnosing stuck task...")
+        log.info(
+            "arch.invoked",
+            task_label=task.label,
+            consecutive_exhaustions=self._consecutive_exhaustions,
+            iterations_without_approval=self._iterations_without_approval,
+        )
+
+        error_summary = self._build_error_summary(task)
+        code_state = self._build_code_state_summary(task)
+
+        arch_request = ArchRequest(
+            task_label=task.label,
+            task_text=task.text,
+            error_summary=error_summary[:3000],  # cap to prevent ARG_MAX
+            code_state=code_state[:2000],
+        )
+
+        arch_session = _generate_session_id("arch")
+
+        arch_result = self._run_goose_with_ui(
+            Actor.ARCH,
+            task.label,
+            recipe_path=self.arch_recipe,
+            session_name=arch_session,
+            params=arch_request.to_params(),
+            max_turns=min(self.max_turns, 30),  # ARCH doesn't need many turns
+            timeout_secs=self.timeout_secs,
+            model=self.model,
+            provider=self.provider,
+            cwd=self.cwd,
+            detail="stuckness diagnosis",
+        )
+
+        # Parse the ARCH response
+        from .goose import _extract_json_block
+
+        parsed = _extract_json_block(arch_result.raw_stdout)
+        arch_response = _parse_arch_response(arch_result.raw_stdout, parsed)
+
+        if arch_response is None:
+            log.warning(
+                "arch.parse_failed",
+                task_label=task.label,
+                stderr=arch_result.raw_stderr[:200] if arch_result.raw_stderr else "",
+            )
+            self.ui.print_warning(
+                f"[{task.label}] ARCHITECT returned unparsable output — "
+                f"treating as RETRY."
+            )
+            return ArchResponse(
+                action=ArchAction.RETRY.value,
+                reason="ARCH agent failed to produce valid JSON.",
+            )
+
+        log.info(
+            "arch.response_parsed",
+            task_label=task.label,
+            action=arch_response.action,
+            reason=arch_response.reason[:100],
+        )
+
+        # Log the ARCH decision
+        arch_entry = IterationEntry(
+            timestamp=_now_iso(),
+            iteration=self.global_iteration,
+            actor=Actor.ARCH,
+            task_label=task.label,
+            status=TaskStatus.ASSIGNED,
+            payload=arch_response.to_dict(),
+        )
+        self.log.append(arch_entry)
+        self.ui.add_iteration(arch_entry)
+
+        return arch_response
+
+    def _apply_arch_decision(
+        self,
+        phase: Phase,
+        task: Task,
+        arch_response: ArchResponse,
+    ) -> str | None:
+        """Apply the ARCH agent's decision and return the new task text.
+
+        Returns:
+            - For CLARIFY: the new task text (loop continues with this text)
+            - For REDECOMPOSE: None (tasks were restructured, caller must re-parse)
+            - For SKIP: None (task marked done)
+            - For RETRY: the original task text (loop continues)
+        """
+        action = arch_response.action
+
+        self.ui.print_info(
+            f"[{task.label}] 🏗️ ARCHITECT decision: {action} — "
+            f"{arch_response.reason[:200]}"
+        )
+
+        if action == ArchAction.REDECOMPOSE.value:
+            if not arch_response.subtasks:
+                self.ui.print_warning(
+                    f"[{task.label}] ARCHITECT said REDECOMPOSE but gave no subtasks. "
+                    f"Falling back to RETRY."
+                )
+                return task.text
+
+            labels = [s.label for s in arch_response.subtasks]
+            texts = [s.text for s in arch_response.subtasks]
+
+            self.ui.print_info(
+                f"[{task.label}] ARCHITECT decomposing into "
+                f"{len(texts)} subtask(s): {', '.join(labels)}"
+            )
+
+            insert_subtasks(
+                self.task_file,
+                self.phases,
+                task,
+                subtask_labels=labels,
+                subtask_texts=texts,
+            )
+
+            log.info(
+                "arch.redecomposed",
+                task_label=task.label,
+                subtask_count=len(texts),
+                subtask_labels=labels,
+            )
+
+            # Signal caller to re-parse and continue
+            return None
+
+        elif action == ArchAction.CLARIFY.value:
+            new_text = arch_response.new_task_text or task.text
+            rewrite_task_text(self.task_file, self.phases, task, new_text)
+
+            log.info(
+                "arch.clarified",
+                task_label=task.label,
+                old_text=task.text[:60],
+                new_text=new_text[:60],
+            )
+            return new_text
+
+        elif action == ArchAction.SKIP.value:
+            self.ui.print_info(
+                f"[{task.label}] ARCHITECT recommends SKIP: "
+                f"{arch_response.reason[:200]}"
+            )
+            self._finalize_task(phase, task)
+
+            log.info(
+                "arch.skipped",
+                task_label=task.label,
+                reason=arch_response.reason[:200],
+            )
+            return None
+
+        elif action == ArchAction.RETRY.value:
+            self.ui.print_info(
+                f"[{task.label}] ARCHITECT recommends RETRY: "
+                f"{arch_response.reason[:200]}"
+            )
+            # Reset stuckness counters
+            self._consecutive_exhaustions = 0
+            self._iterations_without_approval = 0
+
+            log.info(
+                "arch.retry",
+                task_label=task.label,
+                reason=arch_response.reason[:200],
+            )
+            return task.text
+
+        else:
+            self.ui.print_warning(
+                f"[{task.label}] ARCHITECT returned unknown action '{action}'. "
+                f"Falling back to RETRY."
+            )
+            return task.text
+
+    def _is_task_stuck(self, task: Task) -> bool:
+        """Check if a task meets the stuckness criteria."""
+        if self._stuck_task_label != task.label:
+            # Different task — reset counters
+            self._stuck_task_label = task.label
+            self._consecutive_exhaustions = 0
+            self._iterations_without_approval = 0
+
+        return (
+            self._consecutive_exhaustions >= _STUCK_EXHAUSTION_THRESHOLD
+            or self._iterations_without_approval >= _STUCK_ITERATION_THRESHOLD
+        )
+
+    def _truncate_feedback(self, feedback: str) -> str:
+        """Truncate feedback to prevent ARG_MAX overflow and context pollution.
+
+        Keeps only the last N feedback rounds and caps total length.
+        """
+        if len(feedback) <= _MAX_FEEDBACK_LENGTH:
+            return feedback
+
+        # Split by QA decision headers and keep last N rounds
+        rounds = feedback.split("## QA Decision:")
+        if len(rounds) > _MAX_FEEDBACK_ROUNDS:
+            kept = rounds[-_MAX_FEEDBACK_ROUNDS:]
+            truncated = "## QA Decision:".join(kept)
+            truncated = "[... earlier feedback truncated ...]\n\n" + truncated
+        else:
+            truncated = feedback
+
+        # Hard cap
+        if len(truncated) > _MAX_FEEDBACK_LENGTH:
+            truncated = truncated[-_MAX_FEEDBACK_LENGTH:]
+            truncated = "[... truncated ...]\n" + truncated
+
+        return truncated
+
     def _run_dev_with_recovery(
         self,
         task: Task,
@@ -985,6 +1409,21 @@ class Orchestrator:
                 )
                 self.log.append(dev_crash_entry)
                 self.ui.add_iteration(dev_crash_entry)
+
+                # Connection-error hard stop: if the provider is down, don't
+                # waste recovery budget on retries. Skip straight to blocked.
+                stderr_lower = (dev_result.raw_stderr or "").lower()
+                if "not connected" in stderr_lower:
+                    log.warning(
+                        "dev.connection_error_hard_stop",
+                        task_label=task.label,
+                        stage=stage.value,
+                    )
+                    self.ui.print_warning(
+                        f"[{task.label}] Connection error detected — "
+                        f"skipping remaining retries"
+                    )
+                    break  # exit recovery loop → synthetic blocked
                 # Subprocess failures don't count as malformed — try again in same stage
                 if attempts_in_stage < stage.max_attempts:
                     self.ui.print_warning(
@@ -1577,6 +2016,48 @@ class Orchestrator:
         for iteration in range(1, self.max_iterations + 1):
             self.global_iteration += 1
 
+            # ── Stuckness check: invoke ARCH if task is stuck ──
+            if self._is_task_stuck(task) and self.arch_recipe:
+                self.ui.print_warning(
+                    f"[{work_label}] ⚠️ Task appears stuck "
+                    f"(exhaustions={self._consecutive_exhaustions}, "
+                    f"iterations_without_approval={self._iterations_without_approval}). "
+                    f"Invoking ARCHITECT..."
+                )
+                log.warning(
+                    "feedback_loop.stuck",
+                    task_label=task.label,
+                    iteration=iteration,
+                    consecutive_exhaustions=self._consecutive_exhaustions,
+                    iterations_without_approval=self._iterations_without_approval,
+                )
+
+                arch_response = self._run_arch(task)
+                if arch_response is not None:
+                    new_text = self._apply_arch_decision(phase, task, arch_response)
+
+                    if new_text is None:
+                        # REDECOMPOSE (tasks restructured) or SKIP (task done)
+                        # Signal caller to re-parse markdown
+                        self._needs_reparse = True
+                        return
+
+                    # CLARIFY or RETRY — update effective task text
+                    effective_task_text = new_text
+                    self._consecutive_exhaustions = 0
+                    self._iterations_without_approval = 0
+
+                    # Rotate sessions for a fresh start
+                    self.dev_session_name = _generate_session_id("dev")
+                    self.qa_session_name = _generate_session_id("qa")
+                    log.info(
+                        "session.rotated",
+                        task_label=task.label,
+                        reason="arch_intervention",
+                        dev_session=self.dev_session_name,
+                        qa_session=self.qa_session_name,
+                    )
+
             # ── 1. Assign to DEV (with recovery) ──
             dev_response = self._run_dev_with_recovery(
                 task=task,
@@ -1587,6 +2068,10 @@ class Orchestrator:
 
             # ── Handle dev blocked ──
             if dev_response.status == "blocked":
+                # Track stuckness: synthetic blocked = recovery exhaustion
+                if "multiple recovery attempts" in (dev_response.summary or ""):
+                    self._consecutive_exhaustions += 1
+
                 log.warning(
                     "dev.blocked",
                     task_label=task.label,
@@ -1694,6 +2179,7 @@ class Orchestrator:
                     feedback += (
                         "\nPlease address the blocker and the QA guidance above."
                     )
+                    feedback = self._truncate_feedback(feedback)
                     continue  # back to top of iteration loop → dev retry
 
             self.ui.print_info(
@@ -1775,6 +2261,8 @@ class Orchestrator:
 
             else:
                 # reject
+                self._iterations_without_approval += 1
+
                 log.info(
                     "qa.rejected",
                     task_label=task.label,
@@ -1796,6 +2284,7 @@ class Orchestrator:
                 for c in qa_response.concerns:
                     feedback += f"- {c}\n"
                 feedback += "\nPlease fix ALL concerns above and re-submit."
+                feedback = self._truncate_feedback(feedback)
 
         # Max iterations reached — mark done to prevent infinite loop
         log.error(
