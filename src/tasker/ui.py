@@ -189,9 +189,18 @@ class TaskerUI:
     def update_actor(self, actor: Actor, task_label: str, detail: str = "") -> None:
         if not self._layout:
             return
-        icon = "🧪" if actor == Actor.QA else "🛠️"
-        name = "QA Reviewer" if actor == Actor.QA else "Developer"
-        color = "magenta" if actor == Actor.QA else "cyan"
+        if actor == Actor.ARCH:
+            icon = "🏗️"
+            name = "Architect"
+            color = "yellow"
+        elif actor == Actor.QA:
+            icon = "🧪"
+            name = "QA Reviewer"
+            color = "magenta"
+        else:
+            icon = "🛠️"
+            name = "Developer"
+            color = "cyan"
         text = Text(f" {icon} {name}  —  Task {task_label}")
         if detail:
             text.append(f"  ({detail})", style="dim")

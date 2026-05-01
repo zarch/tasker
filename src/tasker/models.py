@@ -103,6 +103,7 @@ class Phase:
 class Actor(str, enum.Enum):
     QA = "qa"
     DEV = "dev"
+    ARCH = "arch"
 
 
 class TaskStatus(str, enum.Enum):
@@ -410,4 +411,58 @@ class DecomposeResponse:
         }
         if self.subtasks:
             d["subtasks"] = [{"label": s.label, "text": s.text} for s in self.subtasks]
+        return d
+
+
+# ── Architect (ARCH) agent communication ──────────────────────────
+
+
+class ArchAction(str, enum.Enum):
+    """Actions the ARCH agent can take when a task is stuck."""
+
+    REDECOMPOSE = "recompose"  # split into smaller subtasks
+    CLARIFY = "clarify"  # rewrite the task text with better instructions
+    SKIP = "skip"  # mark task as not needed
+    RETRY = "retry"  # give the dev agent another chance
+
+
+@dataclass
+class ArchRequest:
+    """Orchestrator → ARCH: review a stuck task and decide what to do."""
+
+    task_label: str
+    task_text: str
+    error_summary: str  # summary of failures (from _build_error_summary)
+    code_state: str  # summary of what exists on disk (from _build_code_state_summary)
+
+    def to_params(self) -> dict[str, str]:
+        return {
+            "task_label": self.task_label,
+            "task_text": self.task_text,
+            "error_summary": self.error_summary,
+            "code_state": self.code_state,
+        }
+
+
+@dataclass
+class ArchResponse:
+    """ARCH → Orchestrator: decision on how to unblock a stuck task."""
+
+    action: str  # ArchAction value
+    reason: str
+    subtasks: list[Subtask] = field(default_factory=list)  # for REDECOMPOSE
+    new_task_text: str = ""  # for CLARIFY
+    max_iterations_override: int | None = None  # for RETRY
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "action": self.action,
+            "reason": self.reason,
+        }
+        if self.subtasks:
+            d["subtasks"] = [{"label": s.label, "text": s.text} for s in self.subtasks]
+        if self.new_task_text:
+            d["new_task_text"] = self.new_task_text
+        if self.max_iterations_override is not None:
+            d["max_iterations_override"] = self.max_iterations_override
         return d
