@@ -21,6 +21,7 @@ from .models import RateLimitConfig, SessionScope
 _RECIPES_DIR = Path(__file__).resolve().parent.parent.parent / "recipes"
 _DEFAULT_DEV = _RECIPES_DIR / "recipe-dev.yaml"
 _DEFAULT_QA = _RECIPES_DIR / "recipe-qa.yaml"
+_DEFAULT_ARCH = _RECIPES_DIR / "recipe-arch.yaml"
 
 app = typer.Typer(
     name="tasker",
@@ -54,6 +55,16 @@ def main(
         None,
         "--decompose",
         help="Path to a task decomposition recipe. When set, QA reviews each task before passing to DEV and may split it into subtasks.",
+    ),
+    arch: Path = typer.Option(
+        _DEFAULT_ARCH,
+        "--arch",
+        help="Path to the Architect goose recipe (YAML). Invoked when a task gets stuck. Default: recipe-arch.yaml.",
+    ),
+    no_arch: bool = typer.Option(
+        False,
+        "--no-arch",
+        help="Disable the Architect agent — stuck tasks will just be marked blocked.",
     ),
     task_file: Path = typer.Argument(
         ...,
@@ -101,9 +112,9 @@ def main(
         help="VCS integration: 'jj' (Jujutsu), 'git' (feature branch + squash), or 'none' (default).",
     ),
     session_scope: str = typer.Option(
-        "subphase",
+        "task",
         "--session-scope",
-        help="When to rotate goose sessions: phase (per ## heading), subphase (per ### heading, default), or task (per task).",
+        help="When to rotate goose sessions: phase (per ## heading), subphase (per ### heading), or task (per task, default).",
     ),
     new_session: bool = typer.Option(
         False,
@@ -207,6 +218,18 @@ def main(
     dev_abs = dev.resolve()
     qa_abs = qa.resolve()
 
+    # Resolve ARCH recipe (default: recipe-arch.yaml, disabled with --no-arch)
+    if no_arch:
+        arch_abs = None
+    else:
+        if not arch.exists():
+            console.print(
+                f"[bold red]Error:[/bold red] Architect recipe not found: {arch}\n"
+                f"  Use --arch to specify an alternate path, or --no-arch to disable."
+            )
+            raise typer.Exit(1)
+        arch_abs = arch.resolve()
+
     # Resolve VCS backend
     from .vcs import create_backend
 
@@ -238,6 +261,7 @@ def main(
             max_retries=rate_limit_max_retries,
         ),
         decompose_recipe=str(decompose.resolve()) if decompose else None,
+        arch_recipe=arch_abs,
     )
 
     orchestrator.run()
