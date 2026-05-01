@@ -1,1 +1,33 @@
-Read AGENTS.md and README.md files.
+# tasker goosehints — lessons learned during ARCH agent implementation
+
+## ARCH Agent Architecture
+- ARCH is a fourth agent role (DEV, QA, ARCH, + decompose). It's invoked when a task gets stuck.
+- Stuckness thresholds: >=3 consecutive recovery exhaustions OR >=10 iterations without QA approval.
+- ARCH runs with its own recipe (recipe-arch.yaml), fresh session, and max 30 turns.
+- ARCH returns one of: REDECOMPOSE (split into subtasks), CLARIFY (rewrite task text), SKIP, RETRY.
+- `_needs_reparse` flag signals `_run_loop()` to re-parse the markdown file after ARCH restructuring.
+
+## Parser Mutation
+- `insert_subtasks()` replaces a task's checkbox with [x] + adds new [ ] lines below it.
+- `rewrite_task_text()` changes the text after the checkbox marker in-place.
+- Both mutate the markdown file AND the in-memory `phases` model.
+- `_find_task_line()` uses prefix matching on task text (first 60 chars) to find the target line.
+
+## Complementary Fixes
+- Feedback is truncated to 2000 chars / last 3 rounds via `_truncate_feedback()`.
+- Connection errors ("not connected") trigger immediate hard stop — no retry budget wasted.
+- Default session_scope changed from `subphase` to `task` to prevent context overflow.
+- `GooseRunResult` requires `success` parameter (it's a positional arg, not derived from return_code).
+
+## Key Line References (orchestrator.py ~2300 lines)
+- `_parse_arch_response`: ~line 112
+- Stuckness constants: ~line 180
+- `__init__` (arch_recipe, stuckness state): ~line 240
+- `_run_loop` (reparse logic): ~line 421
+- `_build_error_summary`: ~line 895
+- `_run_arch`: ~line 970
+- `_apply_arch_decision`: ~line 1060
+- `_is_task_stuck`: ~line 1150
+- `_truncate_feedback`: ~line 1170
+- Connection-error hard stop: ~line 1395
+- Feedback loop stuckness check: ~line 1990
