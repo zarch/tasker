@@ -105,6 +105,12 @@ parameters:
     default: ""
     description: "Recovery instruction when previous response was malformed (continue/subtask/summarize)"
 
+  - key: max_turns
+    input_type: string
+    requirement: optional
+    default: "100"
+    description: "Maximum tool calls (turns) available per invocation"
+
 extensions:
   - type: builtin
     name: developer
@@ -131,6 +137,8 @@ prompt: |
   ## ⚠️ Recovery Instruction
   {{ recovery_instruction }}
   {% endif %}
+
+  **Turn Budget**: You have {{ max_turns }} tool calls available. The spec-reading steps 1–3 above must fit in at most {{ (max_turns | int) // 3 }} turns — spend the rest on writing code and the JSON block. If turns run low, write stubs/skeletons rather than abandoning without a JSON response.
 
   Implement the task now. When finished, respond with the required JSON block.
 

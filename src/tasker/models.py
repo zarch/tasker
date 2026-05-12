@@ -18,6 +18,7 @@ class Task:
     task_index: int
     text: str
     done: bool = False
+    skipped: bool = False  # True when max_iterations was reached without QA approval
 
     # Sub-phase context — set by parser when the task sits under a ### heading
     subphase: str = ""
@@ -248,6 +249,7 @@ class DevRequest:
     qa_session_id: str
     dev_session_id: str
     iteration: int
+    max_turns: int = 100
     feedback: str | None = None  # non-None on re-work
     recovery_instruction: str | None = None  # non-None during degradation
 
@@ -259,6 +261,7 @@ class DevRequest:
             "qa_session_id": self.qa_session_id,
             "dev_session_id": self.dev_session_id,
             "iteration": str(self.iteration),
+            "max_turns": str(self.max_turns),
             "feedback": self.feedback or "",
             "recovery_instruction": self.recovery_instruction or "",
         }
@@ -303,6 +306,7 @@ class QARequest:
     project_context: str = ""
     dev_blocked: bool = False  # True when dev returned status="blocked"
     blocker_description: str = ""  # copied from DevResponse when blocked
+    max_turns: int = 100
 
     def to_params(self) -> dict[str, str]:
         """Return key-value pairs for `goose run --params KEY=VALUE`."""
@@ -324,6 +328,7 @@ class QARequest:
             "conversation_history": "",
             # JJ diff context (empty when jj is not enabled)
             "project_context": self.project_context or "",
+            "max_turns": str(self.max_turns),
         }
         return params
 

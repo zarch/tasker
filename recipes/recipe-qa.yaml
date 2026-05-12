@@ -165,6 +165,12 @@ parameters:
     default: ""
     description: "Additional context such as JJ diff output (when version control is enabled)"
 
+  - key: max_turns
+    input_type: string
+    requirement: optional
+    default: "100"
+    description: "Maximum tool calls (turns) available per invocation"
+
 extensions:
   - type: builtin
     name: developer
@@ -216,6 +222,8 @@ prompt: |
   - Can you provide guidance from existing docs? → respond with `"decision": "reject"` and clear instructions.
   - Is user input needed? → respond with `"decision": "needs_user_input"` and a clear `user_question`.
   {% endif %}
+
+  **Turn Budget**: You have {{ max_turns }} tool calls available. Steps 1–2 (reading specs) must fit in at most {{ (max_turns | int) // 4 }} turns — spend the rest on inspecting code and producing the JSON block. If turns run low, make a decision based on what you already know rather than reading more files.
 
   ## Instructions
   1. Read the task description above — extract all `arch/...` and `prd/...` spec references.

@@ -161,7 +161,7 @@ Both backends implement the `VCSBackend` protocol (`vcs/__init__.py`):
 
 The `jj.py` module is a backward-compatibility shim that re-exports from `vcs.jj_backend` — new code should import from `tasker.vcs` directly.
 
-The `jj.py` module is a backward-compatibility shim that re-exports from `vcs.jj_backend` — new code should import from `tasker.vcs` directly.
+**Large diff handling** (`_vcs_get_diff`): Linux has a per-argument size limit (`MAX_ARG_STRLEN` = 128 KB). When the VCS diff exceeds 100 KB, `_vcs_get_diff` writes the full diff to a temp file in the project directory and returns a truncated context string that instructs QA to read the file. The method returns `tuple[str, str]` — `(project_context, diff_size_note)` — where `diff_size_note` is a human-readable string like `"(150 lines, 3 KB)"` for small diffs or `"(5000 lines, 350 KB → temp file tasker-G4.T1-xyz.diff)"` for large ones. Callers that only need to check for emptiness can use `_vcs_check, _ = self._vcs_get_diff(task)` and test `not _vcs_check`.
 
 ### 7. UI Activity Indicators & Live Feedback
 
@@ -334,6 +334,8 @@ Accepted values (case-insensitive): `debug`, `info`, `warning` (or `warn`), `err
 | `vcs.initialized` | orchestrator | info | VCS backend init success |
 | `vcs.task_started` | orchestrator | info | Task workspace created |
 | `vcs.diff_obtained` | orchestrator | debug | Diff retrieved for QA |
+| `vcs.diff_too_large_for_argv` | orchestrator | warning | Diff exceeds 100 KB, written to temp file |
+| `vcs.get_diff_failed` | orchestrator | warning | VCS get_diff raised RuntimeError |
 | `vcs.task_committed` | orchestrator | info | Task changes committed |
 | `vcs.begin_task_failed` | orchestrator | warning | VCS workspace creation failed |
 | `vcs.commit_failed` | orchestrator | error | VCS commit failed |
@@ -341,6 +343,7 @@ Accepted values (case-insensitive): `debug`, `info`, `warning` (or `warn`), `err
 | `goose.completed` | goose | info | Subprocess finished |
 | `goose.timeout` | goose | warning | Process killed on timeout |
 | `goose.launch_failed` | goose | error | Failed to start process |
+| `goose.argv_too_large` | goose | error | E2BIG — argument exceeds OS limit (~128 KB) |
 | `parser.parsing` | parser | debug | Starting file parse |
 | `parser.parsed` | parser | info | Parse complete (counts) |
 | `parser.updating_markdown` | parser | debug | Rewriting checkboxes |
@@ -364,7 +367,7 @@ The orchestrator sets these for every Goose invocation (see `goose.py`):
 | Variable | Value | Purpose |
 |---|---|---|
 | `GOOSE_CONTEXT_STRATEGY` | `summarize` | Compress long session context |
-| `GOOSE_AUTO_COMPACT_THRESHOLD` | `0.35` | Auto-compact at 35% of context window |
+| `GOOSE_AUTO_COMPACT_THRESHOLD` | `0.55` | Auto-compact at 55% of context window |
 
 ## Testing Philosophy
 
@@ -387,5 +390,7 @@ Tests in `test_dryrun.py` cover:
 - Goose heartbeat thread (background liveness pings, structlog stdlib integration)
 - `_run_goose_with_ui` wiring (activity start/stop, pending iteration lifecycle)
 - Iteration table entries (`_format_timestamp`, `_entry_summary`, pending row with braille spinner)
+- E2BIG detection (OSError errno.E2BIG in `run_goose`, separate from generic launch failures)
+- VCS diff size handling (`_vcs_get_diff` tuple return, temp file for large diffs, empty/error fallbacks)
 
 When adding new features, add corresponding dry-run tests — no real Goose subprocess calls.

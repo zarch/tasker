@@ -108,6 +108,8 @@ def find_next_task(phases: list[Phase]) -> tuple[Phase, Task] | None:
     """Return the first (phase, task) pair that is not yet done."""
     for phase in phases:
         for task in phase.tasks:
+            if task.skipped:
+                continue
             if not task.done:
                 return phase, task
     return None

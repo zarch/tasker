@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -319,6 +320,46 @@ def run_goose(
                 duration_secs=round(duration, 2),
                 timed_out=True,
             )
+    except OSError as exc:
+        duration = time.monotonic() - start
+        if exc.errno == errno.E2BIG:
+            # E2BIG: total argv+envp exceeds OS limits, or a single argument
+            # exceeds MAX_ARG_STRLEN (128 KB on Linux).  This is typically
+            # caused by a very large --params value (e.g. project_context with
+            # a huge VCS diff).  Log a clear, actionable message so the caller
+            # can truncate the diff or switch to file-based param passing.
+            total_argv = sum(len(a) for a in cmd)
+            log.error(
+                "goose.argv_too_large",
+                session=session_name,
+                error=str(exc),
+                argv_bytes=total_argv,
+                hint="VCS diff or other param too large for execve(); "
+                "truncate the diff or write it to a temp file",
+            )
+            return GooseRunResult(
+                success=False,
+                raw_stdout="",
+                raw_stderr=(
+                    f"Cannot start goose: argument list too long "
+                    f"(argv ≈ {total_argv / 1024:.0f} KB). "
+                    f"The VCS diff or another parameter exceeds the OS "
+                    f"per-argument limit (~128 KB). "
+                    f"Truncate the diff or use file-based parameter passing."
+                ),
+                return_code=-1,
+                duration_secs=round(duration, 2),
+                timed_out=False,
+            )
+        log.error("goose.launch_failed", session=session_name, error=str(exc))
+        return GooseRunResult(
+            success=False,
+            raw_stdout="",
+            raw_stderr=f"Failed to start goose process: {exc}",
+            return_code=-1,
+            duration_secs=round(duration, 2),
+            timed_out=False,
+        )
     except Exception as exc:
         duration = time.monotonic() - start
         log.error("goose.launch_failed", session=session_name, error=str(exc))

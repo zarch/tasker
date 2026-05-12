@@ -133,18 +133,25 @@ def _parse_arch_response(raw: str, parsed: dict | None) -> ArchResponse | None:
 # ── Recovery instructions for graceful degradation ────────────────
 
 _RECOVERY_CONTINUE = (
-    "⚠️ FORMAT RECOVERY — your last response had no JSON block.\n\n"
-    "You have already completed the implementation in previous turns. "
-    "DO NOT re-read specs, explore code, or start over. "
-    "Output ONLY the JSON response block now:\n"
+    "⚠️ FORMAT RECOVERY — your previous response had no JSON block.\n\n"
+    "CRITICAL RULES — follow in order:\n"
+    "1. DO NOT read any files, specs, or explore the codebase.\n"
+    "2. DO NOT start over or re-investigate anything.\n"
+    "3. Based on what you already know, output the JSON block immediately:\n"
     '{"status": "done"|"blocked", "summary": "...", "files_modified": [...], ...}'
 )
 
 _RECOVERY_SUBTASK = (
     "⚠️ FORMAT RECOVERY — your last responses had no JSON block.\n\n"
-    "The task may be too large. Pick the single most important piece of work, "
-    "implement it now (keep it small), then output ONLY the JSON block.\n"
-    '{"status": "done", "summary": "Implemented: <what you did>", "files_modified": [...]}'
+    "CRITICAL RULES — follow in order:\n"
+    "1. DO NOT read any files, specs, or explore the codebase.\n"
+    "2. Pick the SINGLE most important piece from the task description.\n"
+    "3. Write ONLY the minimal skeleton (struct/fn stubs with TODO bodies). Max 20 lines.\n"
+    "4. Output the JSON block IMMEDIATELY after the skeleton:\n"
+    '{"status": "done", "summary": "Wrote skeleton: <file>", "files_modified": [...]}\n\n'
+    "CRITICAL: Do NOT claim the task is already done unless you have personally written or "
+    'verified the code in THIS session. If no code changes were made, report status "blocked" '
+    'with a description of what prevented progress, NOT status "done".'
 )
 
 _RECOVERY_TRUNCATION = (
@@ -161,13 +168,23 @@ _RECOVERY_SUMMARIZE = (
     "⚠️ FORMAT RECOVERY — stop implementing immediately.\n\n"
     "Output ONLY this JSON block with your progress:\n"
     '{"status": "blocked", "summary": "<what you did so far>", '
-    '"files_modified": [...], "blocker_description": "<what remains>"}'
+    '"files_modified": [...], "blocker_description": "<what remains>"}\n\n'
+    "CRITICAL: Do NOT claim the task is already done unless you have personally written or "
+    'verified the code in THIS session. If no code changes were made, report status "blocked" '
+    'with a description of what prevented progress, NOT status "done".'
 )
 
 _RECOVERY_RESTART = (
     "⚠️ FRESH START — previous attempts produced no JSON block.\n\n"
-    "You are in a new session with no prior context. "
-    "Implement the task concisely and output the JSON block when done."
+    "CRITICAL RULES — follow in order:\n"
+    "1. DO NOT read any files, specs, or explore the codebase.\n"
+    "2. Based ONLY on the task description provided, create the target file(s) as minimal stubs.\n"
+    "3. Write empty function bodies / TODO placeholders — correctness not required.\n"
+    "4. Output the JSON block immediately after writing:\n"
+    '{"status": "done", "summary": "Created stubs for: <file>", "files_modified": [...]}\n\n'
+    "CRITICAL: Do NOT claim the task is already done unless you have personally written or "
+    'verified the code in THIS session. If no code changes were made, report status "blocked" '
+    'with a description of what prevented progress, NOT status "done".'
 )
 
 
@@ -185,17 +202,21 @@ _QA_RECOVERY_SUMMARIZE = (
     "⚠️ FORMAT RECOVERY — stop reading files immediately.\n\n"
     "Based on what you already know, output ONLY the JSON decision block:\n"
     '{"decision": "approve"|"reject"|"needs_user_input", "feedback": "...", '
-    '"concerns": [...]}'
+    '"concerns": [...]}\n\n'
+    "CRITICAL: Base your decision only on code you can verify exists. Do not approve based "
+    "on the developer's claim that work was done previously — check the actual file changes."
 )
 
 _QA_RECOVERY_RESTART = (
     "⚠️ FRESH START — previous review attempts produced no JSON block.\n\n"
-    "You are in a new session. Review concisely and output the JSON block."
+    "You are in a new session. Review concisely and output the JSON block.\n\n"
+    "CRITICAL: Base your decision only on code you can verify exists. Do not approve based "
+    "on the developer's claim that work was done previously — check the actual file changes."
 )
 
 # ── Stuckness detection constants ──────────────────────────────────
 # Consecutive full-recovery exhaustions before invoking ARCH
-_STUCK_EXHAUSTION_THRESHOLD = 3
+_STUCK_EXHAUSTION_THRESHOLD = 2
 # Max feedback-loop iterations without QA approval before invoking ARCH
 _STUCK_ITERATION_THRESHOLD = 10
 # Maximum feedback text length (chars) — prevents ARG_MAX overflow
@@ -316,6 +337,7 @@ class Orchestrator:
         self._stuck_task_label: str = ""
         self._consecutive_exhaustions: int = 0
         self._iterations_without_approval: int = 0
+        self._pending_arch_check: bool = False
 
     def run(self) -> None:
         """Main entry point — run all tasks."""
@@ -462,6 +484,9 @@ class Orchestrator:
                 self._stuck_task_label = task.label
                 self._consecutive_exhaustions = 0
                 self._iterations_without_approval = 0
+                self._pending_arch_check = False
+                # Restore counters from previous runs if available
+                self._restore_stuckness_from_log(task)
 
             log.info(
                 "task.starting",
@@ -768,25 +793,101 @@ class Orchestrator:
             )
             self.vcs = None
 
-    def _vcs_get_diff(self, task: Task) -> str:
+    def _vcs_get_diff(self, task: Task) -> tuple[str, str]:
         """Get the diff for the current task.
 
         Called before QA review to provide context about what changed.
+
+        Returns:
+            A tuple of (project_context, diff_size_note).
+            - project_context: the formatted diff string, or a message pointing
+              to a temp file when the diff exceeds MAX_DIFF_SIZE.
+            - diff_size_note: a human-readable note about the diff size for
+              logging/UI, or empty string if no diff.
         """
         if self.vcs is None:
-            return ""
+            return "", ""
+
         try:
             diff = self.vcs.get_diff(task, cwd=self.cwd)
-            log.debug(
-                "vcs.diff_obtained",
-                task_label=task.label,
-                diff_lines=diff.count("\n") if diff else 0,
-            )
-            return diff
         except RuntimeError as exc:
             log.warning("vcs.get_diff_failed", task_label=task.label, error=str(exc))
             self.ui.print_warning(f"[{task.label}] VCS: failed to get diff: {exc}")
-            return ""
+            return "", ""
+
+        if not diff:
+            return "", ""
+
+        diff_lines = diff.count("\n") + 1
+        diff_bytes = len(diff.encode("utf-8", errors="replace"))
+        log.debug(
+            "vcs.diff_obtained",
+            task_label=task.label,
+            diff_lines=diff_lines,
+            diff_bytes=diff_bytes,
+        )
+
+        # Build the full project_context string
+        project_context = f"## VCS Diff (task changes)\n```\n{diff}\n```"
+
+        # Linux MAX_ARG_STRLEN = PAGE_SIZE * 32 = 128 KB per argument.
+        # We use 100 KB as a conservative threshold (leaves room for escaping
+        # overhead, other params, and environment).
+        MAX_DIFF_SIZE = 100_000  # 100 KB
+
+        if diff_bytes <= MAX_DIFF_SIZE:
+            size_note = f"({diff_lines} lines, {diff_bytes / 1024:.0f} KB)"
+            return project_context, size_note
+
+        # Diff is too large for CLI args — write to a temp file
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".diff",
+            prefix=f"tasker-{task.label}-",
+            dir=str(self.cwd),
+            delete=False,
+            encoding="utf-8",
+        )
+        tmp.write(diff)
+        tmp.close()
+        diff_file = Path(tmp.name)
+
+        size_kb = diff_bytes / 1024
+        log.warning(
+            "vcs.diff_too_large_for_argv",
+            task_label=task.label,
+            diff_bytes=diff_bytes,
+            diff_lines=diff_lines,
+            diff_file=str(diff_file),
+            hint="Diff exceeds MAX_ARG_STRLEN; written to temp file instead",
+        )
+        self.ui.print_warning(
+            f"[{task.label}] VCS diff is {size_kb:.0f} KB / {diff_lines} lines "
+            f"— exceeds CLI arg limit. Written to {diff_file.name}"
+        )
+
+        # Return a context string that points QA to the file
+        truncated_preview = diff[:4096]
+        project_context = (
+            f"## ⚠️ VCS Diff (task changes) — LARGE DIFF\n\n"
+            f"The full VCS diff is **{size_kb:.0f} KB / {diff_lines} lines**, "
+            f"which exceeds the CLI argument size limit (~128 KB).\n"
+            f"It has been written to a file on disk so you can read it.\n\n"
+            f"### Instructions\n"
+            f"1. Read the diff file at: `{diff_file}`\n"
+            f"2. Use your developer tools to examine the full diff.\n"
+            f"3. A truncated preview is provided below for quick reference.\n\n"
+            f"### Truncated Preview (first ~4 KB)\n"
+            f"```\n{truncated_preview}\n```\n\n"
+            f"[... remaining {diff_lines - truncated_preview.count(chr(10))} "
+            f"lines available in `{diff_file.name}` ...]"
+        )
+        size_note = (
+            f"({diff_lines} lines, {size_kb:.0f} KB → temp file {diff_file.name})"
+        )
+        return project_context, size_note
 
     def _vcs_commit_task(self, task: Task) -> None:
         """Commit the task's changes as a single clean commit.
@@ -821,6 +922,23 @@ class Orchestrator:
         self.ui.update_phase(phase)
         self.ui.update_project(self.phases, phase)
         log.info("task.finalized", task_label=task.label)
+
+    def _skip_task(self, phase: Phase, task: Task) -> None:
+        """Mark task as skipped for this run without updating markdown.
+
+        Called when max_iterations is reached without QA approval.
+        Leaves task as '[ ]' so it can be retried with better settings.
+        """
+        task.skipped = True
+        log.warning(
+            "task.skipped",
+            task_label=task.label,
+            reason="max_iterations_reached_without_approval",
+        )
+        self.ui.print_warning(
+            f"[{task.label}] ⚠ Skipped — max iterations reached without QA approval. "
+            f"Task remains incomplete ([ ]) and will be retried."
+        )
 
     def _decompose_task(self, task: Task) -> DecomposeResponse | None:
         """Ask the decomposer agent whether *task* should be split.
@@ -1175,7 +1293,8 @@ class Orchestrator:
                 f"[{task.label}] ARCHITECT recommends SKIP: "
                 f"{arch_response.reason[:200]}"
             )
-            self._finalize_task(phase, task)
+            # Only QA approval can mark a task done — ARCH SKIP leaves it as [ ]
+            self._skip_task(phase, task)
 
             log.info(
                 "arch.skipped",
@@ -1214,10 +1333,52 @@ class Orchestrator:
             self._stuck_task_label = task.label
             self._consecutive_exhaustions = 0
             self._iterations_without_approval = 0
+            self._pending_arch_check = False
 
         return (
             self._consecutive_exhaustions >= _STUCK_EXHAUSTION_THRESHOLD
             or self._iterations_without_approval >= _STUCK_ITERATION_THRESHOLD
+        )
+
+    def _restore_stuckness_from_log(self, task: Task) -> None:
+        """Restore stuckness counters from JSONL log for a resumed task.
+
+        Scans iteration history for the given task and replays counter state
+        so that stuckness detection works across process restarts.
+        """
+        entries = self.log.read_all()
+        task_entries = [e for e in entries if e.get("task_label") == task.label]
+
+        if not task_entries:
+            return
+
+        exhaustions = 0
+        iters_without_approval = 0
+
+        for entry in task_entries:
+            status = entry.get("status", "")
+            actor = entry.get("actor", "")
+
+            if status == "blocked" and actor == "dev":
+                exhaustions += 1
+            elif status == "approved":
+                # QA approval resets everything
+                exhaustions = 0
+                iters_without_approval = 0
+            elif status == "feedback" and actor == "qa":
+                iters_without_approval += 1
+            elif status == "done" and actor == "dev":
+                # Dev done doesn't reset — QA still needs to approve
+                pass
+
+        self._consecutive_exhaustions = exhaustions
+        self._iterations_without_approval = iters_without_approval
+        log.info(
+            "stuckness.restored_from_log",
+            task_label=task.label,
+            consecutive_exhaustions=exhaustions,
+            iterations_without_approval=iters_without_approval,
+            total_entries=len(task_entries),
         )
 
     def _truncate_feedback(self, feedback: str) -> str:
@@ -1326,6 +1487,7 @@ class Orchestrator:
                 qa_session_id=self.qa_session_name,
                 dev_session_id=self.dev_session_name,
                 iteration=iteration,
+                max_turns=self.max_turns,
                 feedback=feedback,
                 recovery_instruction=recovery_instruction,
             )
@@ -2016,8 +2178,9 @@ class Orchestrator:
         for iteration in range(1, self.max_iterations + 1):
             self.global_iteration += 1
 
-            # ── Stuckness check: invoke ARCH if task is stuck ──
-            if self._is_task_stuck(task) and self.arch_recipe:
+            # ── Deferred stuckness check: invoke ARCH if flagged last iteration ──
+            if self._pending_arch_check and self.arch_recipe:
+                self._pending_arch_check = False
                 self.ui.print_warning(
                     f"[{work_label}] ⚠️ Task appears stuck "
                     f"(exhaustions={self._consecutive_exhaustions}, "
@@ -2066,11 +2229,41 @@ class Orchestrator:
                 override_task_text=effective_task_text,
             )
 
+            # ── Validate "done" claim: check VCS diff (Bug Fix 7) ──
+            if dev_response.status == "done" and self.vcs is not None:
+                # _vcs_get_diff returns ("", "") when diff is empty
+                _vcs_check, _ = self._vcs_get_diff(task)
+                if not _vcs_check:
+                    log.warning(
+                        "dev.empty_diff_on_done",
+                        task_label=task.label,
+                        iteration=iteration,
+                    )
+                    self.ui.print_warning(
+                        f"[{work_label}] ⚠️ Dev claims done but VCS diff is empty. "
+                        f"Downgrading to blocked."
+                    )
+                    dev_response = DevResponse(
+                        status="blocked",
+                        summary="No file changes detected despite claiming done. "
+                        "The task may already be complete from a previous session, "
+                        "or no actual code was written.",
+                        files_modified=[],
+                        notes="Auto-downgraded from 'done' due to empty VCS diff.",
+                    )
+
             # ── Handle dev blocked ──
             if dev_response.status == "blocked":
-                # Track stuckness: synthetic blocked = recovery exhaustion
-                if "multiple recovery attempts" in (dev_response.summary or ""):
-                    self._consecutive_exhaustions += 1
+                # Track stuckness: ANY blocked event counts toward exhaustion.
+                # Previously only synthetic blocked (from recovery exhaustion)
+                # was counted, but real blocked events also indicate a stuck task.
+                self._consecutive_exhaustions += 1
+                log.info(
+                    "dev.stuckness_counter_incremented",
+                    task_label=task.label,
+                    consecutive_exhaustions=self._consecutive_exhaustions,
+                    iterations_without_approval=self._iterations_without_approval,
+                )
 
                 log.warning(
                     "dev.blocked",
@@ -2104,6 +2297,7 @@ class Orchestrator:
                     iteration=iteration,
                     dev_blocked=True,
                     blocker_description=dev_response.blocker_description,
+                    max_turns=self.max_turns,
                 )
 
                 qa_response = self._run_qa_with_recovery(
@@ -2142,8 +2336,8 @@ class Orchestrator:
                         blocker_description=dev_response.blocker_description,
                     )
                     if not resolved:
-                        # User skipped — mark done and move on
-                        self._finalize_task(phase, task)
+                        # User skipped — only QA can mark done; leave as [ ] for retry
+                        self._skip_task(phase, task)
                         return
                     # Issue resolved via chat — loop back so dev retries
                     feedback = (
@@ -2159,7 +2353,7 @@ class Orchestrator:
                         f"[{work_label}] QA approved blocked task: {qa_response.feedback[:100]}"
                     )
                     self._finalize_task(phase, task)
-                    return
+                    return  # Bug Fix 5: exit immediately — no further code must run
 
                 else:
                     # reject — QA gave guidance to unblock the dev, loop back
@@ -2180,6 +2374,9 @@ class Orchestrator:
                         "\nPlease address the blocker and the QA guidance above."
                     )
                     feedback = self._truncate_feedback(feedback)
+                    # ── Evaluate stuckness after counters updated ──
+                    if self._is_task_stuck(task):
+                        self._pending_arch_check = True
                     continue  # back to top of iteration loop → dev retry
 
             self.ui.print_info(
@@ -2199,14 +2396,17 @@ class Orchestrator:
             )
             self.ui.print_info(f"[{work_label}] Iteration {iteration}: calling QA...")
 
-            # Get VCS diff for QA context
-            vcs_diff = self._vcs_get_diff(task)
+            # Get VCS diff for QA context (may be truncated or written to
+            # a temp file if the diff exceeds the OS per-argument size limit)
+            vcs_context, diff_size_note = self._vcs_get_diff(task)
+            if diff_size_note:
+                self.ui.print_info(f"[{work_label}] VCS diff: {diff_size_note}")
 
             log.debug(
                 "qa.call",
                 task_label=task.label,
                 iteration=iteration,
-                has_vcs_diff=bool(vcs_diff),
+                has_vcs_diff=bool(vcs_context),
             )
 
             qa_request = QARequest(
@@ -2216,9 +2416,8 @@ class Orchestrator:
                 dev_session_id=self.dev_session_name,
                 qa_session_id=self.qa_session_name,
                 iteration=iteration,
-                project_context=f"## VCS Diff (task changes)\n```\n{vcs_diff}\n```"
-                if vcs_diff
-                else "",
+                project_context=vcs_context,
+                max_turns=self.max_turns,
             )
 
             qa_response = self._run_qa_with_recovery(
@@ -2248,8 +2447,8 @@ class Orchestrator:
                     qa_response=qa_response,
                 )
                 if not resolved:
-                    # User skipped — mark done and move on
-                    self._finalize_task(phase, task)
+                    # User skipped — only QA can mark done; leave as [ ] for retry
+                    self._skip_task(phase, task)
                     return
                 # Issue resolved via chat — loop back so dev retries with updated context
                 feedback = (
@@ -2286,17 +2485,55 @@ class Orchestrator:
                 feedback += "\nPlease fix ALL concerns above and re-submit."
                 feedback = self._truncate_feedback(feedback)
 
-        # Max iterations reached — mark done to prevent infinite loop
+                # ── Evaluate stuckness after counters updated ──
+                if self._is_task_stuck(task):
+                    self._pending_arch_check = True
+
+        # Max iterations reached without QA approval — consult ARCH before giving up
         log.error(
             "feedback_loop.max_iterations",
             task_label=task.label,
             max_iterations=self.max_iterations,
         )
         self.ui.print_error(
-            f"[{work_label}] Max iterations ({self.max_iterations}) reached. "
-            f"Marking task done and moving on."
+            f"[{work_label}] Max iterations ({self.max_iterations}) reached without QA "
+            f"approval. "
+            + (
+                "Requesting ARCHITECT review to improve task for next attempt..."
+                if self.arch_recipe
+                else "Skipping task — it remains [ ] for retry."
+            )
         )
-        self._finalize_task(phase, task)
+
+        if self.arch_recipe:
+            arch_response = self._run_arch(task)
+            if arch_response is not None:
+                new_text = self._apply_arch_decision(phase, task, arch_response)
+                if new_text is None:
+                    # REDECOMPOSE: subtasks inserted, original marked [x] by insert_subtasks
+                    # SKIP: _apply_arch_decision already called _skip_task
+                    self._needs_reparse = True
+                    max_iter_entry = IterationEntry(
+                        timestamp=_now_iso(),
+                        iteration=self.global_iteration,
+                        actor=Actor.ARCH,
+                        task_label=task.label,
+                        status=TaskStatus.ERROR,
+                        payload={
+                            "error": "max_iterations_reached",
+                            "arch_action": arch_response.action,
+                        },
+                    )
+                    self.log.append(max_iter_entry)
+                    self.ui.add_iteration(max_iter_entry)
+                    return
+                # CLARIFY or RETRY — task text updated in file, skip and retry next run
+                self.ui.print_info(
+                    f"[{work_label}] ARCHITECT improved task description. "
+                    f"Will retry with updated text next run."
+                )
+
+        self._skip_task(phase, task)
         max_iter_entry = IterationEntry(
             timestamp=_now_iso(),
             iteration=self.global_iteration,

@@ -3161,7 +3161,9 @@ def test_stuckness_detection():
     )
 
     # Verify thresholds
-    assert _STUCK_EXHAUSTION_THRESHOLD == 3
+    assert _STUCK_EXHAUSTION_THRESHOLD == 2, (
+        f"Expected threshold 2, got {_STUCK_EXHAUSTION_THRESHOLD}"
+    )
     assert _STUCK_ITERATION_THRESHOLD == 10
 
     # Test with a mock orchestrator (no real goose calls)
@@ -3189,12 +3191,12 @@ def test_stuckness_detection():
     # Initially not stuck
     assert not orch._is_task_stuck(task)
 
-    # Simulate exhaustions
+    # Simulate exhaustions — threshold is 2
     orch._stuck_task_label = task.label
-    orch._consecutive_exhaustions = 2
+    orch._consecutive_exhaustions = 1
     assert not orch._is_task_stuck(task)
 
-    orch._consecutive_exhaustions = 3
+    orch._consecutive_exhaustions = 2
     assert orch._is_task_stuck(task)
 
     # Reset with different task
@@ -3341,6 +3343,789 @@ def test_default_session_scope_is_task():
     print("✓ Default session scope tests passed")
 
 
+# ── Bug Fix tests (stuckness / ARCH invocation) ───────────────────
+
+
+def test_stuckness_counts_all_blocked():
+    """Bug Fix 1: ALL dev blocked events increment counter, not just synthetic ones."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope, DevResponse, QAResponse, Phase
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        task = Task(phase_index=0, task_index=0, text="T1")
+        phase = Phase(index=0, title="Phase 1", tasks=[task])
+        orch._stuck_task_label = task.label
+
+        # Blocked with plain summary — no "multiple recovery attempts" keyword
+        blocked = DevResponse(
+            status="blocked",
+            summary="Cannot find the config file",
+            files_modified=[],
+            blocker_description="Config file is missing",
+        )
+        qa_approve = QAResponse(decision="approve", feedback="OK, skip it")
+
+        with patch.object(orch, "_run_dev_with_recovery", return_value=blocked):
+            with patch.object(orch, "_run_qa_with_recovery", return_value=qa_approve):
+                with patch.object(orch, "_finalize_task"):
+                    orch._run_feedback_loop(phase, task, task.text, feedback=None)
+
+        assert orch._consecutive_exhaustions == 1, (
+            f"Expected counter=1 for ANY blocked event, got {orch._consecutive_exhaustions}"
+        )
+
+    print("✓ test_stuckness_counts_all_blocked passed")
+
+
+def test_stuckness_threshold_lowered():
+    """Bug Fix 3: exhaustion threshold is 2 (was 3)."""
+    from tasker.orchestrator import _STUCK_EXHAUSTION_THRESHOLD
+
+    assert _STUCK_EXHAUSTION_THRESHOLD == 2, (
+        f"Expected threshold 2, got {_STUCK_EXHAUSTION_THRESHOLD}"
+    )
+
+    print("✓ test_stuckness_threshold_lowered passed")
+
+
+def test_stuckness_check_deferred():
+    """Bug Fix 2: _pending_arch_check is set at BOTTOM of loop, invoked at TOP of next iter."""
+    import tempfile
+    from unittest.mock import patch, MagicMock
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope, DevResponse, QAResponse, Phase
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        # Arch recipe must be non-None for ARCH check to run
+        orch.arch_recipe = MagicMock()
+        task = Task(phase_index=0, task_index=0, text="T1")
+        phase = Phase(index=0, title="Phase 1", tasks=[task])
+        orch._stuck_task_label = task.label
+        # One short of threshold — one more blocked will tip it
+        orch._consecutive_exhaustions = 1
+
+        blocked = DevResponse(
+            status="blocked",
+            summary="Still stuck",
+            files_modified=[],
+            blocker_description="Missing dep",
+        )
+        qa_reject = QAResponse(decision="reject", feedback="Try again")
+
+        # ARCH itself should be invoked on next iteration — mock it to stop the loop
+        arch_calls = []
+
+        def fake_run_arch(task):
+            arch_calls.append(task)
+            return (
+                None  # None → no reparse, loop continues but _pending_arch_check reset
+            )
+
+        iteration_count = 0
+
+        def dev_side_effect(**_kw):
+            nonlocal iteration_count
+            iteration_count += 1
+            if iteration_count == 1:
+                return blocked
+            # Second iteration (after ARCH): return done so the loop ends
+            return DevResponse(status="done", summary="Fixed", files_modified=[])
+
+        qa_approve = QAResponse(decision="approve", feedback="Great")
+
+        def qa_side_effect(**kw):
+            qa_req = kw.get("qa_request")
+            if qa_req and qa_req.dev_blocked:
+                return qa_reject
+            return qa_approve
+
+        with patch.object(orch, "_run_dev_with_recovery", side_effect=dev_side_effect):
+            with patch.object(
+                orch, "_run_qa_with_recovery", side_effect=qa_side_effect
+            ):
+                with patch.object(orch, "_run_arch", side_effect=fake_run_arch):
+                    with patch.object(orch, "_finalize_task"):
+                        orch._run_feedback_loop(phase, task, task.text, feedback=None)
+
+        # ARCH must have been invoked (on second iteration, triggered by _pending_arch_check)
+        assert len(arch_calls) == 1, (
+            f"Expected ARCH invoked once, got {len(arch_calls)}"
+        )
+
+    print("✓ test_stuckness_check_deferred passed")
+
+
+def test_stuckness_restored_from_log():
+    """Bug Fix 4: _restore_stuckness_from_log replays counters from JSONL history."""
+    import tempfile
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope, IterationEntry, Actor, TaskStatus
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        log_path = f"{td}/iter.jsonl"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=log_path,
+            session_scope=SessionScope.TASK,
+        )
+        task = Task(phase_index=0, task_index=0, text="T1")
+
+        def make_entry(actor, status, label="P1.T1"):
+            return IterationEntry(
+                timestamp="2026-05-01T10:00:00Z",
+                iteration=1,
+                actor=actor,
+                task_label=label,
+                status=status,
+                payload={},
+            )
+
+        # Build history: 2 dev blocked, 1 qa feedback, then qa approved (resets), then 1 dev blocked
+        orch.log.append(make_entry(Actor.DEV, TaskStatus.BLOCKED))  # exhaustions=1
+        orch.log.append(
+            make_entry(Actor.QA, TaskStatus.FEEDBACK)
+        )  # iters_without_approval=1
+        orch.log.append(make_entry(Actor.DEV, TaskStatus.BLOCKED))  # exhaustions=2
+        orch.log.append(make_entry(Actor.QA, TaskStatus.APPROVED))  # reset: 0, 0
+        orch.log.append(make_entry(Actor.DEV, TaskStatus.BLOCKED))  # exhaustions=1
+        orch.log.append(
+            make_entry(Actor.QA, TaskStatus.FEEDBACK)
+        )  # iters_without_approval=1
+        # Entry for a different task — must be ignored
+        orch.log.append(make_entry(Actor.DEV, TaskStatus.BLOCKED, "P2.T1"))
+
+        orch._restore_stuckness_from_log(task)
+
+        assert orch._consecutive_exhaustions == 1, (
+            f"Expected exhaustions=1, got {orch._consecutive_exhaustions}"
+        )
+        assert orch._iterations_without_approval == 1, (
+            f"Expected iters_without_approval=1, got {orch._iterations_without_approval}"
+        )
+
+    print("✓ test_stuckness_restored_from_log passed")
+
+
+def test_blocked_despite_qa_approve_fix():
+    """Bug Fix 5: When QA approves in blocker triage, _finalize_task is called and loop exits."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope, DevResponse, QAResponse, Phase
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        task = Task(phase_index=0, task_index=0, text="T1")
+        phase = Phase(index=0, title="Phase 1", tasks=[task])
+
+        blocked = DevResponse(
+            status="blocked",
+            summary="Env not set up",
+            files_modified=[],
+            blocker_description="Missing env vars",
+        )
+        # QA approves the blocker (task considered done from prior session)
+        qa_approve = QAResponse(decision="approve", feedback="Task was already done")
+
+        finalize_calls = []
+
+        with patch.object(orch, "_run_dev_with_recovery", return_value=blocked):
+            with patch.object(orch, "_run_qa_with_recovery", return_value=qa_approve):
+                with patch.object(
+                    orch,
+                    "_finalize_task",
+                    side_effect=lambda p, t: finalize_calls.append((p, t)),
+                ):
+                    orch._run_feedback_loop(phase, task, task.text, feedback=None)
+
+        # _finalize_task called exactly once — the approve branch
+        assert len(finalize_calls) == 1, (
+            f"Expected finalize called once, got {len(finalize_calls)}"
+        )
+        # QA was called exactly once (only blocker triage, no second QA review)
+        assert orch._consecutive_exhaustions == 1, (
+            "Counter should still show 1 blocked event"
+        )
+
+    print("✓ test_blocked_despite_qa_approve_fix passed")
+
+
+def test_empty_diff_downgrades_to_blocked():
+    """Bug Fix 7: Dev 'done' claim with empty VCS diff is downgraded to blocked."""
+    import tempfile
+    from unittest.mock import patch, MagicMock
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope, DevResponse, QAResponse, Phase
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        # Enable VCS backend so the diff check runs
+        orch.vcs = MagicMock()
+
+        task = Task(phase_index=0, task_index=0, text="T1")
+        phase = Phase(index=0, title="Phase 1", tasks=[task])
+
+        fake_done = DevResponse(
+            status="done",
+            summary="Already implemented in a previous session",
+            files_modified=[],
+        )
+        # QA approves the blocker triage (after downgrade to blocked)
+        qa_approve = QAResponse(decision="approve", feedback="OK")
+
+        qa_call_details = []
+
+        def qa_side_effect(**kwargs):
+            qa_call_details.append(kwargs.get("qa_request"))
+            return qa_approve
+
+        with patch.object(orch, "_run_dev_with_recovery", return_value=fake_done):
+            with patch.object(orch, "_vcs_get_diff", return_value=("", "")):
+                with patch.object(
+                    orch, "_run_qa_with_recovery", side_effect=qa_side_effect
+                ):
+                    with patch.object(orch, "_finalize_task"):
+                        orch._run_feedback_loop(phase, task, task.text, feedback=None)
+
+        # QA must have been called in blocker-triage mode (dev_blocked=True)
+        assert len(qa_call_details) == 1, (
+            f"Expected 1 QA call, got {len(qa_call_details)}"
+        )
+        assert qa_call_details[0].dev_blocked is True, (
+            "QA should have been called as blocker triage after empty-diff downgrade"
+        )
+        # Counter incremented because downgraded "done" entered the blocked handler
+        assert orch._consecutive_exhaustions == 1, (
+            f"Expected exhaustions=1 after downgrade, got {orch._consecutive_exhaustions}"
+        )
+
+    print("✓ test_empty_diff_downgrades_to_blocked passed")
+
+
+def test_recovery_prompts_anti_fabrication():
+    """Bug Fix 6: Recovery prompts contain anti-fabrication instructions."""
+    from tasker.orchestrator import (
+        _RECOVERY_SUBTASK,
+        _RECOVERY_SUMMARIZE,
+        _RECOVERY_RESTART,
+        _QA_RECOVERY_SUMMARIZE,
+        _QA_RECOVERY_RESTART,
+    )
+
+    dev_prompts = [_RECOVERY_SUBTASK, _RECOVERY_SUMMARIZE, _RECOVERY_RESTART]
+    for prompt in dev_prompts:
+        assert "CRITICAL" in prompt, "Anti-fabrication CRITICAL missing from dev prompt"
+        assert "already done" in prompt, "'already done' guard missing from dev prompt"
+        assert "blocked" in prompt, "'blocked' fallback missing from dev prompt"
+
+    qa_prompts = [_QA_RECOVERY_SUMMARIZE, _QA_RECOVERY_RESTART]
+    for prompt in qa_prompts:
+        assert "CRITICAL" in prompt, "Anti-fabrication CRITICAL missing from QA prompt"
+        assert "verify" in prompt.lower(), (
+            "Verification instruction missing from QA prompt"
+        )
+
+    print("✓ test_recovery_prompts_anti_fabrication passed")
+
+
+def test_recovery_prompts_no_file_reads():
+    """Verify all non-NORMAL recovery prompts prohibit file reading."""
+    from tasker.orchestrator import (
+        _RECOVERY_CONTINUE,
+        _RECOVERY_SUBTASK,
+        _RECOVERY_RESTART,
+    )
+
+    for name, prompt in [
+        ("CONTINUE", _RECOVERY_CONTINUE),
+        ("SUBTASK", _RECOVERY_SUBTASK),
+        ("RESTART", _RECOVERY_RESTART),
+    ]:
+        assert "DO NOT read any files" in prompt, (
+            f"_RECOVERY_{name} must prohibit file reading"
+        )
+        assert "CRITICAL" in prompt or "CRITICAL RULES" in prompt
+    print("✓ test_recovery_prompts_no_file_reads passed")
+
+
+def test_max_turns_passed_to_dev_request():
+    """max_turns is included in DevRequest and forwarded to the recipe."""
+    from tasker.models import DevRequest
+
+    req = DevRequest(
+        task_label="P1.T1",
+        task_text="Do thing",
+        qa_session_id="qa-1",
+        dev_session_id="dev-1",
+        iteration=1,
+        max_turns=42,
+    )
+    params = req.to_params()
+    assert params["max_turns"] == "42"
+    print("✓ test_max_turns_passed_to_dev_request passed")
+
+
+def test_skip_task_leaves_markdown_unchanged():
+    """_skip_task does not mark task [x] — leaves it as [ ] for retry."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import SessionScope, DevResponse, QAResponse
+    from tasker.parser import parse_task_file
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+            max_iterations_per_task=1,
+        )
+        orch.phases = parse_task_file(md_path)
+        task = orch.phases[0].tasks[0]
+        phase = orch.phases[0]
+
+        # Always-failing dev so max_iterations is hit
+        always_blocked = DevResponse(
+            status="blocked",
+            summary="stuck",
+            files_modified=[],
+            blocker_description="can't proceed",
+        )
+        qa_reject = QAResponse(decision="reject", feedback="nope")
+
+        with patch.object(orch, "_run_dev_with_recovery", return_value=always_blocked):
+            with patch.object(orch, "_run_qa_with_recovery", return_value=qa_reject):
+                with patch.object(orch, "_vcs_begin_task"):
+                    with patch.object(orch, "_decompose_task", return_value=None):
+                        orch._process_task(phase, task)
+
+        # Task must still be [ ] not [x]
+        content = Path(md_path).read_text()
+        assert "- [ ] T1" in content, (
+            "Task should remain [ ] after max_iterations without approval"
+        )
+        assert "- [x] T1" not in content, (
+            "Task must NOT be marked [x] when skipped due to max_iterations"
+        )
+        # task.skipped must be set
+        assert task.skipped is True
+
+    print("✓ test_skip_task_leaves_markdown_unchanged passed")
+
+
+def test_max_iterations_triggers_arch_review():
+    """When max_iterations is reached, ARCH is consulted before skipping the task."""
+    import tempfile
+    from unittest.mock import patch, MagicMock
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import (
+        Task,
+        SessionScope,
+        DevResponse,
+        QAResponse,
+        Phase,
+        ArchResponse,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+            max_iterations_per_task=1,
+        )
+        orch.arch_recipe = MagicMock()  # ARCH is enabled
+        task = Task(phase_index=0, task_index=0, text="T1")
+        phase = Phase(index=0, title="Phase 1", tasks=[task])
+
+        always_blocked = DevResponse(
+            status="blocked",
+            summary="stuck",
+            files_modified=[],
+            blocker_description="can't proceed",
+        )
+        qa_reject = QAResponse(decision="reject", feedback="nope")
+        # ARCH decides to CLARIFY (rewrite task text)
+        arch_clarify = ArchResponse(
+            action="clarify",
+            reason="task was unclear",
+            new_task_text="T1 updated: do something clearer",
+        )
+
+        arch_calls = []
+
+        with patch.object(orch, "_run_dev_with_recovery", return_value=always_blocked):
+            with patch.object(orch, "_run_qa_with_recovery", return_value=qa_reject):
+                with patch.object(
+                    orch,
+                    "_run_arch",
+                    side_effect=lambda t: arch_calls.append(t) or arch_clarify,
+                ):
+                    with patch.object(
+                        orch, "_apply_arch_decision", return_value="T1 updated"
+                    ):
+                        with patch.object(orch, "_vcs_begin_task"):
+                            with patch.object(
+                                orch, "_decompose_task", return_value=None
+                            ):
+                                orch._process_task(phase, task)
+
+        # ARCH must have been invoked once for the final review
+        assert len(arch_calls) == 1, f"Expected ARCH called once, got {len(arch_calls)}"
+
+    print("✓ test_max_iterations_triggers_arch_review passed")
+
+
+def test_only_qa_approval_marks_done():
+    """Only QA approve path calls _finalize_task; all other exits use _skip_task."""
+    import tempfile
+    from unittest.mock import patch
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope, DevResponse, QAResponse, Phase
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        task = Task(phase_index=0, task_index=0, text="T1")
+        phase = Phase(index=0, title="Phase 1", tasks=[task])
+
+        fake_done = DevResponse(status="done", summary="did it", files_modified=[])
+
+        finalize_calls = []
+        skip_calls = []
+
+        # Simulate user /skip via needs_user_input → _interactive_chat_loop returns False
+        qa_needs_input = QAResponse(
+            decision="needs_user_input",
+            feedback="question?",
+            user_question="Can you clarify?",
+        )
+
+        with patch.object(orch, "_run_dev_with_recovery", return_value=fake_done):
+            with patch.object(
+                orch, "_run_qa_with_recovery", return_value=qa_needs_input
+            ):
+                with patch.object(orch, "_interactive_chat_loop", return_value=False):
+                    with patch.object(
+                        orch,
+                        "_finalize_task",
+                        side_effect=lambda p, t: finalize_calls.append(t),
+                    ):
+                        with patch.object(
+                            orch,
+                            "_skip_task",
+                            side_effect=lambda p, t: skip_calls.append(t),
+                        ):
+                            orch._run_feedback_loop(
+                                phase, task, task.text, feedback=None
+                            )
+
+        assert len(finalize_calls) == 0, "User-skip must NOT call _finalize_task"
+        assert len(skip_calls) == 1, "User-skip must call _skip_task"
+
+    print("✓ test_only_qa_approval_marks_done passed")
+
+
+def run_bugfix_tests():
+    test_stuckness_counts_all_blocked()
+    test_stuckness_threshold_lowered()
+    test_stuckness_check_deferred()
+    test_stuckness_restored_from_log()
+    test_blocked_despite_qa_approve_fix()
+    test_empty_diff_downgrades_to_blocked()
+    test_recovery_prompts_anti_fabrication()
+    test_recovery_prompts_no_file_reads()
+    test_max_turns_passed_to_dev_request()
+    test_skip_task_leaves_markdown_unchanged()
+    test_only_qa_approval_marks_done()
+    test_max_iterations_triggers_arch_review()
+    print("\n✅ All 12 bug-fix tests passed!")
+
+
+# ── E2BIG / diff-size tests ────────────────────────────────────────
+
+
+def test_e2big_detected_in_run_goose():
+    """Fix 4: run_goose catches OSError E2BIG and returns a clear error."""
+    import errno
+    from unittest.mock import patch
+    from tasker.goose import run_goose
+
+    with patch(
+        "tasker.goose.subprocess.Popen",
+        side_effect=OSError(errno.E2BIG, "Argument list too long"),
+    ):
+        result = run_goose(
+            recipe_path="/dev/null",
+            session_name="test_e2big",
+            params={"project_context": "x" * 200_000},
+        )
+
+    assert not result.success
+    assert result.return_code == -1
+    assert "argument list too long" in result.raw_stderr.lower()
+    assert "KB" in result.raw_stderr  # should mention size
+    assert not result.timed_out
+    print("✓ test_e2big_detected_in_run_goose passed")
+
+
+def test_e2big_not_confused_with_other_oserror():
+    """Fix 4: non-E2BIG OSErrors are handled by the generic handler."""
+    import errno
+    from unittest.mock import patch
+    from tasker.goose import run_goose
+
+    with patch(
+        "tasker.goose.subprocess.Popen",
+        side_effect=OSError(errno.ENOENT, "goose not found"),
+    ):
+        result = run_goose(
+            recipe_path="/dev/null",
+            session_name="test_enoent",
+        )
+
+    assert not result.success
+    assert "Failed to start goose process" in result.raw_stderr
+    assert "argument list too long" not in result.raw_stderr.lower()
+    print("✓ test_e2big_not_confused_with_other_oserror passed")
+
+
+def test_vcs_get_diff_returns_tuple():
+    """Fix 3: _vcs_get_diff now returns (project_context, size_note) tuple."""
+    import tempfile
+    from unittest.mock import MagicMock
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        orch.vcs = MagicMock()
+        orch.vcs.get_diff.return_value = "diff --git a/file.rs b/file.rs\n+new line\n"
+
+        task = Task(phase_index=0, task_index=0, text="T1")
+        context, note = orch._vcs_get_diff(task)
+
+    assert context  # non-empty
+    assert "## VCS Diff" in context
+    assert "new line" in context
+    assert note  # non-empty size note
+    assert "lines" in note
+    assert "KB" in note
+    print("✓ test_vcs_get_diff_returns_tuple passed")
+
+
+def test_vcs_get_diff_empty_returns_empty_tuple():
+    """Fix 3: empty diff returns empty tuple values."""
+    import tempfile
+    from unittest.mock import MagicMock
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        orch.vcs = MagicMock()
+        orch.vcs.get_diff.return_value = ""
+
+        task = Task(phase_index=0, task_index=0, text="T1")
+        context, note = orch._vcs_get_diff(task)
+
+    assert context == ""
+    assert note == ""
+    print("✓ test_vcs_get_diff_empty_returns_empty_tuple passed")
+
+
+def test_vcs_get_diff_large_diff_writes_temp_file():
+    """Fix 3: large diff is written to a temp file and context points to it."""
+    import tempfile
+    from unittest.mock import MagicMock
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        # Set cwd to temp dir so temp files land there
+        from pathlib import Path as _Path
+
+        orch.cwd = _Path(td)
+
+        # Create a 150KB diff (over the 100KB threshold)
+        large_diff = (
+            "diff --git a/big.rs b/big.rs\n"
+            + "+line content here padding to reach 150KB total\n" * 4000
+        )
+        orch.vcs = MagicMock()
+        orch.vcs.get_diff.return_value = large_diff
+
+        task = Task(phase_index=0, task_index=0, text="T1")
+        context, note = orch._vcs_get_diff(task)
+
+    # Context should point to a file, not contain the full diff inline
+    assert context
+    assert "LARGE DIFF" in context
+    assert "Truncated Preview" in context
+    assert note
+    assert "temp file" in note
+    # The full diff should NOT be in the context string (it's in the file)
+    assert large_diff not in context
+    print("✓ test_vcs_get_diff_large_diff_writes_temp_file passed")
+
+
+def test_vcs_get_diff_no_vcs_returns_empty():
+    """Fix 3: no VCS backend returns empty tuple."""
+    import tempfile
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        # vcs is None by default
+        task = Task(phase_index=0, task_index=0, text="T1")
+        context, note = orch._vcs_get_diff(task)
+
+    assert context == ""
+    assert note == ""
+    print("✓ test_vcs_get_diff_no_vcs_returns_empty passed")
+
+
+def test_vcs_get_diff_failure_returns_empty():
+    """Fix 3: VCS get_diff RuntimeError returns empty tuple."""
+    import tempfile
+    from unittest.mock import MagicMock
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task, SessionScope
+
+    with tempfile.TemporaryDirectory() as td:
+        md_path = f"{td}/tasks.md"
+        Path(md_path).write_text("## Phase 1\n- [ ] T1: dummy\n")
+
+        orch = Orchestrator(
+            task_file=md_path,
+            dev_recipe="/dev/null",
+            qa_recipe="/dev/null",
+            log_file=f"{td}/iter.jsonl",
+            session_scope=SessionScope.TASK,
+        )
+        orch.vcs = MagicMock()
+        orch.vcs.get_diff.side_effect = RuntimeError("jj not found")
+
+        task = Task(phase_index=0, task_index=0, text="T1")
+        context, note = orch._vcs_get_diff(task)
+
+    assert context == ""
+    assert note == ""
+    print("✓ test_vcs_get_diff_failure_returns_empty passed")
+
+
+def run_e2big_tests():
+    test_e2big_detected_in_run_goose()
+    test_e2big_not_confused_with_other_oserror()
+    test_vcs_get_diff_returns_tuple()
+    test_vcs_get_diff_empty_returns_empty_tuple()
+    test_vcs_get_diff_large_diff_writes_temp_file()
+    test_vcs_get_diff_no_vcs_returns_empty()
+    test_vcs_get_diff_failure_returns_empty()
+    print("\n✅ All 7 E2BIG/diff-size tests passed!")
+
+
 # ── Run all ARCH tests ─────────────────────────────────────────────
 
 
@@ -3423,4 +4208,10 @@ if __name__ == "__main__":
     # ARCH (Architect) agent tests
     run_arch_tests()
 
-    print("\n✅ All 68 dry-run tests passed!")
+    # Bug-fix tests (stuckness detection, ARCH invocation, VCS validation)
+    run_bugfix_tests()
+
+    # E2BIG / diff-size tests
+    run_e2big_tests()
+
+    print("\n✅ All dry-run tests passed!")
