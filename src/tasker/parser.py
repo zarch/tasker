@@ -19,7 +19,8 @@ from .models import Phase, Task
 log = structlog.get_logger(__name__)
 
 
-_PHASE_RE = re.compile(r"^##\s+Phase\s+(\w[\w.-]*)[^\n]*$", re.IGNORECASE)
+_PHASE_EXPLICIT_RE = re.compile(r"^##\s+Phase\s+(\w[\w.-]*)[^\n]*$", re.IGNORECASE)
+_PHASE_ANY_RE = re.compile(r"^##\s+(.+)$")
 _SUBPHASE_RE = re.compile(r"^#{3,4}\s+(.+)$")
 _TASK_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+)$")
 
@@ -27,9 +28,11 @@ _TASK_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+)$")
 def parse_task_file(path: str | Path) -> list[Phase]:
     """Parse a markdown file into a list of Phases with Tasks.
 
-    Each Phase corresponds to a ``##`` heading.  ``###`` sub-headings
-    are recorded on individual Task objects via the ``subphase`` field
-    so the orchestrator can compute session-scope keys.
+    Each Phase corresponds to a ``##`` heading — either the explicit
+    ``## Phase N — Title`` format or a bare ``## Title`` (as produced
+    by ``tasker prepare to-md``).  ``###`` / ``####`` sub-headings are
+    recorded on individual Task objects via the ``subphase`` field so
+    the orchestrator can compute session-scope keys.
     """
     path = Path(path)
     if not path.exists():
@@ -52,12 +55,20 @@ def parse_task_file(path: str | Path) -> list[Phase]:
         stripped = line.strip()
 
         # ── Phase heading (##) ──
-        m = _PHASE_RE.match(stripped)
+        # Accept both "## Phase N — Title" and bare "## Title".
+        m = _PHASE_EXPLICIT_RE.match(stripped)
         if m:
-            # Use sequential 0-based index rather than parsing the literal identifier,
-            # so non-numeric IDs like "HG" are handled the same as "4".
             idx = len(phases)
             current_phase = Phase(index=idx, title=stripped.lstrip("# ").strip())
+            phases.append(current_phase)
+            current_subphase = ""
+            subphase_task_counter = 0
+            continue
+
+        m = _PHASE_ANY_RE.match(stripped)
+        if m:
+            idx = len(phases)
+            current_phase = Phase(index=idx, title=m.group(1).strip())
             phases.append(current_phase)
             current_subphase = ""
             subphase_task_counter = 0

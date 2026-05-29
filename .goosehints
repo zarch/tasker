@@ -7,6 +7,13 @@
 - ARCH returns one of: REDECOMPOSE (split into subtasks), CLARIFY (rewrite task text), SKIP, RETRY.
 - `_needs_reparse` flag signals `_run_loop()` to re-parse the markdown file after ARCH restructuring.
 
+## Parser — dual format support
+- The parser accepts both `## Phase N — Title` (explicit) and bare `## Title` (as produced by `tasker prepare to-md`) headings.
+- `_PHASE_EXPLICIT_RE` matches `## Phase <id>` headings; `_PHASE_ANY_RE` is the fallback for bare `##` headings.
+- `prepare.py` dispatches on file extension: `.md` files go through the markdown parser, `.jsonl` files through JSONL reader.
+- `_read_entries(path)` is the unified entry point used by `validate` and `to-md` commands.
+- `_entries_to_md()` emits `## Phase {N} — {Title}` so generated markdown round-trips through the parser correctly.
+
 ## Parser Mutation
 - `insert_subtasks()` replaces a task's checkbox with [x] + adds new [ ] lines below it.
 - `rewrite_task_text()` changes the text after the checkbox marker in-place.
