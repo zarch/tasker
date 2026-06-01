@@ -21,6 +21,42 @@ instructions: |
   Task descriptions reference specs using: `arch/02-grid-system.md §GridCell Trait`
   → read `specs/arch/02-grid-system.md`, find the "GridCell Trait" section.
 
+  ## ⚡ JSON-First Rule (MANDATORY)
+
+  You MUST output a JSON block as your FIRST assistant message — before any
+  tool calls.  This "checkpoint" ensures the orchestrator always gets a
+  valid response even if you run out of tokens later.
+
+  **Step 0 — Immediate checkpoint (before ANY tool calls):**
+  ```json
+  {"should_decompose": false, "reason": "Analyzing task: {{ task_label }}", "subtasks": []}
+  ```
+
+  **After analysis is complete — update with final decision:**
+  ```json
+  {"should_decompose": true, "reason": "...", "subtasks": [...]}
+  ```
+  or:
+  ```json
+  {"should_decompose": false, "reason": "Single focused change in one module.", "subtasks": []}
+  ```
+
+  **Only the LAST JSON block in your response is parsed**, so your final
+  update always overrides the checkpoint.
+
+  ## Structured Output Helper (optional but recommended)
+
+  A Pydantic model is available for guaranteed-valid JSON:
+
+  ```python
+  from tasker.schema import DecomposeResponse
+  resp = DecomposeResponse(should_decompose=False, reason="Single focused change.")
+  print(resp.model_dump_json())
+  ```
+
+  Use this if you're uncertain about JSON syntax.  Raw JSON in a code block
+  is also acceptable.
+
   ## When to Decompose
 
   Split the task into subtasks when:

@@ -19,6 +19,7 @@ class Task:
     text: str
     done: bool = False
     skipped: bool = False  # True when max_iterations was reached without QA approval
+    failed: bool = False  # True when persistently failed (written as [~] in markdown)
 
     # Sub-phase context — set by parser when the task sits under a ### heading
     subphase: str = ""
@@ -105,6 +106,7 @@ class Actor(str, enum.Enum):
     QA = "qa"
     DEV = "dev"
     ARCH = "arch"
+    SYSTEM = "system"
 
 
 class TaskStatus(str, enum.Enum):
@@ -115,6 +117,7 @@ class TaskStatus(str, enum.Enum):
     ERROR = "error"
     BLOCKED = "blocked"
     NEEDS_USER_INPUT = "needs_user_input"
+    SESSION_START = "session_start"
 
 
 # ── Recovery state for graceful degradation ──────────────────────
@@ -221,6 +224,12 @@ class IterationEntry:
     status: TaskStatus
     payload: dict[str, Any] | None = None
     raw_output: str | None = None
+    checkpoint: bool = False
+    json_blocks_found: int = 0
+    json_blocks_cascade: bool = False
+    assistant_turns: int = 0
+    total_turns: int = 0
+    output_chars: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -234,6 +243,18 @@ class IterationEntry:
             d["payload"] = self.payload
         if self.raw_output is not None:
             d["raw_output"] = self.raw_output
+        if self.checkpoint:
+            d["checkpoint"] = True
+        if self.json_blocks_found:
+            d["json_blocks_found"] = self.json_blocks_found
+        if self.json_blocks_cascade:
+            d["json_blocks_cascade"] = True
+        if self.assistant_turns:
+            d["assistant_turns"] = self.assistant_turns
+        if self.total_turns:
+            d["total_turns"] = self.total_turns
+        if self.output_chars:
+            d["output_chars"] = self.output_chars
         return d
 
 
@@ -272,7 +293,7 @@ class DevRequest:
 class DevResponse:
     """Dev → QA: result of implementation."""
 
-    status: str  # "done" | "blocked"
+    status: str  # "done" | "blocked" | "started"
     summary: str
     files_modified: list[str]
     notes: str = ""

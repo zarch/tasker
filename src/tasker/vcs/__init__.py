@@ -56,6 +56,17 @@ class VCSBackend(Protocol):
         """
         ...
 
+    def init_subdir(self, subdir: Path) -> None:
+        """Auto-init git in a subdirectory if it's not already a repo.
+
+        Steps:
+        1. Check if subdir is already inside a git work tree — skip if so.
+        2. Run ``git init`` in subdir.
+        3. Create ``.gitignore`` with Python defaults (only if missing).
+        4. Stage all files and create a baseline commit.
+        """
+        ...
+
 
 def create_backend(vcs_type: str) -> VCSBackend | None:
     """Factory: create a VCS backend from a CLI flag value.

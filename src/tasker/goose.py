@@ -65,72 +65,239 @@ class GooseRunResult:
     parsed_json: dict | None = None
     duration_secs: float = 0.0
     timed_out: bool = False
+    raw_envelope: str = ""  # original goose JSON output before extraction
+    empty_output: bool = False  # True when goose returned rc=0 but no assistant text
+    json_blocks_found: int = 0  # number of valid JSON blocks found in cascade
+    json_blocks_cascade: bool = (
+        False  # True when a malformed candidate appears after last valid block
+    )
+    assistant_turns: int = 0  # count of messages with role="assistant"
+    total_turns: int = 0  # total message count in the envelope
+    output_chars: int = 0  # len of assistant_text
 
 
-def _extract_json_block(text: str) -> dict | None:
-    """Try to extract a JSON object from text that may contain markdown fences."""
-    # Try: raw JSON first
-    try:
-        obj = json.loads(text.strip())
-        if isinstance(obj, dict):
-            return obj
-    except (json.JSONDecodeError, ValueError):
-        pass
+def _extract_json_blocks(text: str) -> list[dict]:
+    """Extract ALL valid JSON dicts from *text* in document order.
 
-    # Try: fenced code block  ```json ... ```
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
-    if m:
+    Scans for two kinds of candidates:
+
+    1. Fenced ````json ... ```` code blocks (via :func:`re.finditer`).
+    2. Bare ``{ … }`` brace pairs.
+
+    Each candidate is tried with :func:`json.loads`.  Successfully parsed
+    dicts are collected and **deduplicated**: when two candidates parse to
+    the same dict at overlapping character positions, only the earlier one
+    is kept.
+
+    Returns a list of dicts ordered by the first character position of the
+    match in *text*.
+    """
+    # Each candidate: (start_pos, end_pos, parsed_dict)
+    candidates: list[tuple[int, int, dict]] = []
+
+    # 1) Fenced ```json ... ``` blocks
+    fenced_re = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
+    for m in fenced_re.finditer(text):
+        body = m.group(1).strip()
         try:
-            obj = json.loads(m.group(1).strip())
+            obj = json.loads(body)
             if isinstance(obj, dict):
-                return obj
+                candidates.append((m.start(), m.end(), obj))
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Try: last { ... } block
-    last_brace = text.rfind("{")
-    if last_brace != -1:
+    # 2) Bare { … } brace pairs
+    depth = 0
+    brace_start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                brace_start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and brace_start >= 0:
+                try:
+                    obj = json.loads(text[brace_start : i + 1])
+                    if isinstance(obj, dict):
+                        candidates.append((brace_start, i + 1, obj))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                brace_start = -1
+
+    # Sort by start position (stable — earlier matches first)
+    candidates.sort(key=lambda t: t[0])
+
+    # Deduplicate: when two candidates parse to equal dicts at overlapping
+    # positions, keep only the earlier one.
+    seen: list[tuple[int, int, dict]] = []
+    for start, end, obj in candidates:
+        dominated = False
+        for s, e, prev in seen:
+            # Overlap test: two ranges [s, e) and [start, end) overlap
+            # iff s < end and start < e.
+            if s < end and start < e and prev == obj:
+                dominated = True
+                break
+        if not dominated:
+            seen.append((start, end, obj))
+
+    return [obj for _, _, obj in seen]
+
+
+def _find_last_block_end(text: str, obj: dict) -> int:
+    """Return the end position (exclusive) of the last brace-pair match of *obj* in *text*.
+
+    Scans all ``{ … }`` regions and returns the end index of the last one
+    that parses to the same dict as *obj*.  Returns -1 if not found.
+    """
+    last_end = -1
+    depth = 0
+    brace_start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                brace_start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and brace_start >= 0:
+                try:
+                    parsed = json.loads(text[brace_start : i + 1])
+                    if isinstance(parsed, dict) and parsed == obj:
+                        last_end = i + 1
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                brace_start = -1
+    return last_end
+
+
+def _has_trailing_malformed(text: str, last_valid_end: int) -> bool:
+    """Return True if a malformed JSON candidate appears after position *last_valid_end*.
+
+    A malformed candidate is either:
+    - A fenced ````json ... ```` block whose body is not valid JSON (or not a dict).
+    - A bare ``{ … }`` brace pair whose content is not valid JSON (or not a dict).
+
+    We only check candidates that start at or after *last_valid_end*.
+    """
+    # Check fenced blocks after the last valid block
+    fenced_re = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
+    for m in fenced_re.finditer(text):
+        if m.start() < last_valid_end:
+            continue
+        body = m.group(1).strip()
         try:
-            obj = json.loads(text[last_brace:])
-            if isinstance(obj, dict):
-                return obj
+            obj = json.loads(body)
+            if not isinstance(obj, dict):
+                return True
         except (json.JSONDecodeError, ValueError):
-            pass
+            return True
 
-    return None
+    # Check bare brace pairs after the last valid block
+    depth = 0
+    brace_start = -1
+    for i, ch in enumerate(text):
+        if i < last_valid_end:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth = max(depth - 1, 0)
+            continue
+        if ch == "{":
+            if depth == 0:
+                brace_start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and brace_start >= 0:
+                try:
+                    obj = json.loads(text[brace_start : i + 1])
+                    if not isinstance(obj, dict):
+                        return True
+                except (json.JSONDecodeError, ValueError):
+                    return True
+                brace_start = -1
+
+    return False
 
 
-def _extract_last_assistant_text(raw_stdout: str) -> str:
+def _extract_last_assistant_text(raw_stdout: str) -> tuple[str, bool, int, int]:
     """Extract the last assistant message text from goose JSON output.
 
     goose run --output-format json returns: {"messages": [...]}
     Each message has {"role": "user|assistant", "content": [{"type": "text", "text": "..."}]}
-    We concatenate all assistant texts and return them for JSON extraction.
+    We concatenate assistant texts and return them for JSON extraction.
 
-    Returns empty string when the envelope is valid but contains no assistant
-    messages (e.g. goose errored before the agent responded), so that
-    _extract_json_block correctly returns None instead of parsing the envelope
-    itself as a structured response.
+    Returns ``(text, empty_flag, assistant_turns, total_turns)`` where:
+
+    - *text* is the concatenated assistant message content (or raw stdout
+      when the envelope is not valid JSON).
+    - *empty_flag* is True when there are no usable assistant messages —
+      either the envelope has zero assistant messages at all, or ALL
+      assistant messages are stale (none appear after the last user
+      message, meaning goose replayed old history but produced no new
+      response).
+    - *assistant_turns* is the count of messages with role ``"assistant"``.
+    - *total_turns* is ``len(messages)``.
+
+    Stale-output guard: when the envelope has assistant messages but NONE
+    appear after the last user message, the function returns
+    ``("", True, 0, total)`` so stale JSON from a previous call cannot
+    leak into the current iteration.
     """
     try:
         envelope = json.loads(raw_stdout)
         if isinstance(envelope, dict) and "messages" in envelope:
             messages = envelope["messages"]
-            # Collect all assistant message texts
-            assistant_texts = []
-            for msg in messages:
+            total_turns = len(messages)
+
+            # Count assistant messages
+            assistant_turns = sum(
+                1 for msg in messages if msg.get("role") == "assistant"
+            )
+
+            # Find index of the last user message
+            last_user_idx = -1
+            for i, msg in enumerate(messages):
+                if msg.get("role") == "user":
+                    last_user_idx = i
+
+            if last_user_idx == -1:
+                # No user message at all — all assistant messages are stale
+                # replayed history with no new response.
+                if assistant_turns > 0:
+                    return "", True, 0, total_turns
+                # No user messages and no assistant messages
+                return "", True, 0, total_turns
+
+            # Collect only assistant messages that appear after the last
+            # user message — these are the *new* responses from this call.
+            new_assistant_texts: list[str] = []
+            for msg in messages[last_user_idx + 1 :]:
                 if msg.get("role") == "assistant":
                     for content in msg.get("content", []):
                         if content.get("type") == "text" and content.get("text"):
-                            assistant_texts.append(content["text"])
-            if assistant_texts:
-                return "\n\n".join(assistant_texts)
-            # Valid envelope but no assistant messages — return empty so
-            # _extract_json_block returns None (not the envelope itself)
-            return ""
+                            new_assistant_texts.append(content["text"])
+
+            if new_assistant_texts:
+                return (
+                    "\n\n".join(new_assistant_texts),
+                    False,
+                    assistant_turns,
+                    total_turns,
+                )
+
+            # No new assistant messages after last user message.
+            # If there are assistant messages at all, this is stale output.
+            if assistant_turns > 0:
+                return "", True, 0, total_turns
+
+            # Valid envelope but zero assistant messages — structural failure
+            return "", True, 0, total_turns
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
-    return raw_stdout
+    return raw_stdout, False, 0, 0
 
 
 def build_goose_command(
@@ -195,6 +362,91 @@ def _heartbeat_logger(
         )
 
 
+def _detect_cgroup_memory_limit() -> tuple[str, str] | None:
+    """Detect sensible cgroup memory limits for the goose subprocess.
+
+    Returns ``(memory_max, swap_max)`` as human-readable strings
+    (e.g. ``("8G", "4G")``), or None when cgroup limiting is
+    unavailable.
+
+    Strategy — budget based on **MemAvailable** (what the kernel
+    reports as actually free), not MemTotal:
+
+    1. Read MemAvailable and SwapFree from /proc/meminfo.
+    2. Goose RAM budget = 50% of MemAvailable (rounded to GB).
+    3. Goose swap budget = 30% of SwapFree (rounded to GB).
+    4. Reserve the rest for OS + desktop + tasker + spikes.
+
+    On a 31 GB machine with 22 GB available and 12 GB swap free:
+    MemoryMax=11G, MemorySwapMax=4G.  Total budget = 15G.
+    This leaves ~11 GB RAM + 8 GB swap for the rest of the system.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            info: dict[str, int] = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1])
+
+        avail_kb = info.get("MemAvailable", 0)
+        swap_free_kb = info.get("SwapFree", 0)
+        if avail_kb == 0:
+            return None
+
+        avail_gb = avail_kb / (1024 * 1024)
+        swap_free_gb = swap_free_kb / (1024 * 1024)
+
+        # Goose RAM budget: 50% of what's currently available
+        ram_gb = max(round(avail_gb * 0.50), 4)
+        # Goose swap budget: 30% of free swap
+        swap_gb = max(round(swap_free_gb * 0.30), 2)
+
+        ram_str = f"{ram_gb}G"
+        swap_str = f"{swap_gb}G"
+        log.debug(
+            "goose.cgroup_limit",
+            avail_gb=round(avail_gb, 1),
+            swap_free_gb=round(swap_free_gb, 1),
+            ram_max=ram_str,
+            swap_max=swap_str,
+        )
+        return (ram_str, swap_str)
+    except (OSError, ValueError):
+        return None
+
+
+_systemd_run_available: bool | None = None
+
+
+def _can_use_systemd_run() -> bool:
+    """Check whether ``systemd-run --user --scope`` is available.
+
+    The check is performed once and cached for the lifetime of the
+    process so we don't spawn a subprocess on every goose invocation.
+    """
+    global _systemd_run_available
+    if _systemd_run_available is not None:
+        return _systemd_run_available
+
+    import shutil
+
+    if shutil.which("systemd-run") is None:
+        _systemd_run_available = False
+        return False
+    # Quick smoke test — run a no-op command under a user scope.
+    try:
+        result = subprocess.run(
+            ["systemd-run", "--user", "--scope", "true"],
+            capture_output=True,
+            timeout=5,
+        )
+        _systemd_run_available = result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        _systemd_run_available = False
+    return _systemd_run_available
+
+
 def run_goose(
     recipe_path: str | Path,
     session_name: str,
@@ -204,6 +456,7 @@ def run_goose(
     model: str | None = None,
     provider: str | None = None,
     cwd: str | Path | None = None,
+    memory_limit: str | None = None,
 ) -> GooseRunResult:
     """Run goose synchronously and return parsed result.
 
@@ -215,6 +468,14 @@ def run_goose(
     log events so the monitor log shows liveness during the wait.
 
     Returns a GooseRunResult with timed_out=True when the process is killed.
+
+    When *memory_limit* is set (e.g. ``"12G"``), the goose subprocess is
+    launched inside a ``systemd-run --user --scope`` with
+    ``--property=MemoryMax=…`` so the kernel OOM killer targets the goose
+    cgroup first, sparing the rest of the system.  When *memory_limit*
+    is ``None`` (the default), a limit is auto-detected from
+    ``/proc/meminfo`` if cgroup v2 + systemd --user are available.
+    Set to ``""`` (empty string) to disable the cgroup limit entirely.
     """
     cmd = build_goose_command(
         recipe_path=recipe_path,
@@ -224,6 +485,47 @@ def run_goose(
         model=model,
         provider=provider,
     )
+
+    # ── cgroup memory isolation ────────────────────────────────────────
+    # Wrap the goose command in systemd-run --user --scope with
+    # MemoryMax + MemorySwapMax properties.  This creates a cgroup v2
+    # leaf for the goose process tree.  If the cgroup exceeds either
+    # limit, the kernel will invoke the OOM killer *only* inside that
+    # cgroup — the desktop, tasker, and other user applications are
+    # spared.
+    #
+    # --quiet suppresses "Running as unit: …" on stderr so that the
+    # only stderr output comes from goose itself (making error
+    # diagnosis possible).
+    cgroup_limits: tuple[str, str] | None = None
+    if memory_limit == "":
+        # Explicitly disabled by caller
+        cgroup_limits = None
+    elif memory_limit:
+        # Caller specified a RAM limit; derive a swap limit (50% of RAM)
+        cgroup_limits = (memory_limit, f"{int(memory_limit.rstrip('GgMmKk')) // 2}G")
+    else:
+        # Auto-detect
+        if _can_use_systemd_run():
+            cgroup_limits = _detect_cgroup_memory_limit()
+
+    if cgroup_limits:
+        ram_max, swap_max = cgroup_limits
+        cmd = [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            f"--property=MemoryMax={ram_max}",
+            f"--property=MemorySwapMax={swap_max}",
+            "--",
+        ] + cmd
+        log.info(
+            "goose.cgroup_wrapped",
+            session=session_name,
+            memory_limit=ram_max,
+            swap_limit=swap_max,
+        )
 
     log.debug(
         "goose.launching",
@@ -241,6 +543,44 @@ def run_goose(
     env = os.environ.copy()
     env["GOOSE_CONTEXT_STRATEGY"] = "summarize"
     env["GOOSE_AUTO_COMPACT_THRESHOLD"] = "0.55"
+
+    # Cap cargo build parallelism to 1 to minimize peak memory.
+    # Each linker (lld) uses 1-1.5 GB RSS, and each rustc thread uses
+    # 0.5-1 GB.  With CARGO_BUILD_JOBS=1 the peak is ~3-4 GB for
+    # compilation + 1 GB for goose = ~5 GB total, well within the
+    # cgroup budget.  Higher values caused OOM kills even inside the
+    # cgroup on machines with ≤32 GB RAM and heavy workspaces
+    # (1277 transitive crates, Polars, Arrow, wgpu, geo).
+    env.setdefault("CARGO_BUILD_JOBS", "1")
+
+    # Make rustdoc use mold for doctest linking.
+    # Rustdoc compiles each doctest as a separate binary, linking ALL crate
+    # dependencies.  By default it uses /usr/bin/ld (~600 MB per process).
+    # With mold, each linker uses ~300 MB — critical when 10-16 doctests
+    # compile in parallel (3-5 GB vs 6-10 GB peak).
+    # NOTE: rustflags in .cargo/config.toml are NOT propagated to rustdoc's
+    # doctest compilation — only RUSTDOCFLAGS works here.
+    env.setdefault("RUSTDOCFLAGS", "-C link-arg=-fuse-ld=mold")
+
+    # Limit test runner parallelism.  Even with mold, running many doctest
+    # or unit-test binaries concurrently can exhaust memory.  Serial
+    # execution (1 thread) is safest on memory-constrained machines.
+    env.setdefault("RUST_TEST_THREADS", "1")
+
+    # Disable incremental compilation so sccache can cache artifacts.
+    # Without this, sccache marks incremental builds as non-cacheable and
+    # every cargo build/test recompiles from scratch (30+ seconds even with
+    # no source changes). With CARGO_INCREMENTAL=0, sccache achieves 100%
+    # cache hit rate on repeat builds.
+    env.setdefault("CARGO_INCREMENTAL", "0")
+
+    # Inject tasker src directory into PYTHONPATH so the goose agent
+    # subprocess can import tasker modules (e.g. from tasker.schema import DevResponse).
+    tasker_src = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = tasker_src + os.pathsep + env.get("PYTHONPATH", "")
+    log.debug(
+        "goose.pythonpath_injected", tasker_src=tasker_src, pythonpath=env["PYTHONPATH"]
+    )
 
     start = time.monotonic()
 
@@ -272,8 +612,38 @@ def run_goose(
 
             # Extract assistant text from the goose JSON envelope,
             # then try to parse a structured JSON response from it.
-            assistant_text = _extract_last_assistant_text(stdout)
-            parsed = _extract_json_block(assistant_text)
+            assistant_text, empty_output, assistant_turns, total_turns = (
+                _extract_last_assistant_text(stdout)
+            )
+
+            # Cascade: extract ALL valid JSON blocks; last valid block wins.
+            blocks = _extract_json_blocks(assistant_text)
+            json_blocks_found = len(blocks)
+            parsed = blocks[-1] if blocks else None
+
+            # Detect cascade: is there a malformed candidate after the last
+            # valid block?
+            json_blocks_cascade = False
+            if blocks:
+                # Find end position of the last valid block in the text
+                last_obj = blocks[-1]
+                # Scan for the last occurrence of this dict in brace pairs
+                last_valid_end = _find_last_block_end(assistant_text, last_obj)
+                if last_valid_end >= 0:
+                    json_blocks_cascade = _has_trailing_malformed(
+                        assistant_text, last_valid_end
+                    )
+            elif assistant_text:
+                # No valid blocks found but there IS text — check if any
+                # malformed candidate exists at all
+                json_blocks_cascade = _has_trailing_malformed(assistant_text, 0)
+
+            # Structural failure: goose exited cleanly (rc=0) but produced
+            # zero assistant text — it never reached the LLM or silently
+            # errored inside the JSON envelope.  Mark as not-successful so
+            # the orchestrator's recovery pipeline handles it properly
+            # instead of entering the endless malformed_output cycle.
+            success = proc.returncode == 0 and not empty_output
 
             log.info(
                 "goose.completed",
@@ -283,16 +653,28 @@ def run_goose(
                 parsed=bool(parsed),
                 stdout_len=len(assistant_text),
                 stderr_len=len(stderr),
+                empty_output=empty_output,
+                json_blocks_found=json_blocks_found,
+                json_blocks_cascade=json_blocks_cascade,
+                assistant_turns=assistant_turns,
+                total_turns=total_turns,
             )
 
             return GooseRunResult(
-                success=proc.returncode == 0,
+                success=success,
                 raw_stdout=assistant_text,
                 raw_stderr=stderr,
                 return_code=proc.returncode,
                 parsed_json=parsed,
                 duration_secs=round(duration, 2),
                 timed_out=False,
+                raw_envelope=stdout[:5000] if stdout else "",
+                empty_output=empty_output,
+                json_blocks_found=json_blocks_found,
+                json_blocks_cascade=json_blocks_cascade,
+                assistant_turns=assistant_turns,
+                total_turns=total_turns,
+                output_chars=len(assistant_text),
             )
         except subprocess.TimeoutExpired:
             # Kill the entire process group (goose + any child processes)
@@ -387,6 +769,7 @@ def run_goose_with_backoff(
     provider: str | None = None,
     cwd: str | Path | None = None,
     rate_limit: RateLimitConfig | None = None,
+    memory_limit: str | None = None,
 ) -> GooseRunResult:
     """Run goose with automatic retry on transient connection errors.
 
@@ -397,6 +780,9 @@ def run_goose_with_backoff(
 
     The backoff delay is controlled by *rate_limit* (defaults to sensible
     values when ``None``).
+
+    *memory_limit* is forwarded to :func:`run_goose`.  See its docstring
+    for details.
 
     Returns the last :class:`GooseRunResult` -- either a successful run or
     the final failure after exhausting retries.
@@ -413,6 +799,7 @@ def run_goose_with_backoff(
             model=model,
             provider=provider,
             cwd=cwd,
+            memory_limit=memory_limit,
         )
 
     attempt = 0
@@ -427,6 +814,7 @@ def run_goose_with_backoff(
             model=model,
             provider=provider,
             cwd=cwd,
+            memory_limit=memory_limit,
         )
 
         # --- Success or non-connection failure: return immediately ---

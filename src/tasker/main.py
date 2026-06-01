@@ -30,6 +30,11 @@ app = typer.Typer(
 )
 console = Console()
 
+# Register the ``tasker prepare`` subcommand group.
+from .prepare import prepare_app  # noqa: E402
+
+app.add_typer(prepare_app, name="prepare")
+
 
 def _resolve_path(path: str) -> Path:
     p = Path(path)
@@ -140,6 +145,11 @@ def main(
         False,
         "--no-rate-limit",
         help="Disable automatic backoff on connection errors entirely.",
+    ),
+    max_consecutive_empty: int = typer.Option(
+        3,
+        "--max-consecutive-empty",
+        help="Max consecutive empty-output goose calls before marking a task as permanently failed ([~]). Default: 3.",
     ),
     monitor_log: Path = typer.Option(
         None,
@@ -262,6 +272,7 @@ def main(
         ),
         decompose_recipe=str(decompose.resolve()) if decompose else None,
         arch_recipe=arch_abs,
+        max_consecutive_empty=max_consecutive_empty,
     )
 
     orchestrator.run()

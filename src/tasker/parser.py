@@ -22,7 +22,7 @@ log = structlog.get_logger(__name__)
 _PHASE_EXPLICIT_RE = re.compile(r"^##\s+Phase\s+(\w[\w.-]*)[^\n]*$", re.IGNORECASE)
 _PHASE_ANY_RE = re.compile(r"^##\s+(.+)$")
 _SUBPHASE_RE = re.compile(r"^#{3,4}\s+(.+)$")
-_TASK_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+)$")
+_TASK_RE = re.compile(r"^-\s+\[([ xX~])\]\s+(.+)$")
 
 
 def parse_task_file(path: str | Path) -> list[Phase]:
@@ -87,12 +87,15 @@ def parse_task_file(path: str | Path) -> list[Phase]:
         # ── Task checkbox ──
         m = _TASK_RE.match(stripped)
         if m and current_phase is not None:
-            done = m.group(1).lower() == "x"
+            marker = m.group(1)
+            done = marker.lower() == "x"
+            failed = marker == "~"
             task = Task(
                 phase_index=current_phase.index,
                 task_index=task_counter,
                 text=m.group(2).strip(),
                 done=done,
+                failed=failed,
                 subphase=current_subphase,
                 subphase_index=subphase_task_counter if current_subphase else -1,
             )
@@ -116,10 +119,10 @@ def parse_task_file(path: str | Path) -> list[Phase]:
 
 
 def find_next_task(phases: list[Phase]) -> tuple[Phase, Task] | None:
-    """Return the first (phase, task) pair that is not yet done."""
+    """Return the first (phase, task) pair that is not yet done and not failed."""
     for phase in phases:
         for task in phase.tasks:
-            if task.skipped:
+            if task.skipped or task.failed:
                 continue
             if not task.done:
                 return phase, task
@@ -131,8 +134,20 @@ def mark_task_done(task: Task, phases: list[Phase]) -> None:
     task.done = True
 
 
+def mark_task_failed(task: Task, phases: list[Phase], path: str | Path) -> None:
+    """Mark a task as permanently failed in the in-memory model and markdown.
+
+    Writes ``[~]`` to the markdown file so the task is skipped on subsequent
+    tasker runs.  This prevents endlessly retrying tasks where the agent
+    cannot produce any output (structural failure).
+    """
+    task.failed = True
+    update_markdown(path, phases)
+    log.info("parser.task_marked_failed", task_label=task.label)
+
+
 def update_markdown(path: str | Path, phases: list[Phase]) -> None:
-    """Rewrite the markdown file, reflecting done/undone checkboxes."""
+    """Rewrite the markdown file, reflecting done/failed/undone checkboxes."""
     path = Path(path)
     log.debug("parser.updating_markdown", path=str(path))
     text = path.read_text(encoding="utf-8")
@@ -146,9 +161,14 @@ def update_markdown(path: str | Path, phases: list[Phase]) -> None:
             if phase_idx is not None:
                 task = _task_at(phases, phase_idx, task_idx)
                 if task is not None:
-                    check = "x" if task.done else " "
+                    if task.failed:
+                        check = "~"
+                    elif task.done:
+                        check = "x"
+                    else:
+                        check = " "
                     lines[i] = re.sub(
-                        r"^(\s*-\s+\[)[ xX](\]\s+)",
+                        r"^(\s*-\s+\[)[ xX~](\]\s+)",
                         rf"\g<1>{check}\2",
                         line,
                     )
@@ -228,7 +248,7 @@ def insert_subtasks(
 
     # Replace the original task line with: [x] original + new subtask lines
     lines[target_line] = re.sub(
-        r"^(\s*-\s+\[)[ xX](\]\s+)",
+        r"^(\s*-\s+\[)[ xX~](\]\s+)",
         r"\g<1>x\2",
         lines[target_line],
     )
@@ -297,7 +317,7 @@ def rewrite_task_text(
 
     # Replace the text after the checkbox marker
     lines[target_line] = re.sub(
-        r"^(\s*-\s+\[[ xX]\]\s+).+$",
+        r"^(\s*-\s+\[[ xX~]\]\s+).+$",
         rf"\g<1>{new_text}",
         lines[target_line],
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ import structlog
 
 from .goose import GooseRunResult, run_goose_with_backoff
 from .log import IterationLog
+from .mem import MemorySnapshot, delta, format_snapshot_human, snapshot
 from .models import (
     Actor,
     ArchAction,
@@ -32,13 +34,19 @@ from .models import (
     RateLimitConfig,
     UserChatRequest,
 )
+from .schema import ArchResponse as ArchResponseSchema
+from .schema import DecomposeResponse as DecomposeResponseSchema
+from .schema import DevResponse as DevResponseSchema
+from .schema import QAResponse as QAResponseSchema
+from .adapter import (
+    insert_subtasks_dispatch,
+    load_tasks,
+    mark_done,
+    rewrite_text,
+)
 from .parser import (
     find_next_task,
-    insert_subtasks,
-    mark_task_done,
-    parse_task_file,
-    rewrite_task_text,
-    update_markdown,
+    mark_task_failed,
 )
 from .ui import TaskerUI
 from .vcs import VCSBackend
@@ -61,32 +69,56 @@ def _now_iso() -> str:
 def _parse_dev_response(raw: str, parsed: dict | None) -> DevResponse | None:
     """Extract DevResponse from goose output. Returns None if unparsable."""
     if parsed and "status" in parsed:
-        status = parsed["status"]
-        if status not in ("done", "blocked"):
-            return None  # unknown status — treat as malformed
-        return DevResponse(
-            status=status,
-            summary=parsed.get("summary", ""),
-            files_modified=parsed.get("files_modified", []),
-            notes=parsed.get("notes", ""),
-            blocker_description=parsed.get("blocker_description", ""),
-            blocker_suggestion=parsed.get("blocker_suggestion", ""),
-        )
+        # Primary path: Pydantic validation
+        try:
+            validated = DevResponseSchema.model_validate(parsed)
+            return DevResponse(
+                status=validated.status,
+                summary=validated.summary,
+                files_modified=validated.files_modified,
+                notes=validated.notes,
+                blocker_description=validated.blocker_description,
+                blocker_suggestion=validated.blocker_suggestion,
+            )
+        except Exception:
+            # Fallback: ad-hoc dict extraction for edge cases Pydantic rejects
+            status = parsed["status"]
+            if status not in ("done", "blocked", "started"):
+                return None  # unknown status — treat as malformed
+            return DevResponse(
+                status=status,
+                summary=parsed.get("summary", ""),
+                files_modified=parsed.get("files_modified", []),
+                notes=parsed.get("notes", ""),
+                blocker_description=parsed.get("blocker_description", ""),
+                blocker_suggestion=parsed.get("blocker_suggestion", ""),
+            )
     return None
 
 
 def _parse_qa_response(raw: str, parsed: dict | None) -> QAResponse | None:
     """Extract QAResponse from goose output. Returns None if unparsable."""
     if parsed and "decision" in parsed:
-        decision = parsed["decision"]
-        if decision not in ("approve", "reject", "needs_user_input"):
-            return None  # unknown decision — treat as malformed
-        return QAResponse(
-            decision=decision,
-            feedback=parsed.get("feedback", ""),
-            concerns=parsed.get("concerns", []),
-            user_question=parsed.get("user_question", ""),
-        )
+        # Primary path: Pydantic validation
+        try:
+            validated = QAResponseSchema.model_validate(parsed)
+            return QAResponse(
+                decision=validated.decision,
+                feedback=validated.feedback,
+                concerns=validated.concerns,
+                user_question=validated.user_question,
+            )
+        except Exception:
+            # Fallback: ad-hoc dict extraction for edge cases Pydantic rejects
+            decision = parsed["decision"]
+            if decision not in ("approve", "reject", "needs_user_input"):
+                return None  # unknown decision — treat as malformed
+            return QAResponse(
+                decision=decision,
+                feedback=parsed.get("feedback", ""),
+                concerns=parsed.get("concerns", []),
+                user_question=parsed.get("user_question", ""),
+            )
     return None
 
 
@@ -95,42 +127,73 @@ def _parse_decompose_response(
 ) -> DecomposeResponse | None:
     """Extract DecomposeResponse from goose output. Returns None if unparsable."""
     if parsed and "should_decompose" in parsed:
-        should = parsed["should_decompose"]
-        if not isinstance(should, bool):
-            should = str(should).lower() == "true"
-        subtasks: list[Subtask] = []
-        for st in parsed.get("subtasks", []):
-            if isinstance(st, dict) and st.get("label") and st.get("text"):
-                subtasks.append(Subtask(label=st["label"], text=st["text"]))
-        return DecomposeResponse(
-            should_decompose=should,
-            reason=parsed.get("reason", ""),
-            subtasks=subtasks,
-        )
+        # Primary path: Pydantic validation
+        try:
+            validated = DecomposeResponseSchema.model_validate(parsed)
+            return DecomposeResponse(
+                should_decompose=validated.should_decompose,
+                reason=validated.reason,
+                subtasks=[
+                    Subtask(label=st.label, text=st.text) for st in validated.subtasks
+                ],
+            )
+        except Exception:
+            # Fallback: ad-hoc dict extraction for edge cases Pydantic rejects
+            # (e.g. should_decompose as string "true"/"false" instead of bool)
+            should = parsed["should_decompose"]
+            if not isinstance(should, bool):
+                should = str(should).lower() == "true"
+            subtasks: list[Subtask] = []
+            for st in parsed.get("subtasks", []):
+                if isinstance(st, dict) and st.get("label") and st.get("text"):
+                    subtasks.append(Subtask(label=st["label"], text=st["text"]))
+            return DecomposeResponse(
+                should_decompose=should,
+                reason=parsed.get("reason", ""),
+                subtasks=subtasks,
+            )
     return None
 
 
 def _parse_arch_response(raw: str, parsed: dict | None) -> ArchResponse | None:
     """Extract ArchResponse from goose output. Returns None if unparsable."""
     if parsed and "action" in parsed:
-        action = parsed["action"]
-        if action not in ("recompose", "clarify", "skip", "retry"):
-            return None
-        subtasks: list[Subtask] = []
-        for st in parsed.get("subtasks", []):
-            if isinstance(st, dict) and st.get("label") and st.get("text"):
-                subtasks.append(Subtask(label=st["label"], text=st["text"]))
-        return ArchResponse(
-            action=action,
-            reason=parsed.get("reason", ""),
-            subtasks=subtasks,
-            new_task_text=parsed.get("new_task_text", ""),
-            max_iterations_override=parsed.get("max_iterations_override"),
-        )
+        # Primary path: Pydantic validation
+        try:
+            validated = ArchResponseSchema.model_validate(parsed)
+            return ArchResponse(
+                action=validated.action,
+                reason=validated.reason,
+                subtasks=[
+                    Subtask(label=st.label, text=st.text) for st in validated.subtasks
+                ],
+                new_task_text=validated.new_task_text,
+                max_iterations_override=validated.max_iterations_override,
+            )
+        except Exception:
+            # Fallback: ad-hoc dict extraction for edge cases Pydantic rejects
+            action = parsed["action"]
+            if action not in ("recompose", "clarify", "skip", "retry"):
+                return None
+            subtasks: list[Subtask] = []
+            for st in parsed.get("subtasks", []):
+                if isinstance(st, dict) and st.get("label") and st.get("text"):
+                    subtasks.append(Subtask(label=st["label"], text=st["text"]))
+            return ArchResponse(
+                action=action,
+                reason=parsed.get("reason", ""),
+                subtasks=subtasks,
+                new_task_text=parsed.get("new_task_text", ""),
+                max_iterations_override=parsed.get("max_iterations_override"),
+            )
     return None
 
 
 # ── Recovery instructions for graceful degradation ────────────────
+
+_TASK_CONTEXT_TEMPLATE = (
+    "## YOUR TASK (repeated for recovery):\n**{task_label}**: {task_text}\n\n"
+)
 
 _RECOVERY_CONTINUE = (
     "⚠️ FORMAT RECOVERY — your previous response had no JSON block.\n\n"
@@ -188,6 +251,17 @@ _RECOVERY_RESTART = (
 )
 
 
+def _with_task_context(instruction: str, task_label: str, task_text: str) -> str:
+    """Prepend the task description to a recovery instruction.
+
+    This ensures the agent always has its task available even when
+    recovery mode suppresses the normal task_text parameter or when
+    context compaction has purged the original task from the session.
+    """
+    ctx = _TASK_CONTEXT_TEMPLATE.format(task_label=task_label, task_text=task_text)
+    return ctx + instruction
+
+
 # ── QA recovery instructions for graceful degradation ─────────────
 
 _QA_RECOVERY_CONTINUE = (
@@ -238,6 +312,22 @@ def _is_truncated_output(raw_stdout: str | None) -> bool:
     return _TRUNCATION_MARKER in raw_stdout if raw_stdout else False
 
 
+def _is_checkpoint(response: DevResponse | QAResponse) -> bool:
+    """Check if a response signals a checkpoint pause.
+
+    For DevResponse: status="started" (primary), or status="blocked" with
+    'checkpoint' in notes (legacy fallback).
+    For QAResponse: rejected with 'checkpoint' in feedback.
+    """
+    if isinstance(response, DevResponse):
+        return response.status == "started" or (
+            response.status == "blocked" and "checkpoint" in response.notes
+        )
+    elif isinstance(response, QAResponse):
+        return response.decision == "reject" and "checkpoint" in response.feedback
+    return False
+
+
 def _timeout_feedback(actor: str, timeout_secs: int) -> str:
     """Build a feedback message to send when an agent was killed for timing out."""
     timeout_minutes = timeout_secs / 60
@@ -254,6 +344,36 @@ def _timeout_feedback(actor: str, timeout_secs: int) -> str:
         f"Do NOT redo work you have already completed. Continue from where you "
         f"were interrupted and wrap up promptly.\n"
     )
+
+
+# Matches paths in backticks containing known source directories
+_DIR_REF_RE = re.compile(r"`([^`\s]+/(?:src|tests|crates|modules|pkg)/[^`\s]*)`")
+
+
+def _extract_dir_refs(text: str, cwd: Path) -> set[Path]:
+    """Extract directory references from task text.
+
+    Looks for paths in backticks that contain known source directories
+    (src/, tests/, crates/, modules/, pkg/).  Returns the set of
+    unique root directories (the top-level dir containing src/ or tests/).
+
+    For example:
+      `eudox-mcp/src/eudox_mcp/server.py` → {cwd / "eudox-mcp"}
+      `plans-mcp/tests/test_auth.py`       → {cwd / "plans-mcp"}
+      `src/eudox/pipeline/analytics.py`    → {} (inside cwd repo, no sub-dir)
+    """
+    roots: set[Path] = set()
+    for m in _DIR_REF_RE.finditer(text):
+        raw_path = m.group(1)
+        parts = Path(raw_path).parts
+        # Find the boundary: the dir that directly contains src/ or tests/
+        for i, part in enumerate(parts):
+            if part in ("src", "tests", "crates", "modules", "pkg") and i > 0:
+                root = cwd / Path(*parts[:i])
+                if root.is_dir():
+                    roots.add(root)
+                break
+    return roots
 
 
 def _compute_scope_key(task: Task, scope: SessionScope) -> str:
@@ -296,6 +416,7 @@ class Orchestrator:
         rate_limit: RateLimitConfig | None = None,
         decompose_recipe: str | Path | None = None,
         arch_recipe: str | Path | None = None,
+        max_consecutive_empty: int = 3,
     ) -> None:
         self.task_file = Path(task_file).resolve()
         self.dev_recipe = Path(dev_recipe)
@@ -323,6 +444,10 @@ class Orchestrator:
         # Rate-limit / connection-error backoff
         self.rate_limit = rate_limit or RateLimitConfig()
 
+        # Circuit breaker: max consecutive empty-output goose calls before
+        # skipping a task entirely (prevents the endless malformed_output loop).
+        self.max_consecutive_empty = max_consecutive_empty
+
         # goose run uses --name for session persistence and auto-resumes
         # when the same name is used again.
         self.dev_session_name = _generate_session_id("dev")
@@ -338,6 +463,9 @@ class Orchestrator:
         self._consecutive_exhaustions: int = 0
         self._iterations_without_approval: int = 0
         self._pending_arch_check: bool = False
+
+        # Memory tracking — snapshots around goose subprocesses
+        self._last_memory_snapshot: MemorySnapshot | None = None
 
     def run(self) -> None:
         """Main entry point — run all tasks."""
@@ -357,6 +485,14 @@ class Orchestrator:
             vcs="enabled" if self.vcs else "disabled",
             arch="enabled" if self.arch_recipe else "disabled",
         )
+
+        # Log initial memory state
+        initial_snap = snapshot()
+        if initial_snap is not None:
+            self._last_memory_snapshot = initial_snap
+            log.info("memory.initial", **initial_snap.to_dict())
+            self.ui.print_info(f"Memory: {format_snapshot_human(initial_snap)}")
+
         self.ui.print_info(f"Developer session: {self.dev_session_name}")
         self.ui.print_info(f"QA session:       {self.qa_session_name}")
         self.ui.print_info(f"Session scope:    {self.session_scope.value}")
@@ -384,7 +520,7 @@ class Orchestrator:
                     self.vcs = None
 
         # Parse tasks
-        self.phases = parse_task_file(self.task_file)
+        self.phases = load_tasks(self.task_file)
 
         if not self.phases:
             log.error("parser.no_phases", task_file=str(self.task_file))
@@ -405,20 +541,94 @@ class Orchestrator:
                 tasks_skipped=skipped,
             )
 
+        # Reset [~] (permanently failed) tasks back to [ ] (pending).
+        # This gives tasks a fresh chance on each new orchestrator run —
+        # the previous failure was likely due to a transient issue (e.g.
+        # the checkpoint feedback loop bug) rather than an intrinsic problem.
+        reset_count = 0
+        for phase in self.phases:
+            for task in phase.tasks:
+                if task.failed:
+                    task.failed = False
+                    task.skipped = False
+                    reset_count += 1
+        if reset_count > 0:
+            from .parser import update_markdown
+
+            update_markdown(self.task_file, self.phases)
+            log.info("tasks.reset_failed", count=reset_count)
+            self.ui.print_info(
+                f"♻️  Reset {reset_count} previously failed task(s) — giving them a fresh attempt"
+            )
+
         total_tasks = sum(p.total for p in self.phases)
         done_tasks = sum(p.completed for p in self.phases)
+        remaining = total_tasks - done_tasks
         log.info(
             "tasks.loaded",
             phases=len(self.phases),
             total_tasks=total_tasks,
             done_tasks=done_tasks,
-            remaining=total_tasks - done_tasks,
+            remaining=remaining,
         )
         self.ui.print_info(
             f"Loaded {len(self.phases)} phases, {total_tasks} tasks "
-            f"({done_tasks} already done, {total_tasks - done_tasks} remaining)"
+            f"({done_tasks} already done, {remaining} remaining)"
         )
         self.ui.print_info("")
+
+        # Log session-start entry to the JSONL iteration log.
+        # This makes it easy to find where a new orchestrator invocation
+        # begins when inspecting logs from multiple runs.
+        from datetime import datetime, timezone
+
+        session_start_entry = IterationEntry(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            iteration=0,
+            actor=Actor.SYSTEM,
+            task_label="—",
+            status=TaskStatus.SESSION_START,
+            payload={
+                "dev_session": self.dev_session_name,
+                "qa_session": self.qa_session_name,
+                "session_scope": self.session_scope.value,
+                "total_tasks": total_tasks,
+                "done_tasks": done_tasks,
+                "remaining": remaining,
+                "failed_reset": reset_count,
+                "task_file": str(self.task_file),
+                "model": self.model or "",
+                "provider": self.provider or "",
+                "max_iterations": self.max_iterations,
+                "max_turns": self.max_turns,
+            },
+        )
+        self.log.append(session_start_entry)
+        log.info(
+            "session.start",
+            dev_session=self.dev_session_name,
+            qa_session=self.qa_session_name,
+            failed_reset=reset_count,
+        )
+
+        # Auto-init VCS in subdirectories referenced by tasks
+        if self.vcs is not None:
+            assert self.cwd is not None  # VCS requires a working directory
+            untracked = self._scan_vcs_paths()
+            for path in untracked:
+                try:
+                    rel = path.relative_to(self.cwd)
+                except ValueError:
+                    rel = path
+                self.ui.print_info(f"VCS: auto-init git in {rel}")
+                try:
+                    self.vcs.init_subdir(path)
+                except RuntimeError as exc:
+                    log.warning("vcs.auto_init_failed", path=str(path), error=str(exc))
+                    self.ui.print_warning(
+                        f"VCS: failed to auto-init {path}: {exc}. "
+                        f"Files in this directory will not be VCS-tracked."
+                    )
 
         # Start live UI
         self.ui.init_progress()
@@ -433,6 +643,17 @@ class Orchestrator:
         # Final summary
         total_tasks = sum(p.total for p in self.phases)
         done_tasks = sum(p.completed for p in self.phases)
+
+        # Final memory summary
+        final_snap = snapshot()
+        if final_snap is not None:
+            final_dict = final_snap.to_dict()
+            log.info("memory.final", **final_dict)
+            if self._last_memory_snapshot is not None:
+                mem_delta = delta(self._last_memory_snapshot, final_snap)
+                log.info("memory.session_delta", **mem_delta)
+            self.ui.print_info(f"Final memory: {format_snapshot_human(final_snap)}")
+
         log.info(
             "orchestrator.finished",
             total_tasks=total_tasks,
@@ -456,7 +677,7 @@ class Orchestrator:
                     task_file=str(self.task_file),
                 )
                 self.ui.print_info("🏗️ ARCHITECT restructured tasks — reloading...")
-                self.phases = parse_task_file(self.task_file)
+                self.phases = load_tasks(self.task_file)
                 self._needs_reparse = False
 
                 total_tasks = sum(p.total for p in self.phases)
@@ -496,6 +717,14 @@ class Orchestrator:
                 phase_progress=f"{phase.completed}/{phase.total}",
                 global_iteration=self.global_iteration,
             )
+
+            # Log memory at task start
+            task_snap = snapshot()
+            if task_snap is not None:
+                log.info(
+                    "memory.task_start", task_label=task.label, **task_snap.to_dict()
+                )
+                self.ui.print_info(f"Memory: {format_snapshot_human(task_snap)}")
 
             self.ui.print_info(
                 f"\n{'=' * 60}\n"
@@ -654,6 +883,11 @@ class Orchestrator:
                     else None,
                     "raw": chat_result.raw_stdout[:300],
                 },
+                json_blocks_found=chat_result.json_blocks_found,
+                json_blocks_cascade=chat_result.json_blocks_cascade,
+                assistant_turns=chat_result.assistant_turns,
+                total_turns=chat_result.total_turns,
+                output_chars=chat_result.output_chars,
             )
             self.log.append(chat_entry)
             self.ui.add_iteration(chat_entry)
@@ -742,6 +976,11 @@ class Orchestrator:
         label = f"{icon} {name} — Task {task_label}"
         if detail:
             label += f"  ({detail})"
+        # Take a memory snapshot before launching goose
+        snap_before = snapshot()
+        if snap_before is not None:
+            log.info("memory.before_goose", **snap_before.to_dict())
+
         self.ui.activity_start(label)
         self.ui.set_pending_iteration(actor, task_label, detail=detail)
         try:
@@ -755,13 +994,110 @@ class Orchestrator:
                 provider=provider,
                 cwd=cwd,
                 rate_limit=self.rate_limit,
+                memory_limit=None,  # auto-detect from /proc/meminfo
             )
         finally:
             self.ui.clear_pending_iteration()
             self.ui.activity_stop()
+
+        # Take a memory snapshot after goose returns and log the delta
+        snap_after = snapshot()
+        if snap_after is not None:
+            after_dict = snap_after.to_dict()
+            log.info("memory.after_goose", **after_dict)
+            if snap_before is not None:
+                mem_delta = delta(snap_before, snap_after)
+                log.info("memory.goose_delta", **mem_delta)
+            self._last_memory_snapshot = snap_after
+            # Show memory state in the UI so it's always visible
+            self.ui.print_info(f"Memory: {format_snapshot_human(snap_after)}")
+
         return result
 
+    # ── Task context file ──────────────────────────────────────
+
+    _TASK_CONTEXT_FILENAME = ".tasker-context.json"
+
+    def _write_task_context(self, task: Task) -> None:
+        """Write a JSON file with the current task description to the project root.
+
+        The agent recipe instructs the agent to read this file first when starting
+        a task.  This gives the agent a durable "north star" that survives context
+        compaction, session recovery, and malformed-output retry cycles.
+
+        The file is removed when the task completes (approve / skip / max-iter).
+        """
+        import json
+
+        cwd = self.cwd or Path(".")
+        ctx_path = cwd / self._TASK_CONTEXT_FILENAME
+
+        payload = {
+            "task_label": task.label,
+            "task_text": task.text,
+            "phase_index": task.phase_index,
+            "task_index": task.task_index,
+            "subphase": task.subphase,
+            "timestamp": _now_iso(),
+        }
+
+        ctx_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        log.debug("task_context.written", path=str(ctx_path), task_label=task.label)
+
+    def _cleanup_task_context(self) -> None:
+        """Remove the task context file after task completion."""
+        cwd = self.cwd or Path(".")
+        ctx_path = cwd / self._TASK_CONTEXT_FILENAME
+        try:
+            if ctx_path.exists():
+                ctx_path.unlink()
+                log.debug("task_context.cleaned_up", path=str(ctx_path))
+        except OSError as exc:
+            log.warning(
+                "task_context.cleanup_failed", path=str(ctx_path), error=str(exc)
+            )
+
     # ── VCS integration methods ────────────────────────────────
+
+    def _scan_vcs_paths(self) -> list[Path]:
+        """Scan all task texts for directory references not tracked by git.
+
+        Iterates all tasks in ``self.phases``, extracts directory references
+        via ``_extract_dir_refs``, and returns sorted list of unique root
+        directories that are NOT inside a git working tree.
+        """
+        if self.vcs is None:
+            return []
+
+        assert self.cwd is not None  # VCS requires a working directory
+        candidates: set[Path] = set()
+        for phase in self.phases:
+            for task in phase.tasks:
+                refs = _extract_dir_refs(task.text, self.cwd)
+                candidates.update(refs)
+
+        if not candidates:
+            return []
+
+        import subprocess
+
+        untracked: list[Path] = []
+        for path in sorted(candidates):
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "--is-inside-work-tree"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=str(path),
+                )
+                if not result.returncode == 0:
+                    untracked.append(path)
+            except (subprocess.TimeoutExpired, OSError):
+                # If we can't check, assume it needs init
+                untracked.append(path)
+
+        return untracked
 
     def _vcs_begin_task(self, task: Task) -> None:
         """Create an isolated workspace for the task.
@@ -907,37 +1243,47 @@ class Orchestrator:
     def _finalize_task(self, phase: Phase, task: Task) -> None:
         """Mark a task as done, update the markdown file, then VCS-commit.
 
-        The order matters: update_markdown MUST run before _vcs_commit_task
+        The order matters: file update MUST run before _vcs_commit_task
         so that the [x] checkbox change is included in the VCS commit.
         Otherwise the markdown change lives only in the working tree and
         is never committed (git) or is lost on the next task's branch switch.
         """
         log.info("task.finalizing", task_label=task.label)
-        mark_task_done(task, self.phases)
-        update_markdown(self.task_file, self.phases)
-        log.debug(
-            "task.markdown_updated", task_label=task.label, file=str(self.task_file)
-        )
+        self._cleanup_task_context()
+        mark_done(self.task_file, task, self.phases)
+        log.debug("task.file_updated", task_label=task.label, file=str(self.task_file))
         self._vcs_commit_task(task)
         self.ui.update_phase(phase)
         self.ui.update_project(self.phases, phase)
         log.info("task.finalized", task_label=task.label)
 
-    def _skip_task(self, phase: Phase, task: Task) -> None:
-        """Mark task as skipped for this run without updating markdown.
+        # Log memory at task completion
+        done_snap = snapshot()
+        if done_snap is not None:
+            log.info("memory.task_done", task_label=task.label, **done_snap.to_dict())
+            if self._last_memory_snapshot is not None:
+                mem_delta = delta(self._last_memory_snapshot, done_snap)
+                log.info("memory.cumulative_delta", task_label=task.label, **mem_delta)
 
-        Called when max_iterations is reached without QA approval.
-        Leaves task as '[ ]' so it can be retried with better settings.
+    def _skip_task(self, phase: Phase, task: Task) -> None:
+        """Mark task as permanently failed and persist [~] to markdown.
+
+        Called when max_iterations is reached without QA approval, or when
+        the circuit breaker detects a structural failure (empty output).
+        Writes ``[~]`` to the markdown file so the task is permanently
+        skipped on subsequent tasker runs.
         """
         task.skipped = True
+        mark_task_failed(task, self.phases, self.task_file)
+        self._cleanup_task_context()
         log.warning(
             "task.skipped",
             task_label=task.label,
             reason="max_iterations_reached_without_approval",
         )
         self.ui.print_warning(
-            f"[{task.label}] ⚠ Skipped — max iterations reached without QA approval. "
-            f"Task remains incomplete ([ ]) and will be retried."
+            f"[{task.label}] ⚠ Skipped (marked [~] in markdown) — "
+            f"task will not be retried on next run."
         )
 
     def _decompose_task(self, task: Task) -> DecomposeResponse | None:
@@ -950,8 +1296,6 @@ class Orchestrator:
         """
         if not self.decompose_recipe:
             return None
-
-        from .goose import _extract_json_block
 
         self.ui.update_actor(Actor.QA, task.label, "analyzing task complexity")
         self.ui.print_info(f"[{task.label}] Decompose: analyzing task complexity...")
@@ -976,7 +1320,7 @@ class Orchestrator:
             detail="decompose",
         )
 
-        parsed = _extract_json_block(result.raw_stdout)
+        parsed = result.parsed_json
         response = _parse_decompose_response(result.raw_stdout, parsed)
 
         if response is None:
@@ -1013,6 +1357,11 @@ class Orchestrator:
             task_label=task.label,
             status=TaskStatus.ASSIGNED,
             payload=response.to_dict(),
+            json_blocks_found=result.json_blocks_found,
+            json_blocks_cascade=result.json_blocks_cascade,
+            assistant_turns=result.assistant_turns,
+            total_turns=result.total_turns,
+            output_chars=result.output_chars,
         )
         self.log.append(decompose_entry)
         self.ui.add_iteration(decompose_entry)
@@ -1179,10 +1528,7 @@ class Orchestrator:
             detail="stuckness diagnosis",
         )
 
-        # Parse the ARCH response
-        from .goose import _extract_json_block
-
-        parsed = _extract_json_block(arch_result.raw_stdout)
+        parsed = arch_result.parsed_json
         arch_response = _parse_arch_response(arch_result.raw_stdout, parsed)
 
         if arch_response is None:
@@ -1215,6 +1561,11 @@ class Orchestrator:
             task_label=task.label,
             status=TaskStatus.ASSIGNED,
             payload=arch_response.to_dict(),
+            json_blocks_found=arch_result.json_blocks_found,
+            json_blocks_cascade=arch_result.json_blocks_cascade,
+            assistant_turns=arch_result.assistant_turns,
+            total_turns=arch_result.total_turns,
+            output_chars=arch_result.output_chars,
         )
         self.log.append(arch_entry)
         self.ui.add_iteration(arch_entry)
@@ -1258,7 +1609,7 @@ class Orchestrator:
                 f"{len(texts)} subtask(s): {', '.join(labels)}"
             )
 
-            insert_subtasks(
+            insert_subtasks_dispatch(
                 self.task_file,
                 self.phases,
                 task,
@@ -1278,7 +1629,7 @@ class Orchestrator:
 
         elif action == ArchAction.CLARIFY.value:
             new_text = arch_response.new_task_text or task.text
-            rewrite_task_text(self.task_file, self.phases, task, new_text)
+            rewrite_text(self.task_file, self.phases, task, new_text)
 
             log.info(
                 "arch.clarified",
@@ -1428,23 +1779,33 @@ class Orchestrator:
         )
 
         truncation_detected = False
+        consecutive_empty = 0  # circuit breaker counter for empty-output failures
+
         while True:
             attempts_in_stage += 1
 
-            # Pick recovery instruction based on stage
+            # Pick recovery instruction based on stage — always include task context
+            # so the agent doesn't lose track of its task during recovery.
             recovery_instruction: str | None = None
             if stage == RecoveryStage.NORMAL and attempts_in_stage == 1:
                 recovery_instruction = None  # first call, no recovery needed
             elif stage == RecoveryStage.CONTINUE:
-                recovery_instruction = _RECOVERY_CONTINUE
+                recovery_instruction = _with_task_context(
+                    _RECOVERY_CONTINUE, task.label, task.text
+                )
             elif stage == RecoveryStage.SUBTASK:
-                recovery_instruction = (
+                base = (
                     _RECOVERY_TRUNCATION if truncation_detected else _RECOVERY_SUBTASK
                 )
+                recovery_instruction = _with_task_context(base, task.label, task.text)
             elif stage == RecoveryStage.SUMMARIZE:
-                recovery_instruction = _RECOVERY_SUMMARIZE
+                recovery_instruction = _with_task_context(
+                    _RECOVERY_SUMMARIZE, task.label, task.text
+                )
             elif stage == RecoveryStage.RESTART:
-                recovery_instruction = _RECOVERY_RESTART
+                recovery_instruction = _with_task_context(
+                    _RECOVERY_RESTART, task.label, task.text
+                )
 
             self.ui.update_actor(
                 Actor.DEV,
@@ -1505,6 +1866,15 @@ class Orchestrator:
                 cwd=self.cwd,
             )
 
+            # Log cascade event if multiple JSON blocks were found
+            if dev_result.json_blocks_cascade:
+                log.info(
+                    "json.cascade",
+                    task_label=task.label,
+                    actor="dev",
+                    blocks_found=dev_result.json_blocks_found,
+                )
+
             # Check for subprocess failure (crash, timeout)
             if not dev_result.success:
                 if dev_result.timed_out:
@@ -1533,6 +1903,11 @@ class Orchestrator:
                             "duration": dev_result.duration_secs,
                         },
                         raw_output=dev_result.raw_stderr[:500],
+                        json_blocks_found=dev_result.json_blocks_found,
+                        json_blocks_cascade=dev_result.json_blocks_cascade,
+                        assistant_turns=dev_result.assistant_turns,
+                        total_turns=dev_result.total_turns,
+                        output_chars=dev_result.output_chars,
                     )
                     self.log.append(dev_timeout_entry)
                     self.ui.add_iteration(dev_timeout_entry)
@@ -1568,6 +1943,11 @@ class Orchestrator:
                     status=TaskStatus.ERROR,
                     payload={"error": "subprocess_failed", "stage": stage.value},
                     raw_output=dev_result.raw_stderr[:500],
+                    json_blocks_found=dev_result.json_blocks_found,
+                    json_blocks_cascade=dev_result.json_blocks_cascade,
+                    assistant_turns=dev_result.assistant_turns,
+                    total_turns=dev_result.total_turns,
+                    output_chars=dev_result.output_chars,
                 )
                 self.log.append(dev_crash_entry)
                 self.ui.add_iteration(dev_crash_entry)
@@ -1645,7 +2025,21 @@ class Orchestrator:
                     else TaskStatus.IN_PROGRESS,
                     payload=dev_response.to_dict(),
                     raw_output=dev_result.raw_stdout[:500],
+                    json_blocks_found=dev_result.json_blocks_found,
+                    json_blocks_cascade=dev_result.json_blocks_cascade,
+                    assistant_turns=dev_result.assistant_turns,
+                    total_turns=dev_result.total_turns,
+                    output_chars=dev_result.output_chars,
                 )
+                # Check for checkpoint signal
+                if _is_checkpoint(dev_response):
+                    log.info(
+                        "dev.checkpoint",
+                        task_label=task.label,
+                        checkpoint_summary=dev_response.summary[:200],
+                    )
+                    dev_entry.checkpoint = True
+
                 self.log.append(dev_entry)
                 self.ui.add_iteration(dev_entry)
                 return dev_response
@@ -1656,19 +2050,50 @@ class Orchestrator:
                 task_label=task.label,
                 stage=stage.value,
                 attempt=f"{attempts_in_stage}/{stage.max_attempts}",
+                empty_output=dev_result.empty_output,
             )
             self.ui.print_warning(
                 f"[{task.label}] Dev did not return valid JSON (stage={stage.value}, "
                 f"attempt={attempts_in_stage}/{stage.max_attempts})"
             )
+
+            # Circuit breaker: if goose produced completely empty output,
+            # no amount of re-prompting will help — the failure is structural
+            # (goose never reached the LLM).  Count and break early.
+            if dev_result.empty_output:
+                consecutive_empty += 1
+                if consecutive_empty >= self.max_consecutive_empty:
+                    log.error(
+                        "dev.empty_output_circuit_breaker",
+                        task_label=task.label,
+                        consecutive_empty=consecutive_empty,
+                        max_consecutive_empty=self.max_consecutive_empty,
+                    )
+                    self.ui.print_error(
+                        f"[{task.label}] Circuit breaker: {consecutive_empty} consecutive "
+                        f"empty outputs — skipping remaining recovery stages"
+                    )
+                    break  # exit recovery loop → synthetic blocked
+            else:
+                consecutive_empty = 0  # reset on non-empty malformed output
+
             malformed_entry = IterationEntry(
                 timestamp=_now_iso(),
                 iteration=self.global_iteration,
                 actor=Actor.DEV,
                 task_label=task.label,
                 status=TaskStatus.ERROR,
-                payload={"error": "malformed_output", "stage": stage.value},
+                payload={
+                    "error": "malformed_output",
+                    "stage": stage.value,
+                    "empty_output": dev_result.empty_output,
+                },
                 raw_output=dev_result.raw_stdout[:500],
+                json_blocks_found=dev_result.json_blocks_found,
+                json_blocks_cascade=dev_result.json_blocks_cascade,
+                assistant_turns=dev_result.assistant_turns,
+                total_turns=dev_result.total_turns,
+                output_chars=dev_result.output_chars,
             )
             self.log.append(malformed_entry)
             self.ui.add_iteration(malformed_entry)
@@ -1764,6 +2189,11 @@ class Orchestrator:
             task_label=task.label,
             status=TaskStatus.BLOCKED,
             payload=synthetic.to_dict(),
+            json_blocks_found=0,
+            json_blocks_cascade=False,
+            assistant_turns=0,
+            total_turns=0,
+            output_chars=0,
         )
         self.log.append(synthetic_blocked_entry)
         self.ui.add_iteration(synthetic_blocked_entry)
@@ -1784,6 +2214,7 @@ class Orchestrator:
         """
         stage = QARecoveryStage.NORMAL
         attempts_in_stage = 0
+        consecutive_empty = 0  # circuit breaker counter for empty-output failures
 
         log.info(
             "qa.recovery_start",
@@ -1795,16 +2226,23 @@ class Orchestrator:
         while True:
             attempts_in_stage += 1
 
-            # Pick recovery instruction based on stage
+            # Pick recovery instruction based on stage — include task context
+            # so QA doesn't lose track of what it's reviewing during recovery.
             recovery_instruction: str | None = None
             if stage == QARecoveryStage.NORMAL and attempts_in_stage == 1:
                 recovery_instruction = None  # first call, no recovery needed
             elif stage == QARecoveryStage.CONTINUE:
-                recovery_instruction = _QA_RECOVERY_CONTINUE
+                recovery_instruction = _with_task_context(
+                    _QA_RECOVERY_CONTINUE, task.label, task.text
+                )
             elif stage == QARecoveryStage.SUMMARIZE:
-                recovery_instruction = _QA_RECOVERY_SUMMARIZE
+                recovery_instruction = _with_task_context(
+                    _QA_RECOVERY_SUMMARIZE, task.label, task.text
+                )
             elif stage == QARecoveryStage.RESTART:
-                recovery_instruction = _QA_RECOVERY_RESTART
+                recovery_instruction = _with_task_context(
+                    _QA_RECOVERY_RESTART, task.label, task.text
+                )
 
             # Inject recovery instruction into QA params
             params = qa_request.to_params()
@@ -1857,6 +2295,15 @@ class Orchestrator:
                 detail=detail or f"review [{stage.value}]",
             )
 
+            # Log cascade event if multiple JSON blocks were found
+            if qa_result.json_blocks_cascade:
+                log.info(
+                    "json.cascade",
+                    task_label=task.label,
+                    actor="qa",
+                    blocks_found=qa_result.json_blocks_found,
+                )
+
             # Check for subprocess failure (crash, timeout)
             if not qa_result.success:
                 if qa_result.timed_out:
@@ -1884,6 +2331,11 @@ class Orchestrator:
                             "stage": stage.value,
                         },
                         raw_output=qa_result.raw_stderr[:500],
+                        json_blocks_found=qa_result.json_blocks_found,
+                        json_blocks_cascade=qa_result.json_blocks_cascade,
+                        assistant_turns=qa_result.assistant_turns,
+                        total_turns=qa_result.total_turns,
+                        output_chars=qa_result.output_chars,
                     )
                     self.log.append(qa_timeout_entry)
                     self.ui.add_iteration(qa_timeout_entry)
@@ -1917,6 +2369,11 @@ class Orchestrator:
                         "stage": stage.value,
                     },
                     raw_output=qa_result.raw_stderr[:500],
+                    json_blocks_found=qa_result.json_blocks_found,
+                    json_blocks_cascade=qa_result.json_blocks_cascade,
+                    assistant_turns=qa_result.assistant_turns,
+                    total_turns=qa_result.total_turns,
+                    output_chars=qa_result.output_chars,
                 )
                 self.log.append(qa_crash_entry)
                 self.ui.add_iteration(qa_crash_entry)
@@ -1987,7 +2444,21 @@ class Orchestrator:
                     ),
                     payload=qa_response.to_dict(),
                     raw_output=qa_result.raw_stdout[:500],
+                    json_blocks_found=qa_result.json_blocks_found,
+                    json_blocks_cascade=qa_result.json_blocks_cascade,
+                    assistant_turns=qa_result.assistant_turns,
+                    total_turns=qa_result.total_turns,
+                    output_chars=qa_result.output_chars,
                 )
+                # Check for checkpoint signal
+                if _is_checkpoint(qa_response):
+                    log.info(
+                        "qa.checkpoint",
+                        task_label=task.label,
+                        checkpoint_summary=qa_response.feedback[:200],
+                    )
+                    qa_entry.checkpoint = True
+
                 self.log.append(qa_entry)
                 self.ui.add_iteration(qa_entry)
                 return qa_response
@@ -1998,19 +2469,49 @@ class Orchestrator:
                 task_label=task.label,
                 stage=stage.value,
                 attempt=f"{attempts_in_stage}/{stage.max_attempts}",
+                empty_output=qa_result.empty_output,
             )
             self.ui.print_warning(
                 f"[{task.label}] QA did not return valid JSON (stage={stage.value}, "
                 f"attempt={attempts_in_stage}/{stage.max_attempts})"
             )
+
+            # Circuit breaker: if goose produced completely empty output,
+            # no amount of re-prompting will help.
+            if qa_result.empty_output:
+                consecutive_empty += 1
+                if consecutive_empty >= self.max_consecutive_empty:
+                    log.error(
+                        "qa.empty_output_circuit_breaker",
+                        task_label=task.label,
+                        consecutive_empty=consecutive_empty,
+                        max_consecutive_empty=self.max_consecutive_empty,
+                    )
+                    self.ui.print_error(
+                        f"[{task.label}] QA circuit breaker: {consecutive_empty} consecutive "
+                        f"empty outputs — skipping remaining recovery stages"
+                    )
+                    break  # exit recovery loop → synthetic reject
+            else:
+                consecutive_empty = 0
+
             malformed_entry = IterationEntry(
                 timestamp=_now_iso(),
                 iteration=self.global_iteration,
                 actor=Actor.QA,
                 task_label=task.label,
                 status=TaskStatus.ERROR,
-                payload={"error": "malformed_output", "stage": stage.value},
+                payload={
+                    "error": "malformed_output",
+                    "stage": stage.value,
+                    "empty_output": qa_result.empty_output,
+                },
                 raw_output=qa_result.raw_stdout[:500],
+                json_blocks_found=qa_result.json_blocks_found,
+                json_blocks_cascade=qa_result.json_blocks_cascade,
+                assistant_turns=qa_result.assistant_turns,
+                total_turns=qa_result.total_turns,
+                output_chars=qa_result.output_chars,
             )
             self.log.append(malformed_entry)
             self.ui.add_iteration(malformed_entry)
@@ -2097,6 +2598,11 @@ class Orchestrator:
             task_label=task.label,
             status=TaskStatus.FEEDBACK,
             payload=synthetic.to_dict(),
+            json_blocks_found=0,
+            json_blocks_cascade=False,
+            assistant_turns=0,
+            total_turns=0,
+            output_chars=0,
         )
         self.log.append(synthetic_reject_entry)
         self.ui.add_iteration(synthetic_reject_entry)
@@ -2110,6 +2616,9 @@ class Orchestrator:
         through its own DEV→QA loop.  Otherwise the original task text is
         passed to DEV unchanged.
         """
+        # Write task context file so agents can re-orient after recovery
+        self._write_task_context(task)
+
         # Begin jj change for this task (covers all subtasks)
         self._vcs_begin_task(task)
 
@@ -2167,7 +2676,8 @@ class Orchestrator:
         # The label shown to the user and agents for this unit of work
         work_label = subtask_label or task.label
 
-        feedback: str | None = None  # None on first iteration
+        # feedback parameter carries prior feedback; reset on first iteration
+        # (already set from parameter)
 
         log.info(
             "feedback_loop.start",
@@ -2177,6 +2687,16 @@ class Orchestrator:
 
         for iteration in range(1, self.max_iterations + 1):
             self.global_iteration += 1
+
+            # ── Log memory state at the start of each iteration ──
+            iter_snap = snapshot()
+            if iter_snap is not None:
+                log.info(
+                    "memory.iteration_start",
+                    iteration=iteration,
+                    global_iteration=self.global_iteration,
+                    **iter_snap.to_dict(),
+                )
 
             # ── Deferred stuckness check: invoke ARCH if flagged last iteration ──
             if self._pending_arch_check and self.arch_recipe:
@@ -2252,6 +2772,40 @@ class Orchestrator:
                         notes="Auto-downgraded from 'done' due to empty VCS diff.",
                     )
 
+            # ── Handle dev started (checkpoint-only response) ──
+            # When the agent emitted only the checkpoint JSON and ran out of
+            # turns before producing a final answer, cascade extraction returns
+            # the "started" checkpoint as the sole JSON block.  This is NOT a
+            # blocker — the agent simply didn't finish.  Treat it as a soft
+            # "incomplete" so the next iteration retries (recovery will handle
+            # it), but do NOT increment stuckness or trigger QA triage.
+            if dev_response.status == "started":
+                log.info(
+                    "dev.checkpoint_only",
+                    task_label=task.label,
+                    iteration=iteration,
+                    note="Agent emitted checkpoint but no final JSON — will retry",
+                )
+                self.ui.print_info(
+                    f"[{work_label}] Dev emitted checkpoint only (no final JSON). "
+                    f"Will retry with recovery guidance."
+                )
+                # Do NOT increment stuckness counter — this is expected on long tasks
+                # Continue to next iteration with recovery feedback
+                feedback = (
+                    "## ⚠️ Checkpoint-Only Response\n\n"
+                    "Your previous invocation emitted the initial checkpoint JSON "
+                    'but did NOT produce a final JSON block with `status: "done"` '
+                    'or `status: "blocked"`.\n\n'
+                    "This usually means you ran out of turns before finishing.\n\n"
+                    "**What to do:**\n"
+                    "1. Pick up where you left off — do NOT start over.\n"
+                    "2. Focus on finishing quickly.\n"
+                    "3. Output the final JSON block as soon as possible.\n"
+                )
+                # Don't count this toward stuckness — it's a transient turn-budget issue
+                continue  # back to top of iteration loop → dev retry
+
             # ── Handle dev blocked ──
             if dev_response.status == "blocked":
                 # Track stuckness: ANY blocked event counts toward exhaustion.
@@ -2316,6 +2870,11 @@ class Orchestrator:
                     task_label=task.label,
                     status=TaskStatus.BLOCKED,
                     payload=qa_response.to_dict(),
+                    json_blocks_found=0,
+                    json_blocks_cascade=False,
+                    assistant_turns=0,
+                    total_turns=0,
+                    output_chars=0,
                 )
                 self.log.append(qa_blocked_entry)
                 self.ui.add_iteration(qa_blocked_entry)
@@ -2523,6 +3082,11 @@ class Orchestrator:
                             "error": "max_iterations_reached",
                             "arch_action": arch_response.action,
                         },
+                        json_blocks_found=0,
+                        json_blocks_cascade=False,
+                        assistant_turns=0,
+                        total_turns=0,
+                        output_chars=0,
                     )
                     self.log.append(max_iter_entry)
                     self.ui.add_iteration(max_iter_entry)
@@ -2541,6 +3105,11 @@ class Orchestrator:
             task_label=task.label,
             status=TaskStatus.ERROR,
             payload={"error": "max_iterations_reached"},
+            json_blocks_found=0,
+            json_blocks_cascade=False,
+            assistant_turns=0,
+            total_turns=0,
+            output_chars=0,
         )
         self.log.append(max_iter_entry)
         self.ui.add_iteration(max_iter_entry)

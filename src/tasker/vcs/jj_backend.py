@@ -146,6 +146,10 @@ class JJBackend:
             logger.error("Failed to commit task: %s", result.stderr)
             raise RuntimeError(f"jj commit failed: {result.stderr}")
 
+    def init_subdir(self, subdir: Path) -> None:
+        """No-op for jj backend — auto-init is only supported for git."""
+        logger.debug("init_subdir is a no-op for jj backend (path=%s)", subdir)
+
 
 # ── Standalone helpers (used by tests and diagnostics) ────────────
 

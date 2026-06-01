@@ -85,27 +85,30 @@ def test_logger():
 
 
 def test_json_extraction():
-    from tasker.goose import _extract_json_block
+    from tasker.goose import _extract_json_blocks
 
     # Fenced code block
     text1 = 'Some text\n```json\n{"status": "done", "summary": "ok"}\n```\nmore text'
-    result1 = _extract_json_block(text1)
-    assert result1 == {"status": "done", "summary": "ok"}
+    blocks1 = _extract_json_blocks(text1)
+    assert len(blocks1) == 1
+    assert blocks1[0] == {"status": "done", "summary": "ok"}
 
     # Raw JSON
     text2 = '{"decision": "approve", "feedback": "LGTM", "concerns": []}'
-    result2 = _extract_json_block(text2)
-    assert result2 == {"decision": "approve", "feedback": "LGTM", "concerns": []}
+    blocks2 = _extract_json_blocks(text2)
+    assert len(blocks2) == 1
+    assert blocks2[0] == {"decision": "approve", "feedback": "LGTM", "concerns": []}
 
     # Last brace fallback
     text3 = 'Blah blah\n{"status": "done"}'
-    result3 = _extract_json_block(text3)
-    assert result3 == {"status": "done"}
+    blocks3 = _extract_json_blocks(text3)
+    assert len(blocks3) == 1
+    assert blocks3[0] == {"status": "done"}
 
     # No JSON
     text4 = "Just plain text, no json here"
-    result4 = _extract_json_block(text4)
-    assert result4 is None
+    blocks4 = _extract_json_blocks(text4)
+    assert len(blocks4) == 0
 
     print("✓ JSON extraction tests passed")
 
@@ -443,7 +446,7 @@ def test_envelope_extraction():
     """Test that the goose JSON envelope is properly unwrapped."""
     from tasker.goose import _extract_last_assistant_text
 
-    # Valid envelope with assistant message
+    # Valid envelope with assistant message after user message
     envelope = json.dumps(
         {
             "messages": [
@@ -460,12 +463,16 @@ def test_envelope_extraction():
             ]
         }
     )
-    result = _extract_last_assistant_text(envelope)
+    result, empty, asst_turns, total_turns = _extract_last_assistant_text(envelope)
+    assert not empty, "Should not be empty when assistant messages exist after user"
     assert '{"status": "done"' in result
     assert "I did it" in result
+    assert asst_turns == 1
+    assert total_turns == 2
 
-    # Envelope with multiple assistant messages
-    envelope2 = json.dumps(
+    # Envelope with assistant messages but NO user message — stale guard
+    # All assistant messages are "old history" since there's no user message
+    envelope_stale = json.dumps(
         {
             "messages": [
                 {
@@ -479,9 +486,58 @@ def test_envelope_extraction():
             ]
         }
     )
-    result2 = _extract_last_assistant_text(envelope2)
+    result_stale, empty_stale, asst_stale, total_stale = _extract_last_assistant_text(
+        envelope_stale
+    )
+    assert empty_stale, (
+        "Should flag as empty when all assistant msgs are stale (no user msg)"
+    )
+    assert result_stale == "", "Stale output should return empty text"
+    assert asst_stale == 0, "Stale output should report 0 assistant_turns"
+    assert total_stale == 2, "Stale output should still report total_turns"
+
+    # Envelope with user then assistant — new assistant after user
+    envelope2 = json.dumps(
+        {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "go"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "thinking..."}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": '{"status": "done"}'}],
+                },
+            ]
+        }
+    )
+    result2, empty2, asst2, total2 = _extract_last_assistant_text(envelope2)
+    assert not empty2
     assert "thinking..." in result2
     assert '{"status": "done"}' in result2
+    assert asst2 == 2
+    assert total2 == 3
+
+    # Stale-only output: assistant before user, none after
+    envelope_stale2 = json.dumps(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": '{"status": "old"}'}],
+                },
+                {"role": "user", "content": [{"type": "text", "text": "new prompt"}]},
+            ]
+        }
+    )
+    result_s2, empty_s2, asst_s2, total_s2 = _extract_last_assistant_text(
+        envelope_stale2
+    )
+    assert empty_s2, "Should flag as stale when assistant msgs only before user"
+    assert result_s2 == ""
+    assert asst_s2 == 0
+    assert total_s2 == 2
 
     # Envelope with only user messages (goose errored before agent responded)
     envelope_no_assistant = json.dumps(
@@ -491,19 +547,32 @@ def test_envelope_extraction():
             ]
         }
     )
-    result_no_asst = _extract_last_assistant_text(envelope_no_assistant)
+    result_no_asst, empty_flag, asst_no, total_no = _extract_last_assistant_text(
+        envelope_no_assistant
+    )
     assert result_no_asst == "", (
         f"Expected empty string for envelope with no assistant messages, got: {result_no_asst!r}"
     )
+    assert empty_flag, "Should flag as empty when no assistant messages"
+    assert asst_no == 0
+    assert total_no == 1
 
     # Empty messages list
     envelope_empty = json.dumps({"messages": []})
-    result_empty = _extract_last_assistant_text(envelope_empty)
+    result_empty, empty_empty, asst_empty, total_empty = _extract_last_assistant_text(
+        envelope_empty
+    )
     assert result_empty == ""
+    assert empty_empty, "Should flag as empty when messages list is empty"
+    assert asst_empty == 0
+    assert total_empty == 0
 
     # Not JSON — fallback to raw
-    result3 = _extract_last_assistant_text("plain text output")
+    result3, empty3, asst3, total3 = _extract_last_assistant_text("plain text output")
     assert result3 == "plain text output"
+    assert not empty3, "Plain text fallback should not be flagged as empty"
+    assert asst3 == 0
+    assert total3 == 0
 
     print("✓ Envelope extraction tests passed")
 
@@ -1517,7 +1586,7 @@ def test_monitoring_orchestrator_events_captured():
         assert "task.finalizing" in content, (
             f"Expected 'task.finalizing' in log, got:\n{content}"
         )
-        assert "task.markdown_updated" in content
+        assert "task.file_updated" in content
         assert "task.finalized" in content
         assert "P1.T1" in content
 
@@ -2122,6 +2191,113 @@ def test_pending_iteration_dataclass():
 # ── 48. Test Subtask and DecomposeResponse models ────────────────
 
 
+# ── 48b. Test schema.py Pydantic models ─────────────────────────
+
+
+def test_schema_dev_response_valid_done():
+    """Construct DevResponse with status='done', verify roundtrip via model_dump_json()."""
+    from tasker.schema import DevResponse
+
+    resp = DevResponse(
+        status="done",
+        summary="Implemented feature X",
+        files_modified=["src/foo.rs", "src/bar.rs"],
+        notes="All good",
+    )
+    json_str = resp.model_dump_json()
+    parsed = json.loads(json_str)
+    assert parsed["status"] == "done"
+    assert parsed["summary"] == "Implemented feature X"
+    assert parsed["files_modified"] == ["src/foo.rs", "src/bar.rs"]
+    assert parsed["notes"] == "All good"
+
+
+def test_schema_dev_response_valid_blocked():
+    """Construct DevResponse with status='blocked', verify roundtrip."""
+    from tasker.schema import DevResponse
+
+    resp = DevResponse(
+        status="blocked",
+        summary="Could not proceed",
+        files_modified=[],
+        notes="Need clarification",
+        blocker_description="Missing spec",
+        blocker_suggestion="Ask the user",
+    )
+    json_str = resp.model_dump_json()
+    parsed = json.loads(json_str)
+    assert parsed["status"] == "blocked"
+    assert parsed["blocker_description"] == "Missing spec"
+    assert parsed["blocker_suggestion"] == "Ask the user"
+
+
+def test_schema_dev_response_invalid_status():
+    """Verify status='unknown' raises ValidationError."""
+    from pydantic import ValidationError
+    from tasker.schema import DevResponse
+
+    try:
+        DevResponse(status="unknown", summary="test")  # ty: ignore[invalid-argument-type]
+        assert False, "Should have raised ValidationError"
+    except ValidationError:
+        pass
+
+
+def test_schema_qa_response_all_decisions():
+    """Verify all three literal decision values are accepted."""
+    from tasker.schema import QAResponse
+
+    for decision in ("approve", "reject", "needs_user_input"):
+        resp = QAResponse(
+            decision=decision, feedback="Looks good", concerns=["minor issue"]
+        )
+        json_str = resp.model_dump_json()
+        parsed = json.loads(json_str)
+        assert parsed["decision"] == decision
+
+
+def test_schema_qa_response_invalid_decision():
+    """Verify invalid decision raises ValidationError."""
+    from pydantic import ValidationError
+    from tasker.schema import QAResponse
+
+    try:
+        QAResponse(decision="maybe", feedback="unsure")  # ty: ignore[invalid-argument-type]
+        assert False, "Should have raised ValidationError"
+    except ValidationError:
+        pass
+
+
+def test_schema_decompose_response():
+    """Verify DecomposeResponse roundtrip serialization."""
+    from tasker.schema import DecomposeResponse, SubtaskSchema
+
+    resp = DecomposeResponse(
+        should_decompose=True,
+        reason="Task spans multiple modules",
+        subtasks=[
+            SubtaskSchema(label="P1.T3.1", text="Part A"),
+            SubtaskSchema(label="P1.T3.2", text="Part B"),
+        ],
+    )
+    json_str = resp.model_dump_json()
+    parsed = json.loads(json_str)
+    assert parsed["should_decompose"] is True
+    assert len(parsed["subtasks"]) == 2
+    assert parsed["subtasks"][0]["label"] == "P1.T3.1"
+
+
+def test_schema_arch_response_all_actions():
+    """Verify all four literal action values are accepted."""
+    from tasker.schema import ArchResponse
+
+    for action in ("recompose", "clarify", "skip", "retry"):
+        resp = ArchResponse(action=action, reason=f"Reason for {action}")
+        json_str = resp.model_dump_json()
+        parsed = json.loads(json_str)
+        assert parsed["action"] == action
+
+
 def test_decompose_models():
     """Test Subtask and DecomposeResponse construction and serialization."""
     from tasker.models import Subtask, DecomposeResponse
@@ -2169,6 +2345,130 @@ def test_decompose_models():
     assert resp_default.subtasks == []
 
     print("✓ DecomposeResponse and Subtask model tests passed")
+
+
+# ── P4.T1: Pydantic-backed _parse_*_response unit tests ──────────
+
+
+def test_parse_dev_response_pydantic_valid():
+    """Valid dict with all fields → DevResponse returned via Pydantic path."""
+    from tasker.orchestrator import _parse_dev_response
+
+    parsed = {
+        "status": "done",
+        "summary": "Implemented feature X",
+        "files_modified": ["src/foo.rs", "src/bar.rs"],
+        "notes": "All good",
+        "blocker_description": "",
+        "blocker_suggestion": "",
+    }
+    result = _parse_dev_response("", parsed)
+    assert result is not None
+    assert result.status == "done"
+    assert result.summary == "Implemented feature X"
+    assert result.files_modified == ["src/foo.rs", "src/bar.rs"]
+    assert result.notes == "All good"
+
+
+def test_parse_dev_response_pydantic_invalid_status_fallback():
+    """Dict with status='unknown' → returns None (both Pydantic and ad-hoc reject it)."""
+    from tasker.orchestrator import _parse_dev_response
+
+    parsed = {"status": "unknown", "summary": "test"}
+    result = _parse_dev_response("", parsed)
+    assert result is None
+
+
+def test_parse_dev_response_extra_fields():
+    """Valid dict plus extra unknown fields → DevResponse returned (Pydantic ignores extras)."""
+    from tasker.orchestrator import _parse_dev_response
+
+    parsed = {
+        "status": "done",
+        "summary": "Did work",
+        "files_modified": ["src/a.rs"],
+        "notes": "",
+        "blocker_description": "",
+        "blocker_suggestion": "",
+        "extra_field": "should be ignored",
+        "another_unknown": 42,
+    }
+    result = _parse_dev_response("", parsed)
+    assert result is not None
+    assert result.status == "done"
+    assert result.summary == "Did work"
+    assert result.files_modified == ["src/a.rs"]
+    # Ensure the result is a dataclass DevResponse, not the Pydantic model
+    from tasker.models import DevResponse
+
+    assert isinstance(result, DevResponse)
+
+
+def test_parse_qa_response_pydantic_valid():
+    """Valid QA dict → QAResponse returned via Pydantic path."""
+    from tasker.orchestrator import _parse_qa_response
+
+    parsed = {
+        "decision": "approve",
+        "feedback": "Looks good",
+        "concerns": ["minor style issue"],
+        "user_question": "",
+    }
+    result = _parse_qa_response("", parsed)
+    assert result is not None
+    assert result.decision == "approve"
+    assert result.feedback == "Looks good"
+    assert result.concerns == ["minor style issue"]
+    assert result.user_question == ""
+
+
+def test_parse_qa_response_invalid_decision():
+    """Dict with decision='maybe' → returns None (both Pydantic and ad-hoc reject it)."""
+    from tasker.orchestrator import _parse_qa_response
+
+    parsed = {"decision": "maybe", "feedback": "unsure"}
+    result = _parse_qa_response("", parsed)
+    assert result is None
+
+
+def test_parse_decompose_response_pydantic_valid():
+    """Valid dict → DecomposeResponse returned via Pydantic path."""
+    from tasker.orchestrator import _parse_decompose_response
+
+    parsed = {
+        "should_decompose": True,
+        "reason": "Task spans multiple modules",
+        "subtasks": [
+            {"label": "P1.T3.1", "text": "Part A"},
+            {"label": "P1.T3.2", "text": "Part B"},
+        ],
+    }
+    result = _parse_decompose_response("", parsed)
+    assert result is not None
+    assert result.should_decompose is True
+    assert result.reason == "Task spans multiple modules"
+    assert len(result.subtasks) == 2
+    assert result.subtasks[0].label == "P1.T3.1"
+    assert result.subtasks[1].text == "Part B"
+
+
+def test_parse_arch_response_pydantic_valid():
+    """Valid dict → ArchResponse returned via Pydantic path."""
+    from tasker.orchestrator import _parse_arch_response
+
+    parsed = {
+        "action": "clarify",
+        "reason": "Task description is ambiguous",
+        "subtasks": [],
+        "new_task_text": "Rewritten task description",
+        "max_iterations_override": None,
+    }
+    result = _parse_arch_response("", parsed)
+    assert result is not None
+    assert result.action == "clarify"
+    assert result.reason == "Task description is ambiguous"
+    assert result.new_task_text == "Rewritten task description"
+    assert result.max_iterations_override is None
 
 
 # ── 49. Test _parse_decompose_response ───────────────────────────
@@ -2293,6 +2593,14 @@ def test_decompose_task():
             '{"label": "P1.T3.2", "text": "Build SpatialIndex"}]}',
             raw_stderr="",
             return_code=0,
+            parsed_json={
+                "should_decompose": True,
+                "reason": "2 modules",
+                "subtasks": [
+                    {"label": "P1.T3.1", "text": "Build GridCell"},
+                    {"label": "P1.T3.2", "text": "Build SpatialIndex"},
+                ],
+            },
         )
         with patch("tasker.goose.run_goose", return_value=fake_decompose):
             result_yes = orch_enabled._decompose_task(task)
@@ -2309,6 +2617,11 @@ def test_decompose_task():
             raw_stdout='{"should_decompose": false, "reason": "Simple task", "subtasks": []}',
             raw_stderr="",
             return_code=0,
+            parsed_json={
+                "should_decompose": False,
+                "reason": "Simple task",
+                "subtasks": [],
+            },
         )
         with patch("tasker.goose.run_goose", return_value=fake_no_split):
             result_no = orch_enabled._decompose_task(task)
@@ -2323,6 +2636,7 @@ def test_decompose_task():
             raw_stdout="I could not determine the complexity.",
             raw_stderr="",
             return_code=0,
+            parsed_json=None,
         )
         with patch("tasker.goose.run_goose", return_value=fake_garbage):
             result_fallback = orch_enabled._decompose_task(task)
@@ -2931,6 +3245,23 @@ if __name__ == "__main__":
     test_spinner_frames()
     test_pending_iteration_dataclass()
     test_decompose_models()
+    test_schema_dev_response_valid_done()
+    test_schema_dev_response_valid_blocked()
+    test_schema_dev_response_invalid_status()
+    test_schema_qa_response_all_decisions()
+    test_schema_qa_response_invalid_decision()
+    test_schema_decompose_response()
+    test_schema_arch_response_all_actions()
+
+    # P4.T1: Pydantic-backed _parse_*_response tests
+    test_parse_dev_response_pydantic_valid()
+    test_parse_dev_response_pydantic_invalid_status_fallback()
+    test_parse_dev_response_extra_fields()
+    test_parse_qa_response_pydantic_valid()
+    test_parse_qa_response_invalid_decision()
+    test_parse_decompose_response_pydantic_valid()
+    test_parse_arch_response_pydantic_valid()
+
     test_parse_decompose_response()
     test_decompose_task()
     test_dev_override_task_text()
@@ -2941,7 +3272,7 @@ if __name__ == "__main__":
     test_truncation_detection()
     test_dev_truncation_fast_forward()
     test_dev_truncation_suppresses_task_text()
-    print("\n✅ All 58 dry-run tests passed!")
+    print("\n✅ All 65 dry-run tests passed!")
 # ── ARCH (Architect) agent tests ──────────────────────────────────
 
 
@@ -3710,8 +4041,8 @@ def test_max_turns_passed_to_dev_request():
     print("✓ test_max_turns_passed_to_dev_request passed")
 
 
-def test_skip_task_leaves_markdown_unchanged():
-    """_skip_task does not mark task [x] — leaves it as [ ] for retry."""
+def test_skip_task_persists_failed_marker():
+    """_skip_task marks task as [~] in markdown so it won't be retried."""
     import tempfile
     from unittest.mock import patch
     from tasker.orchestrator import Orchestrator
@@ -3749,18 +4080,19 @@ def test_skip_task_leaves_markdown_unchanged():
                     with patch.object(orch, "_decompose_task", return_value=None):
                         orch._process_task(phase, task)
 
-        # Task must still be [ ] not [x]
+        # Task must be marked [~] (failed) not [x] (completed) or [ ] (pending)
         content = Path(md_path).read_text()
-        assert "- [ ] T1" in content, (
-            "Task should remain [ ] after max_iterations without approval"
+        assert "- [~] T1" in content, (
+            "Task should be marked [~] (failed) after max_iterations without approval"
         )
         assert "- [x] T1" not in content, (
             "Task must NOT be marked [x] when skipped due to max_iterations"
         )
-        # task.skipped must be set
+        # task.skipped and task.failed must both be set
         assert task.skipped is True
+        assert task.failed is True
 
-    print("✓ test_skip_task_leaves_markdown_unchanged passed")
+    print("✓ test_skip_task_persists_failed_marker passed")
 
 
 def test_max_iterations_triggers_arch_review():
@@ -3899,7 +4231,7 @@ def run_bugfix_tests():
     test_recovery_prompts_anti_fabrication()
     test_recovery_prompts_no_file_reads()
     test_max_turns_passed_to_dev_request()
-    test_skip_task_leaves_markdown_unchanged()
+    test_skip_task_persists_failed_marker()
     test_only_qa_approval_marks_done()
     test_max_iterations_triggers_arch_review()
     print("\n✅ All 12 bug-fix tests passed!")
@@ -4115,15 +4447,196 @@ def test_vcs_get_diff_failure_returns_empty():
     print("✓ test_vcs_get_diff_failure_returns_empty passed")
 
 
+def test_pythonpath_injected_in_env():
+    """run_goose() injects tasker's src/ into PYTHONPATH and preserves existing value."""
+    import os
+    from pathlib import Path
+    from unittest.mock import patch, MagicMock
+
+    from tasker.goose import run_goose
+
+    captured_env: dict[str, str] = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured_env.update(kwargs.get("env", {}))
+        proc = MagicMock()
+        proc.communicate.return_value = (b"", b"")
+        proc.returncode = 0
+        return proc
+
+    original_pythonpath = os.environ.get("PYTHONPATH", "")
+    try:
+        # Set a pre-existing PYTHONPATH to verify it's preserved
+        os.environ["PYTHONPATH"] = "/my/existing/path"
+        with patch("tasker.goose.subprocess.Popen", side_effect=fake_popen):
+            with patch("tasker.goose._systemd_run_available", return_value=False):
+                run_goose(
+                    recipe_path="/dev/null",
+                    session_name="test_pythonpath",
+                )
+    finally:
+        if original_pythonpath:
+            os.environ["PYTHONPATH"] = original_pythonpath
+        else:
+            os.environ.pop("PYTHONPATH", None)
+
+    assert "PYTHONPATH" in captured_env, (
+        "PYTHONPATH should be set in the subprocess env"
+    )
+
+    tasker_src = str(Path(__file__).resolve().parent.parent / "src")
+    pythonpath = captured_env["PYTHONPATH"]
+    assert pythonpath.startswith(tasker_src), (
+        f"PYTHONPATH should start with tasker src dir, got: {pythonpath}"
+    )
+    # Existing PYTHONPATH should be preserved as a suffix
+    assert "/my/existing/path" in pythonpath, (
+        f"PYTHONPATH should preserve existing value, got: {pythonpath}"
+    )
+    print("✓ test_pythonpath_injected_in_env passed")
+
+
 def run_e2big_tests():
     test_e2big_detected_in_run_goose()
     test_e2big_not_confused_with_other_oserror()
+    test_pythonpath_injected_in_env()
     test_vcs_get_diff_returns_tuple()
     test_vcs_get_diff_empty_returns_empty_tuple()
     test_vcs_get_diff_large_diff_writes_temp_file()
     test_vcs_get_diff_no_vcs_returns_empty()
     test_vcs_get_diff_failure_returns_empty()
-    print("\n✅ All 7 E2BIG/diff-size tests passed!")
+    print("\n✅ All 8 E2BIG/diff-size tests passed!")
+
+
+# ── _extract_json_blocks tests ──────────────────────────────────────
+
+
+def test_extract_blocks_single_bare_json():
+    """A single bare JSON dict should produce exactly one block."""
+    from tasker.goose import _extract_json_blocks
+
+    blocks = _extract_json_blocks('{"a":1}')
+    assert len(blocks) == 1
+    assert blocks[0] == {"a": 1}
+
+
+def test_extract_blocks_fenced_json():
+    """A fenced ```json ... ``` block should produce exactly one block."""
+    from tasker.goose import _extract_json_blocks
+
+    blocks = _extract_json_blocks('```json\n{"a":1}\n```')
+    assert len(blocks) == 1
+    assert blocks[0] == {"a": 1}
+
+
+def test_extract_blocks_multiple_ordered():
+    """Two valid JSON dicts should be returned in document order."""
+    from tasker.goose import _extract_json_blocks
+
+    text = '{"first": 1} some text {"second": 2}'
+    blocks = _extract_json_blocks(text)
+    assert len(blocks) == 2
+    assert blocks[0] == {"first": 1}
+    assert blocks[1] == {"second": 2}
+
+
+def test_extract_blocks_last_malformed_cascades():
+    """A valid block followed by truncated JSON should return only the valid block."""
+    from tasker.goose import _extract_json_blocks
+
+    text = '{"valid": true} trailing {"a":'
+    blocks = _extract_json_blocks(text)
+    assert len(blocks) == 1
+    assert blocks[0] == {"valid": True}
+
+
+def test_extract_blocks_no_json():
+    """Plain text with no JSON should return an empty list."""
+    from tasker.goose import _extract_json_blocks
+
+    blocks = _extract_json_blocks("just some plain text here")
+    assert blocks == []
+
+
+def test_extract_blocks_nested_braces():
+    """A dict with nested braces should be returned as a single valid dict."""
+    from tasker.goose import _extract_json_blocks
+
+    blocks = _extract_json_blocks('{"a":{"b":2}}')
+    assert len(blocks) == 1
+    assert blocks[0] == {"a": {"b": 2}}
+
+
+def test_extract_blocks_empty_string():
+    """An empty string should return an empty list."""
+    from tasker.goose import _extract_json_blocks
+
+    blocks = _extract_json_blocks("")
+    assert blocks == []
+
+
+def test_session_resume_cascade_from_history():
+    """Two assistant messages concatenated: first has a valid started checkpoint, second has
+    truncated JSON. _extract_json_blocks should return exactly one valid block (the checkpoint),
+    not the malformed one. Verifies cascade works correctly across multi-message concatenated text.
+
+    Ref: 06-open-questions.md#Q5
+    """
+    from tasker.goose import _extract_json_blocks
+
+    # Simulate what happens when _extract_last_assistant_text concatenates
+    # multiple assistant turns into a single string.
+    first_assistant = '{"status":"started","summary":"checkpoint","files_modified":[],"notes":"checkpoint"}'
+    second_assistant = '{"status":"done","summary":"incomplete'
+    concatenated = first_assistant + "\n" + second_assistant
+
+    blocks = _extract_json_blocks(concatenated)
+    assert len(blocks) == 1, (
+        f"Expected exactly 1 valid block (the checkpoint), got {len(blocks)}: {blocks}"
+    )
+    assert blocks[0]["status"] == "started", (
+        f"Expected status='started' from checkpoint, got {blocks[0]['status']!r}"
+    )
+    assert blocks[0]["summary"] == "checkpoint", (
+        f"Expected summary='checkpoint', got {blocks[0]['summary']!r}"
+    )
+
+
+def test_cascade_flag_set_in_goose_result():
+    """When assistant_text has a valid block followed by a malformed one, GooseRunResult
+    should have json_blocks_cascade == True and json_blocks_found == 1."""
+    from tasker.goose import GooseRunResult
+
+    # Simulate the scenario: valid block then malformed trailing content
+    result = GooseRunResult(
+        success=True,
+        raw_stdout='{"status": "done"} trailing {"a":',
+        raw_stderr="",
+        return_code=0,
+        parsed_json={"status": "done"},
+        duration_secs=1.0,
+        timed_out=False,
+        raw_envelope="",
+        empty_output=False,
+        json_blocks_found=1,
+        json_blocks_cascade=True,
+    )
+    assert result.json_blocks_found == 1
+    assert result.json_blocks_cascade is True
+    assert result.parsed_json == {"status": "done"}
+
+
+def run_json_blocks_tests():
+    test_extract_blocks_single_bare_json()
+    test_extract_blocks_fenced_json()
+    test_extract_blocks_multiple_ordered()
+    test_extract_blocks_last_malformed_cascades()
+    test_extract_blocks_no_json()
+    test_extract_blocks_nested_braces()
+    test_extract_blocks_empty_string()
+    test_session_resume_cascade_from_history()
+    test_cascade_flag_set_in_goose_result()
+    print("\n✅ All 9 _extract_json_blocks tests passed!")
 
 
 # ── Run all ARCH tests ─────────────────────────────────────────────
@@ -4143,7 +4656,835 @@ def run_arch_tests():
     print("\n✅ All 10 ARCH tests passed!")
 
 
-# ── Run all ───────────────────────────────────────────────────────
+# ── P5.T1 — IterationEntry serialization, metrics, checkpoint tests ──
+
+
+def test_iteration_entry_new_fields_serialized():
+    """IterationEntry.to_dict() includes all new fields when set to non-default values."""
+    from tasker.models import IterationEntry, Actor, TaskStatus
+
+    entry = IterationEntry(
+        timestamp="2026-01-01T00:00:00Z",
+        iteration=1,
+        actor=Actor.DEV,
+        task_label="P1.T1",
+        status=TaskStatus.BLOCKED,
+        checkpoint=True,
+        json_blocks_found=3,
+        json_blocks_cascade=True,
+        assistant_turns=5,
+        total_turns=10,
+        output_chars=2048,
+    )
+    d = entry.to_dict()
+    assert d["checkpoint"] is True
+    assert d["json_blocks_found"] == 3
+    assert d["json_blocks_cascade"] is True
+    assert d["assistant_turns"] == 5
+    assert d["total_turns"] == 10
+    assert d["output_chars"] == 2048
+
+
+def test_iteration_entry_defaults_omitted():
+    """IterationEntry.to_dict() omits new keys when left at defaults."""
+    from tasker.models import IterationEntry, Actor, TaskStatus
+
+    entry = IterationEntry(
+        timestamp="2026-01-01T00:00:00Z",
+        iteration=1,
+        actor=Actor.DEV,
+        task_label="P1.T1",
+        status=TaskStatus.APPROVED,
+    )
+    d = entry.to_dict()
+    for key in (
+        "checkpoint",
+        "json_blocks_found",
+        "json_blocks_cascade",
+        "assistant_turns",
+        "total_turns",
+        "output_chars",
+    ):
+        assert key not in d, (
+            f"Key '{key}' should be omitted at defaults but was present"
+        )
+
+
+def test_extract_last_assistant_text_returns_metrics():
+    """_extract_last_assistant_text returns correct assistant_turns and total_turns."""
+    from tasker.goose import _extract_last_assistant_text
+    import json
+
+    envelope = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": [{"type": "text", "text": "do work"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "result"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "more result"}]},
+        ]
+    }
+    text, empty, assistant_turns, total_turns = _extract_last_assistant_text(
+        json.dumps(envelope)
+    )
+    assert not empty
+    assert assistant_turns == 3  # 3 assistant messages total
+    assert total_turns == 5  # 5 messages total
+    # Only messages after the last user message should be in the text
+    assert "result" in text
+    assert "more result" in text
+
+
+def test_session_resume_ignores_old_checkpoint():
+    """When goose returns session history with old checkpoints but no new output, old JSON is NOT extracted.
+
+    Ref: 06-open-questions.md#Q5 — verifies the stale-output guard in _extract_last_assistant_text.
+    The envelope contains an old assistant message with a blocked JSON block, followed by a
+    user message (recovery instruction), but NO new assistant message. The function must
+    return empty_flag=True and text="" so the stale JSON block is not misinterpreted as
+    the current iteration's response.
+    """
+    from tasker.goose import _extract_last_assistant_text
+    import json
+
+    envelope = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '```json\n{"status":"started","summary":"old","files_modified":[],"notes":"checkpoint"}\n```',
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Recovery instruction: continue working on the task.",
+                    }
+                ],
+            },
+        ]
+    }
+    text, empty_flag, assistant_turns, total_turns = _extract_last_assistant_text(
+        json.dumps(envelope)
+    )
+    assert empty_flag is True, (
+        f"Expected empty_flag=True (stale output guard), got {empty_flag!r}"
+    )
+    assert text == "", (
+        f"Expected empty text (old checkpoint must not leak), got: {text!r}"
+    )
+    assert assistant_turns == 0, (
+        f"Expected 0 assistant_turns (stale guard zeros them), got {assistant_turns}"
+    )
+    assert total_turns == 2
+
+
+def test_session_resume_new_checkpoint_wins():
+    """When goose returns session history with old checkpoint BUT also new output, new wins (last-wins).
+
+    Ref: 06-open-questions.md#Q5 — verifies that _extract_last_assistant_text returns
+    the NEW assistant message text when both old and new checkpoints exist in the
+    envelope. The old blocked JSON block should NOT be returned; the new done JSON
+    block should be the one extracted via _extract_json_blocks.
+    """
+    from tasker.goose import _extract_last_assistant_text, _extract_json_blocks
+    import json
+
+    envelope = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '```json\n{"status":"started","summary":"old","files_modified":[],"notes":"checkpoint"}\n```',
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Recovery instruction: continue working on the task.",
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": 'Here is the final result:\n```json\n{"status":"done","summary":"new","files_modified":["src/main.rs"],"notes":"completed"}\n```',
+                    }
+                ],
+            },
+        ]
+    }
+    text, empty_flag, assistant_turns, total_turns = _extract_last_assistant_text(
+        json.dumps(envelope)
+    )
+    assert empty_flag is False, (
+        f"Expected empty_flag=False (new output present), got {empty_flag!r}"
+    )
+    blocks = _extract_json_blocks(text)
+    assert len(blocks) >= 1, f"Expected at least 1 JSON block, got {len(blocks)}"
+    last_block = blocks[-1]
+    assert last_block["status"] == "done", (
+        f"Expected status='done' (last-wins), got {last_block['status']!r}"
+    )
+    assert last_block["summary"] == "new", (
+        f"Expected summary='new', got {last_block['summary']!r}"
+    )
+
+
+def test_is_checkpoint_dev_blocked_with_checkpoint_notes():
+    """_is_checkpoint returns True for dev blocked with 'checkpoint' in notes (legacy fallback)."""
+    from tasker.models import DevResponse
+    from tasker.orchestrator import _is_checkpoint
+
+    resp = DevResponse(
+        status="blocked",
+        summary="paused",
+        files_modified=[],
+        notes="checkpoint reached mid-task",
+    )
+    assert _is_checkpoint(resp) is True
+
+
+def test_is_checkpoint_dev_started():
+    """_is_checkpoint returns True for dev status='started' (primary checkpoint signal)."""
+    from tasker.models import DevResponse
+    from tasker.orchestrator import _is_checkpoint
+
+    resp = DevResponse(
+        status="started",
+        summary="Starting: P1.T3",
+        files_modified=[],
+        notes="checkpoint",
+    )
+    assert _is_checkpoint(resp) is True
+
+
+def test_is_checkpoint_dev_done():
+    """_is_checkpoint returns False for dev done (not started, not blocked)."""
+    from tasker.models import DevResponse
+    from tasker.orchestrator import _is_checkpoint
+
+    resp = DevResponse(
+        status="done",
+        summary="completed",
+        files_modified=["src/foo.rs"],
+        notes="checkpoint info",
+    )
+    assert _is_checkpoint(resp) is False
+
+
+def test_is_checkpoint_qa_reject_with_checkpoint():
+    """_is_checkpoint returns True for QA rejected with 'checkpoint' in feedback."""
+    from tasker.models import QAResponse
+    from tasker.orchestrator import _is_checkpoint
+
+    resp = QAResponse(
+        decision="reject",
+        feedback="needs checkpoint review before proceeding",
+    )
+    assert _is_checkpoint(resp) is True
+
+
+def test_is_checkpoint_qa_approve():
+    """_is_checkpoint returns False for QA approve (not rejected)."""
+    from tasker.models import QAResponse
+    from tasker.orchestrator import _is_checkpoint
+
+    resp = QAResponse(
+        decision="approve",
+        feedback="all good",
+    )
+    assert _is_checkpoint(resp) is False
+
+
+# ── P10: "started" status tests (checkpoint feedback loop fix) ────
+
+
+def test_pydantic_dev_response_accepts_started():
+    """DevResponse Pydantic model accepts status='started'."""
+    from tasker.schema import DevResponse as DevResponseSchema
+
+    resp = DevResponseSchema(
+        status="started",
+        summary="Starting: P6.T1",
+        files_modified=[],
+        notes="checkpoint",
+    )
+    assert resp.status == "started"
+
+
+def test_parse_dev_response_started():
+    """_parse_dev_response returns a DevResponse with status='started'."""
+    from tasker.orchestrator import _parse_dev_response
+
+    parsed = {
+        "status": "started",
+        "summary": "Starting: P6.T1",
+        "files_modified": [],
+        "notes": "checkpoint",
+    }
+    result = _parse_dev_response("", parsed)
+    assert result is not None
+    assert result.status == "started"
+    assert result.summary == "Starting: P6.T1"
+
+
+def test_parse_dev_response_started_adhoc_fallback():
+    """_parse_dev_response fallback path accepts 'started' even if Pydantic rejects."""
+    from tasker.orchestrator import _parse_dev_response
+
+    # Simulate a dict that would fail Pydantic but has a valid status
+    parsed = {
+        "status": "started",
+        "summary": "Starting: P6.T1",
+        "files_modified": [],
+        "notes": "checkpoint",
+        "extra_field": "should_be_ignored",
+    }
+    # This should still work via ad-hoc fallback
+    result = _parse_dev_response("", parsed)
+    assert result is not None
+    assert result.status == "started"
+
+
+def test_cascade_started_then_done():
+    """When agent emits started checkpoint then done final, cascade picks done."""
+    from tasker.goose import _extract_json_blocks
+
+    text = (
+        '{"status":"started","summary":"Starting: P6.T1","files_modified":[],"notes":"checkpoint"}\n'
+        "Some work happened here...\n"
+        '{"status":"done","summary":"Implemented feature X","files_modified":["src/foo.rs"],"notes":""}'
+    )
+    blocks = _extract_json_blocks(text)
+    # Cascade picks ALL valid blocks, but last-wins in the orchestrator
+    assert len(blocks) == 2
+    assert blocks[0]["status"] == "started"
+    assert blocks[1]["status"] == "done"
+    # The orchestrator uses blocks[-1] — which is the real answer
+    assert blocks[-1]["status"] == "done"
+    assert "src/foo.rs" in blocks[-1]["files_modified"]
+
+
+def test_cascade_started_only():
+    """When agent emits only the started checkpoint (ran out of turns), cascade finds it."""
+    from tasker.goose import _extract_json_blocks
+
+    text = '{"status":"started","summary":"Starting: P6.T1","files_modified":[],"notes":"checkpoint"}'
+    blocks = _extract_json_blocks(text)
+    assert len(blocks) == 1
+    assert blocks[0]["status"] == "started"
+
+
+def test_is_checkpoint_started_no_notes():
+    """_is_checkpoint returns True for status='started' even without 'checkpoint' in notes."""
+    from tasker.models import DevResponse
+    from tasker.orchestrator import _is_checkpoint
+
+    resp = DevResponse(
+        status="started",
+        summary="Starting: P6.T1",
+        files_modified=[],
+        notes="",  # no 'checkpoint' keyword — still detected via status
+    )
+    assert _is_checkpoint(resp) is True
+
+
+def test_started_status_not_counted_as_blocked():
+    """Verify that 'started' status does NOT appear in the blocked status set.
+
+    This is a contract test: the orchestrator's main loop has separate
+    branches for 'started' and 'blocked'.  If 'started' leaked into the
+    blocked branch, the feedback loop would reappear.
+    """
+    from tasker.models import DevResponse
+
+    resp = DevResponse(
+        status="started",
+        summary="checkpoint",
+        files_modified=[],
+    )
+    # The status must be "started", not "blocked"
+    assert resp.status == "started"
+    assert resp.status != "blocked"
+
+
+def test_dev_response_to_dict_includes_started():
+    """DevResponse.to_dict() correctly serializes started status."""
+    from tasker.models import DevResponse
+
+    resp = DevResponse(
+        status="started",
+        summary="Starting: P6.T1",
+        files_modified=[],
+        notes="checkpoint",
+    )
+    d = resp.to_dict()
+    assert d["status"] == "started"
+    assert d["summary"] == "Starting: P6.T1"
+
+
+def test_extract_dir_refs_eudox_mcp() -> None:
+    """Text contains `eudox-mcp/src/eudox_mcp/server.py` → returns {cwd / 'eudox-mcp'}."""
+    from tasker.orchestrator import _extract_dir_refs
+
+    with tempfile.TemporaryDirectory() as td:
+        cwd = Path(td)
+        (cwd / "eudox-mcp" / "src" / "eudox_mcp").mkdir(parents=True)
+        text = "Modify `eudox-mcp/src/eudox_mcp/server.py` to add logging"
+        result = _extract_dir_refs(text, cwd)
+        assert result == {cwd / "eudox-mcp"}
+
+
+def test_extract_dir_refs_plans_mcp() -> None:
+    """Text contains `plans-mcp/tests/test_auth.py` → returns {cwd / 'plans-mcp'}."""
+    from tasker.orchestrator import _extract_dir_refs
+
+    with tempfile.TemporaryDirectory() as td:
+        cwd = Path(td)
+        (cwd / "plans-mcp" / "tests").mkdir(parents=True)
+        text = "Add test in `plans-mcp/tests/test_auth.py` for OAuth flow"
+        result = _extract_dir_refs(text, cwd)
+        assert result == {cwd / "plans-mcp"}
+
+
+def test_extract_dir_refs_inside_cwd() -> None:
+    """Text contains `src/eudox/pipeline/analytics.py` → empty set (no prefix before src/)."""
+    from tasker.orchestrator import _extract_dir_refs
+
+    with tempfile.TemporaryDirectory() as td:
+        cwd = Path(td)
+        (cwd / "src" / "eudox" / "pipeline").mkdir(parents=True)
+        text = "Refactor `src/eudox/pipeline/analytics.py` to use new API"
+        result = _extract_dir_refs(text, cwd)
+        assert result == set()
+
+
+def test_extract_dir_refs_multiple() -> None:
+    """Text has two backtick paths in different dirs → both roots returned."""
+    from tasker.orchestrator import _extract_dir_refs
+
+    with tempfile.TemporaryDirectory() as td:
+        cwd = Path(td)
+        (cwd / "eudox-mcp" / "src").mkdir(parents=True)
+        (cwd / "plans-mcp" / "tests").mkdir(parents=True)
+        text = (
+            "Modify `eudox-mcp/src/eudox_mcp/server.py` and "
+            "`plans-mcp/tests/test_auth.py` together"
+        )
+        result = _extract_dir_refs(text, cwd)
+        assert result == {cwd / "eudox-mcp", cwd / "plans-mcp"}
+
+
+def test_extract_dir_refs_no_paths() -> None:
+    """Plain text with no backtick paths → empty set."""
+    from tasker.orchestrator import _extract_dir_refs
+
+    with tempfile.TemporaryDirectory() as td:
+        cwd = Path(td)
+        text = "Just a plain text with no paths in backticks at all."
+        result = _extract_dir_refs(text, cwd)
+        assert result == set()
+
+
+def test_extract_dir_refs_nonexistent_dir() -> None:
+    """Path in backticks doesn't exist on disk → excluded from results."""
+    from tasker.orchestrator import _extract_dir_refs
+
+    with tempfile.TemporaryDirectory() as td:
+        cwd = Path(td)
+        # Do NOT create phantom-mcp on disk
+        text = "Update `phantom-mcp/src/main.py` with new config"
+        result = _extract_dir_refs(text, cwd)
+        assert result == set()
+
+
+# ── P9.T2: integration-style test for _scan_vcs_paths + init_subdir ──
+
+
+def test_scan_vcs_paths_detects_untracked() -> None:
+    """Integration test: _scan_vcs_paths detects untracked dirs, init_subdir fixes them.
+
+    Creates a temp workspace with a root dir containing:
+      - repo/  (git repo — this is the orchestrator's cwd)
+      - submod/src/file.py  (no git — a sibling directory outside the repo)
+
+    The orchestrator's cwd is set to the root dir (not the git repo itself),
+    so that ``submod/`` is NOT inside the git work tree.  A Phase is built
+    with a task whose text references ``submod/src/file.py``.  We call
+    ``_scan_vcs_paths()`` and assert it returns ``[root / "submod"]``.
+    Then we call ``init_subdir`` and verify the subdir becomes a git repo.
+    """
+    import subprocess
+
+    from tasker.models import Phase, Task
+    from tasker.orchestrator import Orchestrator
+    from tasker.vcs.git_backend import GitBackend
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        repo = root / "repo"
+        repo.mkdir()
+
+        submod = root / "submod"
+        submod_src = submod / "src"
+        submod_src.mkdir(parents=True)
+
+        # Create the file referenced in the task text
+        (submod_src / "file.py").write_text("# hello\n")
+
+        # Init repo/ as a git repo
+        subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=str(repo),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=str(repo),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "init", "--allow-empty"],
+            cwd=str(repo),
+            capture_output=True,
+            check=True,
+        )
+
+        # submod should NOT be inside a git work tree
+        check = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(submod),
+            capture_output=True,
+        )
+        assert check.returncode != 0, "submod should NOT be inside a git work tree"
+
+        # Build a minimal Orchestrator.  cwd is root (parent of both repo/
+        # and submod/) so that submod/ is outside any git work tree.
+        task = Task(
+            phase_index=0,
+            task_index=0,
+            text="Update `submod/src/file.py` with new features",
+        )
+        phase = Phase(index=0, title="Test Phase", tasks=[task])
+
+        orc = object.__new__(Orchestrator)
+        orc.phases = [phase]
+        orc.cwd = root
+        orc.vcs = GitBackend()
+
+        # Step 1: _scan_vcs_paths should detect submod as untracked
+        untracked = orc._scan_vcs_paths()
+        assert untracked == [submod], f"Expected [{submod}], got {untracked}"
+
+        # Step 2: init_subdir should turn submod into a git repo
+        orc.vcs.init_subdir(submod)
+
+        # Verify submod is now a git repo
+        check2 = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(submod),
+            capture_output=True,
+        )
+        assert check2.returncode == 0, "submod should be a git repo after init_subdir"
+
+        # Verify the .gitignore was created with Python defaults
+        gitignore = submod / ".gitignore"
+        assert gitignore.exists(), ".gitignore should exist after init_subdir"
+        assert "__pycache__/" in gitignore.read_text()
+
+
+def test_init_subdir_creates_git_repo_and_gitignore() -> None:
+    """P9.T4: init_subdir creates .git, .gitignore with Python defaults, and baseline commit."""
+    import subprocess
+
+    from tasker.vcs.git_backend import GitBackend
+
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "newmod"
+        src = target / "src"
+        src.mkdir(parents=True)
+        (src / "main.py").write_text("print('hello')\n")
+
+        backend = GitBackend()
+        backend.init_subdir(target)
+
+        # Verify git repo
+        check = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(target),
+            capture_output=True,
+        )
+        assert check.returncode == 0, "Should be a git repo"
+
+        # Verify .gitignore with Python defaults
+        gitignore = target / ".gitignore"
+        assert gitignore.exists()
+        content = gitignore.read_text()
+        assert "__pycache__/" in content
+        assert ".venv/" in content
+        assert "*.pyc" in content
+        assert ".ruff_cache/" in content
+        assert ".pytest_cache/" in content
+
+        # Verify baseline commit exists
+        log = subprocess.run(
+            ["git", "log", "--oneline", "-1"],
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+        )
+        assert log.returncode == 0
+        assert "tasker: baseline snapshot" in log.stdout
+
+
+def test_init_subdir_idempotent_on_existing_repo() -> None:
+    """P9.T4: init_subdir is a no-op when directory is already a git repo."""
+    import subprocess
+
+    from tasker.vcs.git_backend import GitBackend
+
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "existing"
+        target.mkdir()
+
+        # Pre-init as a git repo with an existing commit
+        subprocess.run(
+            ["git", "init"], cwd=str(target), capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=str(target),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=str(target),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "original commit", "--allow-empty"],
+            cwd=str(target),
+            capture_output=True,
+            check=True,
+        )
+
+        # Get the original commit hash
+        original = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        backend = GitBackend()
+        backend.init_subdir(target)
+
+        # HEAD should not have changed — no new commit added
+        current = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert current == original, "init_subdir should not modify an existing repo"
+
+
+def test_init_subdir_preserves_existing_gitignore() -> None:
+    """P9.T4: init_subdir does NOT overwrite an existing .gitignore."""
+
+    from tasker.vcs.git_backend import GitBackend
+
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "custom"
+        target.mkdir()
+        (target / ".gitignore").write_text("node_modules/\ndist/\n")
+        (target / "file.txt").write_text("data\n")
+
+        backend = GitBackend()
+        backend.init_subdir(target)
+
+        # .gitignore should be preserved exactly
+        gitignore = target / ".gitignore"
+        content = gitignore.read_text()
+        assert content == "node_modules/\ndist/\n", (
+            "Existing .gitignore must not be overwritten"
+        )
+        assert "__pycache__/" not in content, "Should not have appended Python defaults"
+
+
+def test_init_subdir_baseline_commit_message() -> None:
+    """P9.T4: baseline commit has exact message 'tasker: baseline snapshot'."""
+    import subprocess
+
+    from tasker.vcs.git_backend import GitBackend
+
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "msgtest"
+        target.mkdir()
+        (target / "code.py").write_text("x = 1\n")
+
+        backend = GitBackend()
+        backend.init_subdir(target)
+
+        # Verify exact commit message
+        msg = subprocess.run(
+            ["git", "log", "--format=%s", "-1"],
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+        )
+        assert msg.stdout.strip() == "tasker: baseline snapshot"
+
+        # Verify the file was committed
+        files = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+        )
+        assert "code.py" in files.stdout
+
+
+def test_init_subdir_empty_dir() -> None:
+    """P9.T4: init_subdir works on completely empty directory (--allow-empty commit)."""
+    import subprocess
+
+    from tasker.vcs.git_backend import GitBackend
+
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "empty"
+        target.mkdir()
+        # No files at all
+
+        backend = GitBackend()
+        backend.init_subdir(target)
+
+        # Should still be a valid repo with the baseline commit
+        check = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(target),
+            capture_output=True,
+        )
+        assert check.returncode == 0
+
+        log = subprocess.run(
+            ["git", "log", "--oneline", "-1"],
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+        )
+        assert "tasker: baseline snapshot" in log.stdout
+
+
+def test_vcs_auto_init_e2e() -> None:
+    """P9.T7: End-to-end — orchestrator startup auto-inits untracked directories.
+
+    Simulates a workspace with:
+      - A task whose text references `svc-a/src/main.py` and `svc-b/tests/test_x.py`
+      - Neither svc-a/ nor svc-b/ have .git
+      - Orchestrator.run() is not fully executed (we only call _scan_vcs_paths
+        + init_subdir), but this verifies the complete scan→init→verify loop.
+    """
+    import subprocess
+
+    from tasker.models import Phase, Task
+    from tasker.orchestrator import Orchestrator
+    from tasker.vcs.git_backend import GitBackend
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        # Create two untracked directories with source trees
+        for name in ("svc-a", "svc-b"):
+            d = root / name / "src"
+            d.mkdir(parents=True)
+            (d / "main.py").write_text(f"# {name}\n")
+            tests = root / name / "tests"
+            tests.mkdir(parents=True)
+            (tests / f"test_{name}.py").write_text("def test_ok(): pass\n")
+
+        # Verify neither is a git repo
+        for name in ("svc-a", "svc-b"):
+            check = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=str(root / name),
+                capture_output=True,
+            )
+            assert check.returncode != 0, f"{name} should not be a git repo"
+
+        # Build an orchestrator with tasks referencing both directories
+        task_a = Task(
+            phase_index=0,
+            task_index=0,
+            text="Implement feature in `svc-a/src/main.py` and add tests in `svc-a/tests/test_svc-a.py`",
+        )
+        task_b = Task(
+            phase_index=0,
+            task_index=1,
+            text="Fix bug in `svc-b/src/main.py` — see `svc-b/tests/test_svc-b.py` for regression test",
+        )
+        phase = Phase(index=0, title="E2E Phase", tasks=[task_a, task_b])
+
+        orc = object.__new__(Orchestrator)
+        orc.phases = [phase]
+        orc.cwd = root
+        orc.vcs = GitBackend()
+
+        # Step 1: scan should detect both untracked dirs
+        untracked = orc._scan_vcs_paths()
+        assert set(untracked) == {root / "svc-a", root / "svc-b"}, (
+            f"Expected svc-a and svc-b, got {untracked}"
+        )
+
+        # Step 2: auto-init both (mimics Orchestrator.run() loop)
+        for path in untracked:
+            orc.vcs.init_subdir(path)
+
+        # Step 3: verify both are now git repos
+        for name in ("svc-a", "svc-b"):
+            check = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=str(root / name),
+                capture_output=True,
+            )
+            assert check.returncode == 0, f"{name} should be a git repo after auto-init"
+
+            # Verify baseline commit
+            log = subprocess.run(
+                ["git", "log", "--oneline", "-1"],
+                cwd=str(root / name),
+                capture_output=True,
+                text=True,
+            )
+            assert "tasker: baseline snapshot" in log.stdout
+
+            # Verify .gitignore
+            assert (root / name / ".gitignore").exists()
+
+        # Step 4: second scan should return empty (both now tracked)
+        untracked2 = orc._scan_vcs_paths()
+        assert untracked2 == [], (
+            f"After auto-init, scan should be empty, got {untracked2}"
+        )
+
 
 if __name__ == "__main__":
     test_parser()
@@ -4194,6 +5535,23 @@ if __name__ == "__main__":
     test_spinner_frames()
     test_pending_iteration_dataclass()
     test_decompose_models()
+    test_schema_dev_response_valid_done()
+    test_schema_dev_response_valid_blocked()
+    test_schema_dev_response_invalid_status()
+    test_schema_qa_response_all_decisions()
+    test_schema_qa_response_invalid_decision()
+    test_schema_decompose_response()
+    test_schema_arch_response_all_actions()
+
+    # P4.T1: Pydantic-backed _parse_*_response tests
+    test_parse_dev_response_pydantic_valid()
+    test_parse_dev_response_pydantic_invalid_status_fallback()
+    test_parse_dev_response_extra_fields()
+    test_parse_qa_response_pydantic_valid()
+    test_parse_qa_response_invalid_decision()
+    test_parse_decompose_response_pydantic_valid()
+    test_parse_arch_response_pydantic_valid()
+
     test_parse_decompose_response()
     test_decompose_task()
     test_dev_override_task_text()
@@ -4205,6 +5563,9 @@ if __name__ == "__main__":
     test_dev_truncation_fast_forward()
     test_dev_truncation_suppresses_task_text()
 
+    # _extract_json_blocks tests
+    run_json_blocks_tests()
+
     # ARCH (Architect) agent tests
     run_arch_tests()
 
@@ -4213,5 +5574,37 @@ if __name__ == "__main__":
 
     # E2BIG / diff-size tests
     run_e2big_tests()
+
+    # P5.T1 — IterationEntry serialization, metrics, checkpoint tests
+    test_iteration_entry_new_fields_serialized()
+    test_iteration_entry_defaults_omitted()
+    test_extract_last_assistant_text_returns_metrics()
+    test_session_resume_ignores_old_checkpoint()
+    test_session_resume_new_checkpoint_wins()
+    test_is_checkpoint_dev_blocked_with_checkpoint_notes()
+    test_is_checkpoint_dev_done()
+    test_is_checkpoint_qa_reject_with_checkpoint()
+    test_is_checkpoint_qa_approve()
+
+    # P9.T2 — _extract_dir_refs tests
+    test_extract_dir_refs_eudox_mcp()
+    test_extract_dir_refs_plans_mcp()
+    test_extract_dir_refs_inside_cwd()
+    test_extract_dir_refs_multiple()
+    test_extract_dir_refs_no_paths()
+    test_extract_dir_refs_nonexistent_dir()
+
+    # P9.T2 — integration-style _scan_vcs_paths + init_subdir test
+    test_scan_vcs_paths_detects_untracked()
+
+    # P9.T4 — isolated init_subdir unit tests
+    test_init_subdir_creates_git_repo_and_gitignore()
+    test_init_subdir_idempotent_on_existing_repo()
+    test_init_subdir_preserves_existing_gitignore()
+    test_init_subdir_baseline_commit_message()
+    test_init_subdir_empty_dir()
+
+    # P9.T7 — orchestrator auto-init e2e verification
+    test_vcs_auto_init_e2e()
 
     print("\n✅ All dry-run tests passed!")

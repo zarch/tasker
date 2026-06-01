@@ -231,7 +231,11 @@ base ──► git checkout -b task/P1.T1 ──► dev implements ──► QA 
 
 > **Important**: All VCS commands use flags to avoid opening `$EDITOR`. No manual intervention is ever required.
 
-## Task file format
+## Task file formats
+
+`tasker` supports two formats for defining tasks: **markdown** (human-friendly) and **JSONL** (machine-friendly). The orchestrator detects the format from the file extension (`.md` or `.jsonl`) and handles both transparently.
+
+### Markdown format
 
 Markdown files with `## Phase N` headings and `- [ ]` / `- [x]` checkboxes. Optional `###` sub-phase headings group tasks for session scope control:
 
@@ -253,6 +257,96 @@ Markdown files with `## Phase N` headings and `- [ ]` / `- [x]` checkboxes. Opti
 ```
 
 The `###` headings are recognized by the parser and used by `--session-scope subphase` to rotate goose sessions at sub-phase boundaries. Files without `###` headings work unchanged.
+
+### JSONL format
+
+Each line in a `.tasks.jsonl` file is a JSON object describing one task. This is the recommended format when an LLM generates the task list — the schema is strict and `tasker prepare validate` catches structural errors before the orchestrator runs.
+
+```json
+{"phase": 1, "phase_title": "GeometryType Enum", "subphase": "P1 Tasks", "task_id": "T0.1", "text": "Add serde.workspace = true to hay-vector/Cargo.toml.", "ref": "00-spec.md#T0.1", "depends_on": [], "done": false}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `phase` | int | 1-based, sequential across the file (1, 2, 3, …) |
+| `phase_title` | str | Phase heading text |
+| `subphase` | str | Sub-heading text |
+| `task_id` | str | Globally unique identifier, e.g. `T0.1`, `T2A.3`, `TDoc.5` |
+| `text` | str | Concise but complete task description — no hard length limit |
+| `ref` | str | Spec anchor with full design details, e.g. `00-spec.md#T0.1` |
+| `depends_on` | list\[str\] | Only for non-obvious dependencies: cross-phase, cross-subphase, or backward references. Use `[]` when the task simply follows the previous one. |
+| `done` | bool | `false` for new tasks |
+
+When the orchestrator reads a `.jsonl` file, it also keeps a companion `.md` file in sync — marking tasks done in both files.
+
+## `tasker prepare` — generate and validate task lists
+
+The `prepare` subcommand provides tools for creating and validating JSONL task files. This is especially useful when asking an LLM to generate a task list — the LLM produces JSONL, you validate it, then convert to markdown for review.
+
+### Show the expected format
+
+```bash
+uv run tasker prepare example
+```
+
+Prints a valid example JSONL entry with all field rules, quality guidelines, and limits. Use this as the reference when instructing an LLM to generate a task list.
+
+### Validate a JSONL file
+
+```bash
+uv run tasker prepare validate 99-todo.tasks.jsonl
+```
+
+Checks the file against the schema and prints a summary table:
+
+```
+                               ✓ Valid: 32 tasks
+┏━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━┓
+┃ Phase ┃ Title                    ┃ Subphase  ┃ Tasks ┃
+┡━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━┩
+│ 1     │ GeometryType Enum        │ P1 Tasks  │     7 │
+│ 2     │ PrimitiveGeometry, ...   │ P2A Tasks │     4 │
+│ ...   │                          │           │       │
+└───────┴──────────────────────────┴───────────┴───────┘
+```
+
+Options: `--max-tasks N` (default 10 per subphase), `--max-subphases N` (default 6 per phase).
+
+### Convert JSONL to markdown
+
+```bash
+uv run tasker prepare to-md 99-todo.tasks.jsonl
+# Or specify output path:
+uv run tasker prepare to-md 99-todo.tasks.jsonl -o specs/99-todo.md
+```
+
+Generates a human-readable markdown file that the orchestrator can also read directly.
+
+### Convert markdown to JSONL
+
+```bash
+uv run tasker prepare to-jsonl 99-todo.md
+```
+
+Extracts tasks from an existing markdown file into JSONL format. Useful for migrating from markdown to JSONL.
+
+### Typical LLM workflow
+
+```bash
+# 1. Ask the LLM to generate the task list
+#    "Run `tasker prepare example` to see the JSONL format, then create 99-todo.tasks.jsonl"
+
+# 2. Validate the LLM's output
+uv run tasker prepare validate 99-todo.tasks.jsonl
+
+# 3. Convert to markdown for your review
+uv run tasker prepare to-md 99-todo.tasks.jsonl
+
+# 4. Run the orchestrator (it reads JSONL directly)
+uv run tasker --dev recipes/recipe-dev.yaml \
+              --qa recipes/recipe-qa.yaml \
+              99-todo.tasks.jsonl
+```
 
 ## Environment variables
 
@@ -424,6 +518,9 @@ tools/tasker/
 │   ├── main.py                  # Typer CLI entry point
 │   ├── models.py                # Dataclasses (Task, Phase, payloads, RecoveryStage)
 │   ├── parser.py                # Markdown task-list parser
+│   ├── taskfile.py              # JSONL task schema, validation, read/write
+│   ├── prepare.py               # `tasker prepare` subcommands (validate, to-md, to-jsonl, example)
+│   ├── adapter.py               # Unified MD/JSONL dispatch for orchestrator
 │   ├── goose.py                 # Goose subprocess runner + JSON extraction
 │   ├── orchestrator.py          # QA↔Dev loop + recovery + chat mode + VCS integration
 │   ├── jj.py                    # Backward-compat re-exports (see vcs/jj_backend.py)

@@ -122,6 +122,7 @@ def setup_monitoring(
     ]
 
     # ── File renderer (human-readable, colored=False for files) ─
+    file_handler: logging.Handler | None = None
     if log_path:
         file_handler = logging.handlers.RotatingFileHandler(
             filename=str(log_path),
@@ -157,7 +158,7 @@ def setup_monitoring(
     root_logger.handlers.clear()
 
     root_logger.addHandler(console_handler)
-    if log_path:
+    if log_path and file_handler is not None:
         root_logger.addHandler(file_handler)
 
     # ── Configure structlog itself ──────────────────────────────

@@ -141,6 +141,43 @@ class GitBackend:
         """Check if git CLI is available."""
         return _run_git(["version"]).success
 
+    def init_subdir(self, subdir: Path) -> None:
+        """Auto-init git in a subdirectory if it's not already a repo.
+
+        Steps:
+        1. Check if subdir is already inside a git work tree — skip if so.
+        2. Run ``git init`` in subdir.
+        3. Create ``.gitignore`` with Python defaults (only if missing).
+        4. Stage all files and create a baseline commit.
+        """
+        # Step 1: already a repo?
+        check = _run_git(["rev-parse", "--is-inside-work-tree"], cwd=subdir)
+        if check.success:
+            return  # already a git repo — nothing to do
+
+        log.warning("vcs.auto_init", path=str(subdir))
+
+        # Step 2: git init
+        init_result = _run_git(["init"], cwd=subdir)
+        if not init_result.success:
+            raise RuntimeError(f"git init failed in {subdir}: {init_result.stderr}")
+
+        # Step 3: Create .gitignore with Python defaults (only if missing)
+        gitignore = subdir / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text(
+                "__pycache__/\n.venv/\n*.pyc\n.ruff_cache/\n.pytest_cache/\n"
+            )
+
+        # Step 4: Stage all + baseline commit
+        _run_git(["add", "-A"], cwd=subdir)
+        _run_git(
+            ["commit", "-m", "tasker: baseline snapshot", "--allow-empty"],
+            cwd=subdir,
+        )
+
+        log.info("vcs.auto_init_complete", path=str(subdir))
+
     def init(self, cwd: Path | None = None) -> None:
         """Capture the current branch and commit as the starting base."""
         # Verify we're in a git repo
