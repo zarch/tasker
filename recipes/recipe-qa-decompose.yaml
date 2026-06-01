@@ -16,38 +16,44 @@ instructions: |
 
   ## Specification Files
   - `specs/prd/` — Product Requirements Documents
-  - `specs/arch/` — Architecture Documents (Rust types, trait signatures, module layout, behavior)
+  - `specs/arch/` — Architecture Documents (types, signatures, module layout, behavior)
 
   Task descriptions reference specs using: `arch/02-grid-system.md §GridCell Trait`
   → read `specs/arch/02-grid-system.md`, find the "GridCell Trait" section.
 
-  ## ⚡ JSON-First Rule (MANDATORY)
-
-  You MUST output a JSON block as your FIRST assistant message — before any
-  tool calls.  This "checkpoint" ensures the orchestrator always gets a
-  valid response even if you run out of tokens later.
-
-  **IMPORTANT**: Use the `tasker.respond` command to emit your JSON. This
-  guarantees valid format — do NOT write JSON by hand. Examples:
-
-  ```bash
-  # Turn 1 — checkpoint (before ANY other tool calls):
-  python3 -m tasker.respond decompose no --reason "Analyzing task: {{ task_label }}"
-
-  # After analysis — decompose:
-  python3 -m tasker.respond decompose yes --reason "Task spans multiple modules" --subtasks 'P1.T3.1|Do A' 'P1.T3.2|Do B'
-
-  # After analysis — don't decompose:
-  python3 -m tasker.respond decompose no --reason "Single focused change in one module."
-  ```
-
-  **Only the LAST JSON block in your response is parsed**, so your final
-  update always overrides the checkpoint.
-
-  ## Structured Output Helper
-
-  **ALWAYS use `python3 -m tasker.respond`** — this guarantees valid JSON.
-  Do NOT write JSON by hand.
+  ## ═══════════════════════════════════════════════════════════════
+  ## ⚡ RULE #1 — COMMUNICATE VIA SHELL COMMAND (MANDATORY)
+  ## ═══════════════════════════════════════════════════════════════
+  ##
+  ## To report your decision, you MUST execute this shell command:
+  ##
+  ##   python3 -m tasker.respond decompose <YES|NO> --reason "<TEXT>"
+  ##
+  ## This is a TOOL CALL. Do NOT write JSON by hand. Do NOT describe
+  ## the command. EXECUTE it using your shell/terminal tool.
+  ##
+  ## Example — your very first action:
+  ##
+  ##   python3 -m tasker.respond decompose no --reason "Analyzing task"
+  ##
+  ## After analysis — don't decompose:
+  ##
+  ##   python3 -m tasker.respond decompose no --reason "Single focused change"
+  ##
+  ## After analysis — decompose into subtasks:
+  ##
+  ##   python3 -m tasker.respond decompose yes --reason "Task spans 3 modules" --subtasks 'P1.T3.1|Implement struct X' 'P1.T3.2|Implement trait Y' 'P1.T3.3|Add tests'
+  ##
+  ## DO NOT:
+  ## - Write JSON in a code block (```json ... ```)
+  ## - Describe what command you would run
+  ## - Put the command inside a JSON object
+  ## - Invent your own JSON format
+  ##
+  ## DO:
+  ## - Use your shell tool to EXECUTE: python3 -m tasker.respond decompose ...
+  ##
+  ## ═══════════════════════════════════════════════════════════════
 
   ## When to Decompose
 
@@ -74,19 +80,7 @@ instructions: |
   5. Keep subtasks **focused**: one concern per subtask.
   6. Include spec references in each subtask so the developer knows what to read.
   7. Aim for **2-5 subtasks** — don't over-decompose. If you can't split meaningfully, don't split.
-  8. If only 1 subtask would result, set `should_decompose` to `false`.
-
-  ## JSON Response Format
-
-  ### No decomposition needed:
-  ```bash
-  python3 -m tasker.respond decompose no --reason "Single focused change in one module."
-  ```
-
-  ### Decompose into subtasks:
-  ```bash
-  python3 -m tasker.respond decompose yes --reason "Task spans 3 modules" --subtasks 'P1.T3.1|Implement the GridCell struct...' 'P1.T3.2|Implement the SpatialIndex trait...' 'P1.T3.3|Add unit tests...'
-  ```
+  8. If only 1 subtask would result, don't decompose.
 
 parameters:
   - key: task_label
@@ -122,9 +116,18 @@ prompt: |
 
   **Your session**: `{{ decompose_session_id }}`
 
+  **YOUR FIRST ACTION RIGHT NOW — execute this exact command in your shell:**
+
+      python3 -m tasker.respond decompose no --reason "Analyzing task: {{ task_label }}"
+
+  Then analyze the task. When done, execute your final decision:
+
+      python3 -m tasker.respond decompose no --reason "..."
+    OR
+      python3 -m tasker.respond decompose yes --reason "..." --subtasks 'LABEL|Description' ...
+
   ## Instructions
   1. Read the task and extract all `arch/...` / `prd/...` spec references.
   2. Read the referenced spec files to understand scope and dependencies.
   3. Decide: should this task be split into smaller subtasks?
   4. If yes, produce focused subtasks following the decomposition rules.
-  5. **MUST** respond with the JSON block — the orchestrator parses it.
