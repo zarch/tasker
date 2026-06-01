@@ -5486,6 +5486,373 @@ def test_vcs_auto_init_e2e() -> None:
         )
 
 
+# ── P11: Silent crash detection + model fallback ────────────────
+
+
+def test_is_silent_crash_true():
+    """rc!=0 + empty stdout + empty stderr → silent crash."""
+    from tasker.goose import GooseRunResult, is_silent_crash
+
+    result = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="",
+        return_code=1,
+        duration_secs=0.5,
+    )
+    assert is_silent_crash(result) is True
+
+
+def test_is_silent_crash_with_stderr():
+    """rc!=0 + non-empty stderr → NOT a silent crash (has diagnostic info)."""
+    from tasker.goose import GooseRunResult, is_silent_crash
+
+    result = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="Error: rate limit exceeded",
+        return_code=1,
+    )
+    assert is_silent_crash(result) is False
+
+
+def test_is_silent_crash_with_stdout():
+    """rc!=0 + non-empty stdout → NOT a silent crash (goose produced output)."""
+    from tasker.goose import GooseRunResult, is_silent_crash
+
+    result = GooseRunResult(
+        success=False,
+        raw_stdout='{"messages": []}',
+        raw_stderr="",
+        return_code=1,
+    )
+    assert is_silent_crash(result) is False
+
+
+def test_is_silent_crash_success():
+    """rc=0 (success) → NOT a silent crash."""
+    from tasker.goose import GooseRunResult, is_silent_crash
+
+    result = GooseRunResult(
+        success=True,
+        raw_stdout="ok",
+        raw_stderr="",
+        return_code=0,
+    )
+    assert is_silent_crash(result) is False
+
+
+def test_is_silent_crash_timeout():
+    """Timed out → NOT a silent crash (timeouts have their own handling)."""
+    from tasker.goose import GooseRunResult, is_silent_crash
+
+    result = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="",
+        return_code=-1,
+        timed_out=True,
+    )
+    assert is_silent_crash(result) is False
+
+
+def test_is_silent_crash_whitespace_only():
+    """rc!=0 + whitespace-only stdout/stderr → still a silent crash."""
+    from tasker.goose import GooseRunResult, is_silent_crash
+
+    result = GooseRunResult(
+        success=False,
+        raw_stdout="   \n\t  ",
+        raw_stderr="  \n  ",
+        return_code=1,
+    )
+    assert is_silent_crash(result) is True
+
+
+def test_backoff_retries_on_silent_crash():
+    """Silent crash triggers backoff retry (same as connection error)."""
+    from unittest.mock import patch
+    from tasker.goose import GooseRunResult, run_goose_with_backoff
+    from tasker.models import RateLimitConfig
+
+    silent_crash = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="",
+        return_code=1,
+    )
+    success = GooseRunResult(
+        success=True,
+        raw_stdout='{"messages":[{"role":"assistant","content":"done"}]}',
+        raw_stderr="",
+        return_code=0,
+    )
+
+    call_count = 0
+
+    def mock_run_goose(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return silent_crash
+        return success
+
+    with patch("tasker.goose.run_goose", side_effect=mock_run_goose):
+        with patch("tasker.goose.time.sleep"):
+            result = run_goose_with_backoff(
+                recipe_path="/tmp/recipe.yaml",
+                session_name="test-session",
+                rate_limit=RateLimitConfig(
+                    enabled=True, max_retries=5, base_delay_secs=1.0
+                ),
+            )
+
+    assert result.success is True
+    assert call_count == 3  # 2 silent crashes retried, then success
+
+
+def test_backoff_no_retry_on_nonempty_stderr():
+    """Non-transient failure (stderr present, not connection error) → no retry."""
+    from unittest.mock import patch
+    from tasker.goose import GooseRunResult, run_goose_with_backoff
+    from tasker.models import RateLimitConfig
+
+    crash_with_stderr = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="Some real error: file not found",
+        return_code=1,
+    )
+
+    with patch("tasker.goose.run_goose", return_value=crash_with_stderr) as mock:
+        result = run_goose_with_backoff(
+            recipe_path="/tmp/recipe.yaml",
+            session_name="test-session",
+            rate_limit=RateLimitConfig(enabled=True, max_retries=5),
+        )
+
+    assert result.success is False
+    assert mock.call_count == 1  # no retry — returned immediately
+
+
+def test_backoff_fallback_model():
+    """After primary model retries exhausted, fallback model is tried."""
+    from unittest.mock import patch
+    from tasker.goose import GooseRunResult, run_goose_with_backoff
+    from tasker.models import RateLimitConfig
+
+    silent_crash = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="",
+        return_code=1,
+    )
+    fallback_success = GooseRunResult(
+        success=True,
+        raw_stdout='{"messages":[{"role":"assistant","content":"fallback done"}]}',
+        raw_stderr="",
+        return_code=0,
+    )
+
+    calls = []
+
+    def mock_run_goose(**kwargs):
+        calls.append({"model": kwargs.get("model"), "provider": kwargs.get("provider")})
+        if kwargs.get("provider") == "ollama":
+            return fallback_success
+        return silent_crash
+
+    with patch("tasker.goose.run_goose", side_effect=mock_run_goose):
+        with patch("tasker.goose.time.sleep"):
+            result = run_goose_with_backoff(
+                recipe_path="/tmp/recipe.yaml",
+                session_name="test-session",
+                model="glm-5.1",
+                provider="custom_z.ai",
+                rate_limit=RateLimitConfig(
+                    enabled=True,
+                    max_retries=2,
+                    base_delay_secs=0.1,
+                ),
+                fallback_model="qwen3.5:9b",
+                fallback_provider="ollama",
+            )
+
+    assert result.success is True
+    # Calls: 2 primary retries (exhausted) + 1 fallback
+    primary_calls = [c for c in calls if c["provider"] == "custom_z.ai"]
+    fallback_calls = [c for c in calls if c["provider"] == "ollama"]
+    assert len(primary_calls) == 2  # max_retries=2
+    assert len(fallback_calls) == 1  # one fallback attempt
+    assert fallback_calls[0]["model"] == "qwen3.5:9b"
+
+
+def test_backoff_fallback_model_also_fails():
+    """Fallback model also fails → return the fallback's failure result."""
+    from unittest.mock import patch
+    from tasker.goose import GooseRunResult, run_goose_with_backoff
+    from tasker.models import RateLimitConfig
+
+    silent_crash = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="",
+        return_code=1,
+    )
+
+    with patch("tasker.goose.run_goose", return_value=silent_crash):
+        with patch("tasker.goose.time.sleep"):
+            result = run_goose_with_backoff(
+                recipe_path="/tmp/recipe.yaml",
+                session_name="test-session",
+                model="glm-5.1",
+                provider="custom_z.ai",
+                rate_limit=RateLimitConfig(
+                    enabled=True,
+                    max_retries=2,
+                    base_delay_secs=0.1,
+                ),
+                fallback_model="qwen3.5:9b",
+                fallback_provider="ollama",
+            )
+
+    assert result.success is False
+    # Should still return a result (the fallback's failure)
+
+
+def test_backoff_no_fallback_when_not_configured():
+    """Without fallback config, returns failure after exhausting retries."""
+    from unittest.mock import patch
+    from tasker.goose import GooseRunResult, run_goose_with_backoff
+    from tasker.models import RateLimitConfig
+
+    silent_crash = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="",
+        return_code=1,
+    )
+
+    with patch("tasker.goose.run_goose", return_value=silent_crash):
+        with patch("tasker.goose.time.sleep"):
+            result = run_goose_with_backoff(
+                recipe_path="/tmp/recipe.yaml",
+                session_name="test-session",
+                model="glm-5.1",
+                provider="custom_z.ai",
+                rate_limit=RateLimitConfig(
+                    enabled=True,
+                    max_retries=2,
+                    base_delay_secs=0.1,
+                ),
+            )
+
+    assert result.success is False
+    # No fallback → just return the last failure
+
+
+def test_fallback_model_config():
+    """FallbackModel dataclass stores provider/model correctly."""
+    from tasker.models import FallbackModel
+
+    fb = FallbackModel(provider="ollama", model="qwen3.5:9b", max_attempts=3)
+    assert fb.provider == "ollama"
+    assert fb.model == "qwen3.5:9b"
+    assert fb.max_attempts == 3
+
+    # Defaults
+    fb2 = FallbackModel(provider="anthropic", model="claude-sonnet-4")
+    assert fb2.max_attempts == 2
+
+
+def test_rate_limit_config_with_fallback():
+    """RateLimitConfig accepts fallback_dev and fallback_qa."""
+    from tasker.models import FallbackModel, RateLimitConfig
+
+    cfg = RateLimitConfig(
+        enabled=True,
+        fallback_dev=FallbackModel(provider="ollama", model="qwen3.5:9b"),
+        fallback_qa=FallbackModel(provider="anthropic", model="claude-sonnet-4"),
+    )
+    assert cfg.fallback_dev is not None
+    assert cfg.fallback_dev.provider == "ollama"
+    assert cfg.fallback_qa is not None
+    assert cfg.fallback_qa.model == "claude-sonnet-4"
+
+    # Without fallbacks (default)
+    cfg_plain = RateLimitConfig()
+    assert cfg_plain.fallback_dev is None
+    assert cfg_plain.fallback_qa is None
+
+
+def test_fallback_model_selection_per_actor():
+    """Dev → fallback_dev (ollama), QA → fallback_qa (anthropic)."""
+    from unittest.mock import patch
+    from tasker.goose import GooseRunResult
+    from tasker.models import FallbackModel, RateLimitConfig
+
+    # We test the resolution logic in _run_goose_with_ui by checking
+    # that the right fallback_model/fallback_provider are passed to
+    # run_goose_with_backoff.  We do this by mocking it and inspecting calls.
+    calls = {}
+
+    def mock_backoff(**kwargs):
+        calls[kwargs.get("fallback_provider")] = kwargs.get("fallback_model")
+        return GooseRunResult(
+            success=True, raw_stdout="ok", raw_stderr="", return_code=0
+        )
+
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Actor
+
+    rl = RateLimitConfig(
+        enabled=True,
+        fallback_dev=FallbackModel(provider="ollama", model="qwen3.5:9b"),
+        fallback_qa=FallbackModel(provider="anthropic", model="claude-sonnet-4"),
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        task_file = Path(tmpdir) / "tasks.md"
+        task_file.write_text("# Phase 1\n## P1\n- [ ] T1 do something\n")
+        log_file = Path(tmpdir) / "log.jsonl"
+
+        orch = Orchestrator(
+            task_file=task_file,
+            dev_recipe=Path("/tmp/dev.yaml"),
+            qa_recipe=Path("/tmp/qa.yaml"),
+            log_file=log_file,
+            model="glm-5.1",
+            provider="custom_z.ai",
+            rate_limit=rl,
+        )
+
+        # Patch run_goose_with_backoff to capture the fallback args
+        with patch(
+            "tasker.orchestrator.run_goose_with_backoff", side_effect=mock_backoff
+        ):
+            # Dev call
+            orch._run_goose_with_ui(
+                Actor.DEV,
+                "T1",
+                recipe_path="/tmp/dev.yaml",
+                session_name="dev-session",
+            )
+            # QA call
+            orch._run_goose_with_ui(
+                Actor.QA,
+                "T1",
+                recipe_path="/tmp/qa.yaml",
+                session_name="qa-session",
+            )
+
+    assert "ollama" in calls, f"Expected ollama fallback for DEV, got calls: {calls}"
+    assert calls["ollama"] == "qwen3.5:9b"
+    assert "anthropic" in calls, (
+        f"Expected anthropic fallback for QA, got calls: {calls}"
+    )
+    assert calls["anthropic"] == "claude-sonnet-4"
+
+
 if __name__ == "__main__":
     test_parser()
     test_logger()
@@ -5606,5 +5973,21 @@ if __name__ == "__main__":
 
     # P9.T7 — orchestrator auto-init e2e verification
     test_vcs_auto_init_e2e()
+
+    # P11 — Silent crash detection + model fallback
+    test_is_silent_crash_true()
+    test_is_silent_crash_with_stderr()
+    test_is_silent_crash_with_stdout()
+    test_is_silent_crash_success()
+    test_is_silent_crash_timeout()
+    test_is_silent_crash_whitespace_only()
+    test_backoff_retries_on_silent_crash()
+    test_backoff_no_retry_on_nonempty_stderr()
+    test_backoff_fallback_model()
+    test_backoff_fallback_model_also_fails()
+    test_backoff_no_fallback_when_not_configured()
+    test_fallback_model_config()
+    test_rate_limit_config_with_fallback()
+    test_fallback_model_selection_per_actor()
 
     print("\n✅ All dry-run tests passed!")

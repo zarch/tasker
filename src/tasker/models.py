@@ -172,6 +172,22 @@ class QARecoveryStage(str, enum.Enum):
 
 
 @dataclass
+class FallbackModel:
+    """Configuration for a fallback model to use when the primary provider
+    is unreachable (e.g. rate-limited).  The fallback is per-role: dev tasks
+    can use a local model (cheaper, good enough for coding) while QA tasks
+    use a strong cloud model (reviews need higher quality).
+
+    The fallback is tried once per goose call — the next orchestrator turn
+    goes back to the primary model.
+    """
+
+    provider: str  # e.g. "ollama", "anthropic"
+    model: str  # e.g. "qwen3.5:9b", "claude-sonnet-4"
+    max_attempts: int = 2  # how many times to try the fallback before giving up
+
+
+@dataclass
 class RateLimitConfig:
     """Controls exponential backoff when the goose subprocess fails with
     a connection / rate-limit error (e.g. "Error: not connected").
@@ -186,6 +202,8 @@ class RateLimitConfig:
         max_retries:        Max consecutive connection-error retries before
                             giving up and letting recovery handle it.
         jitter:             Fractional jitter (0-1) to avoid thundering herd.
+        fallback_dev:       Fallback model for dev role (e.g. local ollama).
+        fallback_qa:        Fallback model for QA role (e.g. cloud claude).
     """
 
     enabled: bool = True
@@ -193,6 +211,8 @@ class RateLimitConfig:
     max_delay_secs: float = 300.0
     max_retries: int = 5
     jitter: float = 0.25
+    fallback_dev: FallbackModel | None = None
+    fallback_qa: FallbackModel | None = None
 
     def next_delay(self, attempt: int) -> float:
         """Compute the backoff delay for *attempt* (1-based).

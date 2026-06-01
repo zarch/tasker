@@ -15,7 +15,7 @@ from rich.console import Console
 
 from .monitoring import setup_monitoring
 from .orchestrator import Orchestrator
-from .models import RateLimitConfig, SessionScope
+from .models import FallbackModel, RateLimitConfig, SessionScope
 
 # Default recipes shipped with tasker, resolved relative to this file.
 _RECIPES_DIR = Path(__file__).resolve().parent.parent.parent / "recipes"
@@ -151,6 +151,26 @@ def main(
         "--max-consecutive-empty",
         help="Max consecutive empty-output goose calls before marking a task as permanently failed ([~]). Default: 3.",
     ),
+    fallback_dev_model: str | None = typer.Option(
+        None,
+        "--fallback-dev-model",
+        help="Fallback model for dev role when primary is unreachable (e.g. qwen3.5:9b). Requires --fallback-dev-provider.",
+    ),
+    fallback_dev_provider: str | None = typer.Option(
+        None,
+        "--fallback-dev-provider",
+        help="Fallback provider for dev role (e.g. ollama). Requires --fallback-dev-model.",
+    ),
+    fallback_qa_model: str | None = typer.Option(
+        None,
+        "--fallback-qa-model",
+        help="Fallback model for QA role when primary is unreachable (e.g. claude-sonnet-4). Requires --fallback-qa-provider.",
+    ),
+    fallback_qa_provider: str | None = typer.Option(
+        None,
+        "--fallback-qa-provider",
+        help="Fallback provider for QA role (e.g. anthropic). Requires --fallback-qa-model.",
+    ),
     monitor_log: Path = typer.Option(
         None,
         "--monitor-log",
@@ -269,6 +289,16 @@ def main(
             base_delay_secs=rate_limit_base_delay,
             max_delay_secs=rate_limit_max_delay,
             max_retries=rate_limit_max_retries,
+            fallback_dev=(
+                FallbackModel(provider=fallback_dev_provider, model=fallback_dev_model)
+                if fallback_dev_provider and fallback_dev_model
+                else None
+            ),
+            fallback_qa=(
+                FallbackModel(provider=fallback_qa_provider, model=fallback_qa_model)
+                if fallback_qa_provider and fallback_qa_model
+                else None
+            ),
         ),
         decompose_recipe=str(decompose.resolve()) if decompose else None,
         arch_recipe=arch_abs,

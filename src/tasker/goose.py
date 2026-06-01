@@ -54,6 +54,26 @@ def is_connection_error(stderr: str, return_code: int | None = None) -> bool:
     return False
 
 
+def is_silent_crash(result: GooseRunResult) -> bool:
+    """Return True if goose crashed with no output at all.
+
+    This happens when the LLM provider rate-limits or refuses the request
+    but goose exits without printing anything to stderr.  These are
+    transient errors that should be retried with backoff, not burned
+    through the recovery-stage budget.
+
+    The heuristic: rc!=0 AND empty stdout AND empty stderr AND not a
+    timeout (timeouts have their own handling path).
+    """
+    return (
+        not result.success
+        and not result.timed_out
+        and result.return_code != 0
+        and not result.raw_stdout.strip()
+        and not result.raw_stderr.strip()
+    )
+
+
 @dataclass
 class GooseRunResult:
     """Result of a goose run invocation."""
@@ -770,22 +790,34 @@ def run_goose_with_backoff(
     cwd: str | Path | None = None,
     rate_limit: RateLimitConfig | None = None,
     memory_limit: str | None = None,
+    fallback_model: str | None = None,
+    fallback_provider: str | None = None,
 ) -> GooseRunResult:
     """Run goose with automatic retry on transient connection errors.
 
-    Wraps :func:`run_goose` and adds exponential backoff when the subprocess
-    fails with a detected connection/rate-limit error (e.g. "Error: not
-    connected").  Non-connection failures and successful runs are returned
-    immediately without any retry.
+    Wraps :func:`run_goose` and adds three layers of resilience:
 
-    The backoff delay is controlled by *rate_limit* (defaults to sensible
-    values when ``None``).
+    1. **Silent-crash detection**: when goose exits rc!=0 with completely
+       empty output (no stdout, no stderr), this is treated as a transient
+       provider failure (rate-limit, temporary outage) and retried with
+       exponential backoff.
+
+    2. **Connection-error backoff**: when stderr contains a known transient
+       pattern ("429", "rate limit", "not connected", etc.), retry with
+       exponential backoff up to *max_retries*.
+
+    3. **Fallback model**: after the primary model's retries are exhausted,
+       try the fallback model/provider (if configured).  This lets the
+       orchestrator keep making progress — e.g. dev falls back to a local
+       Ollama model while QA falls back to a different cloud provider.
+       The fallback is per-call only; the next orchestrator turn reuses
+       the primary model.
 
     *memory_limit* is forwarded to :func:`run_goose`.  See its docstring
     for details.
 
     Returns the last :class:`GooseRunResult` -- either a successful run or
-    the final failure after exhausting retries.
+    the final failure after exhausting all retries and fallbacks.
     """
     if rate_limit is None:
         rate_limit = RateLimitConfig()
@@ -817,23 +849,34 @@ def run_goose_with_backoff(
             memory_limit=memory_limit,
         )
 
-        # --- Success or non-connection failure: return immediately ---
-        if result.success or result.timed_out:
+        # --- Success: return immediately ---
+        if result.success:
             return result
 
-        if not is_connection_error(result.raw_stderr, result.return_code):
+        # --- Timeout: return immediately (has its own handling) ---
+        if result.timed_out:
             return result
 
-        # --- Transient connection error detected ---
+        # --- Is this a transient error we should retry? ---
+        is_conn_err = is_connection_error(result.raw_stderr, result.return_code)
+        is_silent = is_silent_crash(result)
+
+        if not is_conn_err and not is_silent:
+            # Genuine non-transient failure — return immediately
+            return result
+
+        # --- Transient error detected (connection or silent crash) ---
+        error_kind = "connection_error" if is_conn_err else "silent_crash"
         if attempt >= rate_limit.max_retries:
             log.warning(
                 "goose.backoff.exhausted",
                 session=session_name,
                 attempt=attempt,
                 max_retries=rate_limit.max_retries,
+                error_kind=error_kind,
                 stderr=result.raw_stderr[:200],
             )
-            return result  # give up, let the caller/recovery pipeline handle it
+            break  # exit primary retry loop → try fallback
 
         delay = rate_limit.next_delay(attempt)
         log.warning(
@@ -842,7 +885,50 @@ def run_goose_with_backoff(
             attempt=attempt,
             max_retries=rate_limit.max_retries,
             delay_secs=round(delay, 1),
+            error_kind=error_kind,
             stderr=result.raw_stderr[:200],
         )
-        # TODO: emit a UI-visible message so the user sees the wait
         time.sleep(delay)
+
+    # ── Fallback model ──────────────────────────────────────────
+    # Primary model exhausted its retries.  Try the fallback model
+    # if one is configured — this keeps progress going even when the
+    # primary provider is down for an extended period.
+    if fallback_model and fallback_provider:
+        log.warning(
+            "goose.fallback.attempt",
+            session=session_name,
+            primary_model=model,
+            primary_provider=provider,
+            fallback_model=fallback_model,
+            fallback_provider=fallback_provider,
+        )
+        fallback_result = run_goose(
+            recipe_path=recipe_path,
+            session_name=session_name,
+            params=params,
+            max_turns=max_turns,
+            timeout_secs=timeout_secs,
+            model=fallback_model,
+            provider=fallback_provider,
+            cwd=cwd,
+            memory_limit=memory_limit,
+        )
+        if fallback_result.success:
+            log.info(
+                "goose.fallback.success",
+                session=session_name,
+                fallback_model=fallback_model,
+                fallback_provider=fallback_provider,
+            )
+            return fallback_result
+        log.warning(
+            "goose.fallback.failed",
+            session=session_name,
+            fallback_model=fallback_model,
+            fallback_provider=fallback_provider,
+            return_code=fallback_result.return_code,
+        )
+        return fallback_result
+
+    return result

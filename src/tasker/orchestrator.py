@@ -21,6 +21,7 @@ from .models import (
     DecomposeResponse,
     DevRequest,
     DevResponse,
+    FallbackModel,
     IterationEntry,
     Phase,
     QARecoveryStage,
@@ -976,6 +977,18 @@ class Orchestrator:
         label = f"{icon} {name} — Task {task_label}"
         if detail:
             label += f"  ({detail})"
+
+        # Resolve fallback model based on actor role:
+        #   DEV → fallback_dev (e.g. local ollama for coding)
+        #   QA  → fallback_qa  (e.g. different cloud for reviews)
+        fb: FallbackModel | None = None
+        if actor == Actor.DEV:
+            fb = self.rate_limit.fallback_dev
+        elif actor == Actor.QA:
+            fb = self.rate_limit.fallback_qa
+        fallback_model = fb.model if fb else None
+        fallback_provider = fb.provider if fb else None
+
         # Take a memory snapshot before launching goose
         snap_before = snapshot()
         if snap_before is not None:
@@ -995,6 +1008,8 @@ class Orchestrator:
                 cwd=cwd,
                 rate_limit=self.rate_limit,
                 memory_limit=None,  # auto-detect from /proc/meminfo
+                fallback_model=fallback_model,
+                fallback_provider=fallback_provider,
             )
         finally:
             self.ui.clear_pending_iteration()
