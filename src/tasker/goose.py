@@ -320,6 +320,61 @@ def _extract_last_assistant_text(raw_stdout: str) -> tuple[str, bool, int, int]:
     return raw_stdout, False, 0, 0
 
 
+def _extract_tool_response_json(raw_stdout: str) -> dict | None:
+    """Scan goose envelope for tasker.respond JSON inside tool responses.
+
+    When the agent correctly executes ``python3 -m tasker.respond`` via the
+    shell tool, the validated JSON output appears in a ``toolResponse``
+    message (role=user) under ``structuredContent.stdout``.  The final
+    assistant text may contain only a plain-language summary with no JSON.
+
+    This function scans ALL messages in reverse order, looking for
+    ``toolResponse`` entries whose ``stdout`` contains valid JSON that
+    matches the tasker.respond schema (has a ``status`` or ``decision``
+    key).  Returns the **last** (most recent) match, or *None*.
+    """
+    try:
+        envelope = json.loads(raw_stdout)
+        if not isinstance(envelope, dict) or "messages" not in envelope:
+            return None
+        messages = envelope["messages"]
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    # Scan in reverse to find the most recent tasker.respond output
+    for msg in reversed(messages):
+        contents = msg.get("content", [])
+        if not isinstance(contents, list):
+            continue
+        for item in contents:
+            if item.get("type") != "toolResponse":
+                continue
+            # Extract stdout from structuredContent
+            try:
+                structured = item["toolResult"]["value"]["structuredContent"]
+                stdout = structured.get("stdout", "")
+            except (KeyError, TypeError):
+                # Fallback: try text content
+                try:
+                    parts = item["toolResult"]["value"]["content"]
+                    stdout = " ".join(
+                        p.get("text", "") for p in parts if p.get("type") == "text"
+                    )
+                except (KeyError, TypeError):
+                    continue
+
+            if not stdout:
+                continue
+
+            # Extract JSON blocks from this stdout (it may be fenced)
+            blocks = _extract_json_blocks(stdout)
+            for block in reversed(blocks):
+                # Check if it looks like a tasker.respond output
+                if "status" in block or "decision" in block:
+                    return block
+    return None
+
+
 def build_goose_command(
     recipe_path: str | Path,
     session_name: str,
@@ -640,6 +695,22 @@ def run_goose(
             blocks = _extract_json_blocks(assistant_text)
             json_blocks_found = len(blocks)
             parsed = blocks[-1] if blocks else None
+
+            # ── Fallback: scan tool responses for tasker.respond JSON ──
+            # When the agent executes ``python3 -m tasker.respond`` via the
+            # shell tool, the validated JSON appears in a toolResponse
+            # message — not in the assistant's final text.  If the cascade
+            # found nothing in assistant text, check tool responses.
+            if parsed is None:
+                tool_json = _extract_tool_response_json(stdout)
+                if tool_json is not None:
+                    parsed = tool_json
+                    json_blocks_found = 1
+                    log.info(
+                        "goose.tool_response_fallback",
+                        session=session_name,
+                        keys=list(tool_json.keys()),
+                    )
 
             # Detect cascade: is there a malformed candidate after the last
             # valid block?

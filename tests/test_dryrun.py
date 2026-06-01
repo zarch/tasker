@@ -5853,6 +5853,262 @@ def test_fallback_model_selection_per_actor():
     assert calls["anthropic"] == "claude-sonnet-4"
 
 
+# ═══════════════════════════════════════════════════════════════════
+# P12 — Tool response JSON extraction (_extract_tool_response_json)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _make_envelope(messages: list[dict]) -> str:
+    """Helper: wrap messages in a goose envelope."""
+    return json.dumps({"messages": messages})
+
+
+def _make_tool_response(stdout_text: str) -> dict:
+    """Helper: create a toolResponse message like goose produces."""
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "toolResponse",
+                "toolResult": {
+                    "status": "success",
+                    "value": {
+                        "content": [
+                            {"type": "text", "text": stdout_text},
+                        ],
+                        "structuredContent": {
+                            "stdout": stdout_text,
+                            "stderr": "",
+                            "exit_code": 0,
+                        },
+                    },
+                },
+            }
+        ],
+    }
+
+
+def _make_assistant_text(text: str) -> dict:
+    """Helper: create an assistant message with text content."""
+    return {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def _make_user_text(text: str) -> dict:
+    """Helper: create a user message with text content."""
+    return {
+        "role": "user",
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def test_extract_tool_response_json_found():
+    """toolResponse with tasker.respond JSON is extracted."""
+    from tasker.goose import _extract_tool_response_json
+
+    respond_json = json.dumps(
+        {
+            "status": "done",
+            "summary": "Implemented X",
+            "files_modified": ["a.py"],
+        }
+    )
+    stdout_text = f"```json\n{respond_json}\n```"
+    envelope = _make_envelope(
+        [
+            _make_user_text("task prompt"),
+            _make_assistant_text("I did the work."),
+            _make_tool_response(stdout_text),
+            _make_assistant_text("Task complete."),
+        ]
+    )
+    result = _extract_tool_response_json(envelope)
+    assert result is not None, "Should find tasker.respond JSON in tool response"
+    assert result["status"] == "done"
+    assert result["summary"] == "Implemented X"
+    assert result["files_modified"] == ["a.py"]
+
+
+def test_extract_tool_response_json_no_envelope():
+    """Non-JSON input returns None."""
+    from tasker.goose import _extract_tool_response_json
+
+    assert _extract_tool_response_json("not json") is None
+    assert _extract_tool_response_json("{}") is None
+    assert _extract_tool_response_json('{"messages": []}') is None
+
+
+def test_extract_tool_response_json_no_tool_response():
+    """Envelope with no toolResponse messages returns None."""
+    from tasker.goose import _extract_tool_response_json
+
+    envelope = _make_envelope(
+        [
+            _make_user_text("prompt"),
+            _make_assistant_text("response"),
+        ]
+    )
+    assert _extract_tool_response_json(envelope) is None
+
+
+def test_extract_tool_response_json_empty_stdout():
+    """toolResponse with empty stdout returns None."""
+    from tasker.goose import _extract_tool_response_json
+
+    envelope = _make_envelope(
+        [
+            _make_user_text("prompt"),
+            _make_tool_response(""),
+        ]
+    )
+    assert _extract_tool_response_json(envelope) is None
+
+
+def test_extract_tool_response_json_multiple_responses():
+    """When multiple toolResponses exist, the LAST one wins (reverse scan)."""
+    from tasker.goose import _extract_tool_response_json
+
+    first_json = json.dumps({"status": "started", "summary": "Starting"})
+    second_json = json.dumps({"status": "done", "summary": "Done"})
+    envelope = _make_envelope(
+        [
+            _make_user_text("prompt"),
+            _make_tool_response(f"```json\n{first_json}\n```"),
+            _make_assistant_text("working..."),
+            _make_tool_response(f"```json\n{second_json}\n```"),
+            _make_assistant_text("finished."),
+        ]
+    )
+    result = _extract_tool_response_json(envelope)
+    assert result is not None
+    assert result["status"] == "done", "Should pick the LAST tool response"
+
+
+def test_extract_tool_response_json_text_fallback():
+    """toolResponse without structuredContent falls back to text content."""
+    from tasker.goose import _extract_tool_response_json
+
+    respond_json = json.dumps({"status": "done", "summary": "OK"})
+    msg = {
+        "role": "user",
+        "content": [
+            {
+                "type": "toolResponse",
+                "toolResult": {
+                    "value": {
+                        "content": [
+                            {"type": "text", "text": f"```json\n{respond_json}\n```"},
+                        ],
+                    },
+                },
+            }
+        ],
+    }
+    envelope = _make_envelope([_make_user_text("prompt"), msg])
+    result = _extract_tool_response_json(envelope)
+    assert result is not None
+    assert result["status"] == "done"
+
+
+def test_extract_tool_response_json_no_status_key():
+    """toolResponse JSON without 'status' or 'decision' key is ignored."""
+    from tasker.goose import _extract_tool_response_json
+
+    random_json = json.dumps({"command": "ls", "output": "file1 file2"})
+    envelope = _make_envelope(
+        [
+            _make_user_text("prompt"),
+            _make_tool_response(f"```json\n{random_json}\n```"),
+        ]
+    )
+    assert _extract_tool_response_json(envelope) is None
+
+
+def test_tool_response_fallback_in_goose_result():
+    """Integration: GooseRunResult gets parsed_json from tool response fallback."""
+    from tasker.goose import _extract_tool_response_json
+
+    # Verify the helper works with a realistic goose envelope
+    respond_json = json.dumps(
+        {
+            "status": "done",
+            "summary": "SEC-1.T3 complete",
+            "files_modified": ["test.py"],
+            "notes": "",
+            "blocker_description": "",
+            "blocker_suggestion": "",
+        }
+    )
+    stdout_text = f"```json\n{respond_json}\n```"
+
+    # This is the actual structure goose produces
+    envelope = json.dumps(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Task prompt here"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "toolRequest",
+                            "toolCall": {
+                                "status": "success",
+                                "value": {
+                                    "name": "shell",
+                                    "arguments": {
+                                        "command": "python3 -m tasker.respond dev done --summary X"
+                                    },
+                                },
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "toolResponse",
+                            "toolResult": {
+                                "status": "success",
+                                "value": {
+                                    "content": [
+                                        {"type": "text", "text": stdout_text},
+                                    ],
+                                    "structuredContent": {
+                                        "stdout": stdout_text,
+                                        "stderr": "",
+                                        "exit_code": 0,
+                                    },
+                                },
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Task SEC-1.T3 is complete. The test already exists.",
+                        },
+                    ],
+                },
+            ]
+        }
+    )
+
+    result = _extract_tool_response_json(envelope)
+    assert result is not None, "Should find tasker.respond JSON from realistic envelope"
+    assert result["status"] == "done"
+    assert result["summary"] == "SEC-1.T3 complete"
+    assert result["files_modified"] == ["test.py"]
+
+
 if __name__ == "__main__":
     test_parser()
     test_logger()
@@ -5989,5 +6245,15 @@ if __name__ == "__main__":
     test_fallback_model_config()
     test_rate_limit_config_with_fallback()
     test_fallback_model_selection_per_actor()
+
+    # P12 — Tool response JSON extraction
+    test_extract_tool_response_json_found()
+    test_extract_tool_response_json_no_envelope()
+    test_extract_tool_response_json_no_tool_response()
+    test_extract_tool_response_json_empty_stdout()
+    test_extract_tool_response_json_multiple_responses()
+    test_extract_tool_response_json_text_fallback()
+    test_extract_tool_response_json_no_status_key()
+    test_tool_response_fallback_in_goose_result()
 
     print("\n✅ All dry-run tests passed!")
