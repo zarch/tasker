@@ -6109,6 +6109,221 @@ def test_tool_response_fallback_in_goose_result():
     assert result["files_modified"] == ["test.py"]
 
 
+# ═══════════════════════════════════════════════════════════════════
+# P13 — Multi-repo VCS commit
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_discover_git_repos_finds_subdir_repos():
+    """_discover_git_repos finds .git dirs in immediate subdirectories."""
+    import tempfile
+    from tasker.orchestrator import Orchestrator
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        # Create two fake git repos and one non-repo dir
+        (tmp / "repo_a" / ".git").mkdir(parents=True)
+        (tmp / "repo_b" / ".git").mkdir(parents=True)
+        (tmp / "not_a_repo").mkdir(parents=True)
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.cwd = tmp
+        repos = orch._discover_git_repos()
+        names = [p.name for p in repos]
+        assert names == ["repo_a", "repo_b"], f"Expected repo_a, repo_b; got {names}"
+
+
+def test_discover_git_repos_empty_cwd():
+    """No .git dirs → empty list."""
+    import tempfile
+    from tasker.orchestrator import Orchestrator
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "src").mkdir()
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.cwd = tmp
+        assert orch._discover_git_repos() == []
+
+
+def test_discover_git_repos_none_cwd():
+    """cwd=None → empty list."""
+    from tasker.orchestrator import Orchestrator
+
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.cwd = None
+    assert orch._discover_git_repos() == []
+
+
+def test_multi_repo_commit_commits_dirty_repos():
+    """_multi_repo_commit runs git add + commit in repos with changes."""
+    import subprocess
+    import tempfile
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task
+    from tasker.ui import TaskerUI
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        # Create two real git repos
+        for name in ("alpha", "beta"):
+            repo = tmp / name
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init"], cwd=str(repo), check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "t@t.com"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "T"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+            )
+            (repo / "file.txt").write_text("hello")
+            subprocess.run(
+                ["git", "add", "-A"], cwd=str(repo), check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "init"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+            )
+
+        # Make a change in alpha only
+        (tmp / "alpha" / "file.txt").write_text("changed")
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._git_repos = [tmp / "alpha", tmp / "beta"]
+        orch.ui = TaskerUI()
+        task = Task(phase_index=0, task_index=0, text="Test task")
+        orch._multi_repo_commit(task)
+
+        # alpha should have a new commit
+        log_a = subprocess.run(
+            ["git", "log", "--oneline"],
+            cwd=str(tmp / "alpha"),
+            capture_output=True,
+            text=True,
+        )
+        assert "tasker: P1.T1" in log_a.stdout
+
+        # beta should NOT have a new commit (no changes)
+        log_b = subprocess.run(
+            ["git", "log", "--oneline"],
+            cwd=str(tmp / "beta"),
+            capture_output=True,
+            text=True,
+        )
+        assert "tasker: P1.T1" not in log_b.stdout
+
+
+def test_multi_repo_diff_aggregates():
+    """_multi_repo_diff collects diffs from all repos with changes."""
+    import subprocess
+    import tempfile
+    from tasker.orchestrator import Orchestrator
+    from tasker.ui import TaskerUI
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for name in ("x", "y"):
+            repo = tmp / name
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init"], cwd=str(repo), check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "t@t.com"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "T"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+            )
+            (repo / "f.txt").write_text("base")
+            subprocess.run(
+                ["git", "add", "-A"], cwd=str(repo), check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "init"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+            )
+
+        # Change x only
+        (tmp / "x" / "f.txt").write_text("modified")
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._git_repos = [tmp / "x", tmp / "y"]
+        orch.ui = TaskerUI()
+        diff = orch._multi_repo_diff()
+
+        assert "x/" in diff
+        assert "modified" in diff
+        # y has no changes — should not appear
+        assert "y/" not in diff
+
+
+def test_vcs_get_diff_multi_repo_mode():
+    """_vcs_get_diff returns multi-repo diff when _git_repos is set."""
+    import subprocess
+    import tempfile
+    from tasker.orchestrator import Orchestrator
+    from tasker.models import Task
+    from tasker.ui import TaskerUI
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        repo = tmp / "myrepo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@t.com"],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "T"],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+        )
+        (repo / "a.py").write_text("print('hi')")
+        subprocess.run(
+            ["git", "add", "-A"], cwd=str(repo), check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+        )
+        (repo / "a.py").write_text("print('bye')")
+
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._git_repos = [repo]
+        orch.cwd = tmp
+        orch.vcs = None
+        orch.ui = TaskerUI()
+        task = Task(phase_index=0, task_index=0, text="test")
+
+        ctx, note = orch._vcs_get_diff(task)
+        assert "multi-repo" in ctx
+        assert "bye" in ctx
+
+
 if __name__ == "__main__":
     test_parser()
     test_logger()
@@ -6255,5 +6470,13 @@ if __name__ == "__main__":
     test_extract_tool_response_json_text_fallback()
     test_extract_tool_response_json_no_status_key()
     test_tool_response_fallback_in_goose_result()
+
+    # P13 — Multi-repo VCS commit
+    test_discover_git_repos_finds_subdir_repos()
+    test_discover_git_repos_empty_cwd()
+    test_discover_git_repos_none_cwd()
+    test_multi_repo_commit_commits_dirty_repos()
+    test_multi_repo_diff_aggregates()
+    test_vcs_get_diff_multi_repo_mode()
 
     print("\n✅ All dry-run tests passed!")

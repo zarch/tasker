@@ -436,6 +436,9 @@ class Orchestrator:
 
         # VCS integration (jj or git backend, or None)
         self.vcs = vcs
+        # Multi-repo mode: when CWD isn't a git repo but subdirs are,
+        # we track them here and commit per-repo on task approval.
+        self._git_repos: list[Path] = []
 
         # Session scope — controls when new goose sessions are created
         self.session_scope = session_scope
@@ -517,8 +520,25 @@ class Orchestrator:
                     self.ui.print_info("VCS integration: ON")
                 except RuntimeError as exc:
                     log.error("vcs.init_failed", error=str(exc))
-                    self.ui.print_error(f"VCS init failed: {exc}")
-                    self.vcs = None
+                    # Single-repo init failed — try multi-repo discovery.
+                    # This handles the common case where the CWD is a parent
+                    # directory containing multiple git repos as subdirectories.
+                    self._git_repos = self._discover_git_repos()
+                    if self._git_repos:
+                        self.vcs = None  # disable single-repo backend
+                        repo_names = ", ".join(p.name for p in self._git_repos)
+                        log.info(
+                            "vcs.multi_repo",
+                            repos=repo_names,
+                            count=len(self._git_repos),
+                        )
+                        self.ui.print_info(
+                            f"VCS integration: multi-repo mode "
+                            f"({len(self._git_repos)} repos: {repo_names})"
+                        )
+                    else:
+                        self.ui.print_error(f"VCS init failed: {exc}")
+                        self.vcs = None
 
         # Parse tasks
         self.phases = load_tasks(self.task_file)
@@ -1119,7 +1139,22 @@ class Orchestrator:
 
         Called at the start of each task when VCS is enabled.
         Sets task.base_ref and task.task_ref.
+
+        In multi-repo mode, we skip feature-branch creation and
+        just log a marker — each repo gets a simple ``git add -A &&
+        git commit`` on approval.
         """
+        if self._git_repos:
+            log.info(
+                "vcs.multi_repo_task_started",
+                task_label=task.label,
+                repos=[p.name for p in self._git_repos],
+            )
+            self.ui.print_info(
+                f"[{task.label}] VCS: multi-repo mode "
+                f"(will commit in {len(self._git_repos)} repos on approval)"
+            )
+            return
         if self.vcs is None:
             return
         try:
@@ -1151,11 +1186,25 @@ class Orchestrator:
 
         Returns:
             A tuple of (project_context, diff_size_note).
-            - project_context: the formatted diff string, or a message pointing
-              to a temp file when the diff exceeds MAX_DIFF_SIZE.
-            - diff_size_note: a human-readable note about the diff size for
-              logging/UI, or empty string if no diff.
+            - project_context: the formatted diff string, or a message
+              pointing to a temp file when the diff exceeds MAX_DIFF_SIZE.
+            - diff_size_note: a human-readable note about the diff size
+              for logging/UI, or empty string if no diff.
         """
+        # ── Multi-repo mode ──
+        if self._git_repos:
+            diff = self._multi_repo_diff()
+            if not diff:
+                return "", ""
+            diff_lines = diff.count("\n") + 1
+            diff_bytes = len(diff.encode("utf-8", errors="replace"))
+            project_context = (
+                f"## VCS Diff (multi-repo, task changes)\n```\n{diff}\n```"
+            )
+            size_note = f"({diff_lines} lines, {diff_bytes / 1024:.0f} KB)"
+            return project_context, size_note
+
+        # ── Single-repo mode ──
         if self.vcs is None:
             return "", ""
 
@@ -1245,6 +1294,9 @@ class Orchestrator:
 
         Called when QA approves the task.
         """
+        if self._git_repos:
+            self._multi_repo_commit(task)
+            return
         if self.vcs is None:
             return
         try:
@@ -1254,6 +1306,128 @@ class Orchestrator:
         except RuntimeError as exc:
             log.error("vcs.commit_failed", task_label=task.label, error=str(exc))
             self.ui.print_warning(f"[{task.label}] VCS: failed to commit task: {exc}")
+
+    # ── Multi-repo VCS helpers ────────────────────────────────────
+
+    def _discover_git_repos(self) -> list[Path]:
+        """Find git repos in immediate subdirectories of CWD.
+
+        Scans one level deep: ``CWD/*/``.  Returns paths whose
+        ``.git/`` directory exists, sorted by name.
+        """
+        if self.cwd is None:
+            return []
+
+        repos: list[Path] = []
+        for child in sorted(self.cwd.iterdir()):
+            if not child.is_dir():
+                continue
+            if (child / ".git").exists():
+                repos.append(child)
+
+        log.info(
+            "vcs.discovered_repos",
+            count=len(repos),
+            repos=[p.name for p in repos],
+        )
+        return repos
+
+    def _multi_repo_commit(self, task: Task) -> None:
+        """Commit changes in every discovered git repo that has them.
+
+        For each repo with a dirty working tree, this:
+        1. ``git add -A``
+        2. ``git commit -m "<task_label>: <task_text_summary>"``
+
+        The commit message uses the task label for easy identification.
+        """
+        import subprocess
+
+        if not self._git_repos:
+            return
+
+        msg = f"tasker: {task.label}"
+        committed: list[str] = []
+
+        for repo in self._git_repos:
+            try:
+                # Check for changes
+                status = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=str(repo),
+                )
+                if status.returncode != 0 or not status.stdout.strip():
+                    continue
+
+                # Stage everything
+                subprocess.run(
+                    ["git", "add", "-A"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    cwd=str(repo),
+                    check=True,
+                )
+
+                # Commit
+                result = subprocess.run(
+                    ["git", "commit", "-m", msg, "--allow-empty"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    cwd=str(repo),
+                )
+                if result.returncode == 0:
+                    committed.append(repo.name)
+                    log.info(
+                        "vcs.multi_repo_committed",
+                        task_label=task.label,
+                        repo=repo.name,
+                    )
+                else:
+                    log.warning(
+                        "vcs.multi_repo_commit_failed",
+                        task_label=task.label,
+                        repo=repo.name,
+                        stderr=result.stderr[:200],
+                    )
+            except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+                log.warning(
+                    "vcs.multi_repo_error",
+                    task_label=task.label,
+                    repo=repo.name,
+                    error=str(exc),
+                )
+
+        if committed:
+            self.ui.print_info(
+                f"[{task.label}] VCS: committed in {', '.join(committed)}"
+            )
+        else:
+            self.ui.print_info(f"[{task.label}] VCS: no changes to commit")
+
+    def _multi_repo_diff(self) -> str:
+        """Aggregate ``git diff`` from all discovered repos with changes."""
+        import subprocess
+
+        parts: list[str] = []
+        for repo in self._git_repos:
+            try:
+                result = subprocess.run(
+                    ["git", "diff", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    cwd=str(repo),
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    parts.append(f"### {repo.name}/\n{result.stdout}")
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+        return "\n\n".join(parts)
 
     def _finalize_task(self, phase: Phase, task: Task) -> None:
         """Mark a task as done, update the markdown file, then VCS-commit.
