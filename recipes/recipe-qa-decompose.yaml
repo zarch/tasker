@@ -27,35 +27,27 @@ instructions: |
   tool calls.  This "checkpoint" ensures the orchestrator always gets a
   valid response even if you run out of tokens later.
 
-  **Step 0 — Immediate checkpoint (before ANY tool calls):**
-  ```json
-  {"should_decompose": false, "reason": "Analyzing task: {{ task_label }}", "subtasks": []}
-  ```
+  **IMPORTANT**: Use the `tasker.respond` command to emit your JSON. This
+  guarantees valid format — do NOT write JSON by hand. Examples:
 
-  **After analysis is complete — update with final decision:**
-  ```json
-  {"should_decompose": true, "reason": "...", "subtasks": [...]}
-  ```
-  or:
-  ```json
-  {"should_decompose": false, "reason": "Single focused change in one module.", "subtasks": []}
+  ```bash
+  # Turn 1 — checkpoint (before ANY other tool calls):
+  python3 -m tasker.respond decompose no --reason "Analyzing task: {{ task_label }}"
+
+  # After analysis — decompose:
+  python3 -m tasker.respond decompose yes --reason "Task spans multiple modules" --subtasks 'P1.T3.1|Do A' 'P1.T3.2|Do B'
+
+  # After analysis — don't decompose:
+  python3 -m tasker.respond decompose no --reason "Single focused change in one module."
   ```
 
   **Only the LAST JSON block in your response is parsed**, so your final
   update always overrides the checkpoint.
 
-  ## Structured Output Helper (optional but recommended)
+  ## Structured Output Helper
 
-  A Pydantic model is available for guaranteed-valid JSON:
-
-  ```python
-  from tasker.schema import DecomposeResponse
-  resp = DecomposeResponse(should_decompose=False, reason="Single focused change.")
-  print(resp.model_dump_json())
-  ```
-
-  Use this if you're uncertain about JSON syntax.  Raw JSON in a code block
-  is also acceptable.
+  **ALWAYS use `python3 -m tasker.respond`** — this guarantees valid JSON.
+  Do NOT write JSON by hand.
 
   ## When to Decompose
 
@@ -87,21 +79,13 @@ instructions: |
   ## JSON Response Format
 
   ### No decomposition needed:
-  ```json
-  {"should_decompose": false, "reason": "Single focused change in one module.", "subtasks": []}
+  ```bash
+  python3 -m tasker.respond decompose no --reason "Single focused change in one module."
   ```
 
   ### Decompose into subtasks:
-  ```json
-  {
-    "should_decompose": true,
-    "reason": "Task spans 3 modules and has 4 distinct deliverables.",
-    "subtasks": [
-      {"label": "P1.T3.1", "text": "Implement the GridCell struct... — arch/02-grid-system.md §GridCell"},
-      {"label": "P1.T3.2", "text": "Implement the SpatialIndex trait... — arch/02-grid-system.md §SpatialIndex"},
-      {"label": "P1.T3.3", "text": "Add unit tests for GridCell and SpatialIndex... — arch/02-grid-system.md §Tests"}
-    ]
-  }
+  ```bash
+  python3 -m tasker.respond decompose yes --reason "Task spans 3 modules" --subtasks 'P1.T3.1|Implement the GridCell struct...' 'P1.T3.2|Implement the SpatialIndex trait...' 'P1.T3.3|Add unit tests...'
   ```
 
 parameters:

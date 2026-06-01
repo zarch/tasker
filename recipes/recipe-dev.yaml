@@ -33,17 +33,19 @@ instructions: |
   tool calls.  This "checkpoint" ensures the orchestrator always gets a
   valid response even if you run out of tokens later.
 
-  **Step 0 — Immediate checkpoint (before ANY tool calls):**
-  ```json
-  {"status": "started", "summary": "Starting: {{ task_label }}", "files_modified": [], "notes": "checkpoint"}
-  ```
+  **IMPORTANT**: Use the `tasker.respond` command to emit your JSON. This
+  guarantees valid format — do NOT write JSON by hand. Examples:
 
-  **After all work is done — update with final result:**
-  ```json
-  {"status": "done", "summary": "What was implemented", "files_modified": ["path/to/file"], "notes": ""}
-  ```
+  ```bash
+  # Turn 1 — checkpoint (before ANY other tool calls):
+  python3 -m tasker.respond dev started --summary "Starting: {{ task_label }}"
 
-  If the task is genuinely blocked, your final JSON keeps `status: "blocked"`.
+  # When done:
+  python3 -m tasker.respond dev done --summary "What was implemented" --files path/to/file.py
+
+  # If blocked:
+  python3 -m tasker.respond dev blocked --summary "What you attempted" --blocker "What's blocking" --blocker-suggestion "How to resolve"
+  ```
 
   **CRITICAL**: The checkpoint uses `status: "started"` (NOT "blocked"). This
   signals to the orchestrator that you are working — it will NOT trigger blocked
@@ -52,18 +54,14 @@ instructions: |
   **Only the LAST JSON block in your response is parsed**, so your final
   update always overrides the checkpoint.
 
-  ## Structured Output Helper (optional but recommended)
+  ## Structured Output Helper
 
-  A Pydantic model is available for guaranteed-valid JSON:
+  **ALWAYS use `python3 -m tasker.respond`** — this guarantees valid JSON.
+  Do NOT write JSON by hand. The command is already on your PYTHONPATH.
 
-  ```python
-  from tasker.schema import DevResponse
-  resp = DevResponse(status="done", summary="...", files_modified=["file.rs"])
-  print(resp.model_dump_json())
+  ```bash
+  python3 -m tasker.respond dev done --summary "..." --files file.rs
   ```
-
-  Use this if you're uncertain about JSON syntax.  Raw JSON in a code block
-  is also acceptable.
 
   ## Workflow — CODE-FIRST (check code before reading specs)
 
@@ -123,18 +121,18 @@ instructions: |
   ## JSON Response Format
 
   ### Checkpoint (Turn 1 — always output this FIRST, before any tool calls):
-  ```json
-  {"status": "started", "summary": "Starting: {{ task_label }}", "files_modified": [], "notes": "checkpoint"}
+  ```bash
+  python3 -m tasker.respond dev started --summary "Starting: {{ task_label }}"
   ```
 
   ### Final — Success:
-  ```json
-  {"status": "done", "summary": "What was implemented", "files_modified": ["path/to/file.rs"], "notes": "Extra context"}
+  ```bash
+  python3 -m tasker.respond dev done --summary "What was implemented" --files path/to/file.py
   ```
 
   ### Final — Blocked:
-  ```json
-  {"status": "blocked", "summary": "What you attempted", "files_modified": [], "notes": "Partial progress", "blocker_description": "What's blocking", "blocker_suggestion": "How to resolve"}
+  ```bash
+  python3 -m tasker.respond dev blocked --summary "What you attempted" --blocker "What's blocking" --blocker-suggestion "How to resolve"
   ```
 
 parameters:
@@ -216,12 +214,12 @@ prompt: |
   **Turn Budget**: You have {{ max_turns }} tool calls available.
 
   **CRITICAL — JSON-first discipline:**
-  1. **Turn 1**: Output checkpoint JSON immediately. NO tool calls before this.
+  1. **Turn 1**: Run `python3 -m tasker.respond dev started --summary "Starting: {{ task_label }}"`. NO other tool calls before this.
   2. **Turns 2–3**: Quick code check (`rg` the target type/function).
-  3. **If code exists** → turns 4–6: verify + output final JSON. STOP.
+  3. **If code exists** → turns 4–6: verify + run `python3 -m tasker.respond dev done ...`. STOP.
   4. **If code missing** → turns 4–16: read specs + implement.
-  5. **Turn 17+**: Output final JSON NOW, even if work incomplete (status: "blocked").
-  6. **Turn 35+**: ABSOLUTE deadline — JSON NOW.
+  5. **Turn 17+**: Run `python3 -m tasker.respond dev blocked ...` NOW, even if work incomplete.
+  6. **Turn 35+**: ABSOLUTE deadline — respond NOW.
 
   Implement the task now. When finished, respond with the required JSON block.
 

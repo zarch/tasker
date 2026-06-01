@@ -38,13 +38,19 @@ instructions: |
   tool calls.  This "checkpoint" ensures the orchestrator always gets a
   valid response even if you run out of tokens later.
 
-  **Step 0 — Immediate checkpoint (before ANY tool calls):**
-  ```json
-  {"decision": "needs_user_input", "feedback": "Review in progress for {{ task_label }}", "concerns": ["checkpoint"]}
-  ```
+  **IMPORTANT**: Use the `tasker.respond` command to emit your JSON. This
+  guarantees valid format — do NOT write JSON by hand. Examples:
 
-  After completing the review, output your final decision block.
-  Only the LAST JSON block is parsed.
+  ```bash
+  # Turn 1 — checkpoint (before ANY other tool calls):
+  python3 -m tasker.respond qa needs_user_input --feedback "Review in progress for {{ task_label }}"
+
+  # When review is complete — approve:
+  python3 -m tasker.respond qa approve --feedback "LGTM"
+
+  # When review finds issues — reject:
+  python3 -m tasker.respond qa reject --feedback "Fix X" --concerns "bug in Y" "missing test"
+  ```
 
   **CRITICAL**: The checkpoint uses `decision: "needs_user_input"` (NOT "reject").
   This signals to the orchestrator that you are still working — it will NOT treat
@@ -53,18 +59,10 @@ instructions: |
   **Only the LAST JSON block in your response is parsed**, so your final
   update always overrides the checkpoint.
 
-  ## Structured Output Helper (optional but recommended)
+  ## Structured Output Helper
 
-  A Pydantic model is available for guaranteed-valid JSON:
-
-  ```python
-  from tasker.schema import QAResponse
-  resp = QAResponse(decision="approve", feedback="Looks good", concerns=[])
-  print(resp.model_dump_json())
-  ```
-
-  Use this if you're uncertain about JSON syntax.  Raw JSON in a code block
-  is also acceptable.
+  **ALWAYS use `python3 -m tasker.respond`** — this guarantees valid JSON.
+  Do NOT write JSON by hand. The command is already on your PYTHONPATH.
 
   ## Review Workflow — CODE-FIRST
   1. Read the task and the developer's report.
@@ -121,23 +119,23 @@ instructions: |
   ## JSON Response Format
 
   **Checkpoint (Turn 1 — always output this FIRST, before any tool calls):**
-  ```json
-  {"decision": "needs_user_input", "feedback": "Review in progress for {{ task_label }}", "concerns": ["checkpoint"]}
+  ```bash
+  python3 -m tasker.respond qa needs_user_input --feedback "Review in progress for {{ task_label }}"
   ```
 
   **Final — Approval:**
-  ```json
-  {"decision": "approve", "feedback": "Task completed correctly.", "concerns": []}
+  ```bash
+  python3 -m tasker.respond qa approve --feedback "Task completed correctly."
   ```
 
   **Final — Rejection:**
-  ```json
-  {"decision": "reject", "feedback": "Several issues found.", "concerns": ["src/foo.rs:42 — Missing error handling", "tests/foo_test.rs — No tests"]}
+  ```bash
+  python3 -m tasker.respond qa reject --feedback "Several issues found." --concerns "src/foo.rs:42 — Missing error handling" "tests/foo_test.rs — No tests"
   ```
 
   **Final — Needs User Input:**
-  ```json
-  {"decision": "needs_user_input", "feedback": "Design decision needed.", "user_question": "Should X return 404 or empty list?", "concerns": ["No pagination spec exists"]}
+  ```bash
+  python3 -m tasker.respond qa needs_user_input --feedback "Design decision needed." --question "Should X return 404 or empty list?"
   ```
 
 parameters:
@@ -286,11 +284,11 @@ prompt: |
   **Turn Budget**: You have {{ max_turns }} tool calls available.
 
   **CRITICAL — JSON-first discipline:**
-  1. **Turn 1**: Output checkpoint JSON. NO tool calls before this.
+  1. **Turn 1**: Run `python3 -m tasker.respond qa needs_user_input --feedback "Review in progress"`. NO other tool calls before this.
   2. **Turns 2–3**: Quick code check + read dev report.
-  3. **If code exists and looks correct** → turns 4–6: verify + final JSON. STOP.
-  4. **If concerns** → turns 4–12: read specs + inspect code + final JSON.
-  5. **Turn 30+**: ABSOLUTE deadline — JSON NOW.
+  3. **If code exists and looks correct** → turns 4–6: verify + run `python3 -m tasker.respond qa approve ...`. STOP.
+  4. **If concerns** → turns 4–12: read specs + inspect code + run `python3 -m tasker.respond qa reject ...`.
+  5. **Turn 30+**: ABSOLUTE deadline — respond NOW.
 
   ## Instructions
   1. Read the task description above — extract all `arch/...` and `prd/...` spec references.

@@ -28,31 +28,27 @@ system_prompt: |
   tool calls.  This "checkpoint" ensures the orchestrator always gets a
   valid response even if you run out of tokens later.
 
-  **Step 0 — Immediate checkpoint (before ANY tool calls):**
-  ```json
-  {"action": "retry", "reason": "Analyzing stuck task: {{ task_label }}"}
-  ```
+  **IMPORTANT**: Use the `tasker.respond` command to emit your JSON. This
+  guarantees valid format — do NOT write JSON by hand. Examples:
 
-  **After all analysis is done — update with final decision:**
-  ```json
-  {"action": "<recompose|clarify|skip|retry>", "reason": "...", ...}
+  ```bash
+  # Turn 1 — checkpoint (before ANY other tool calls):
+  python3 -m tasker.respond arch retry --reason "Analyzing stuck task: {{ task_label }}"
+
+  # After all analysis is done:
+  python3 -m tasker.respond arch recompose --reason "Task too large"
+  python3 -m tasker.respond arch clarify --reason "Ambiguous requirements"
+  python3 -m tasker.respond arch skip --reason "Obsolete task"
+  python3 -m tasker.respond arch retry --reason "Transient failure"
   ```
 
   **Only the LAST JSON block in your response is parsed**, so your final
   update always overrides the checkpoint.
 
-  ## Structured Output Helper (optional but recommended)
+  ## Structured Output Helper
 
-  A Pydantic model is available for guaranteed-valid JSON:
-
-  ```python
-  from tasker.schema import ArchResponse
-  resp = ArchResponse(action="recompose", reason="...", subtasks=[...])
-  print(resp.model_dump_json())
-  ```
-
-  Use this if you're uncertain about JSON syntax.  Raw JSON in a fenced code
-  block is also acceptable.
+  **ALWAYS use `python3 -m tasker.respond`** — this guarantees valid JSON.
+  Do NOT write JSON by hand.
 
   ## Your Analysis Process
 
