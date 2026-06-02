@@ -1363,14 +1363,21 @@ class Orchestrator:
                     continue
 
                 # Stage everything
-                subprocess.run(
+                add_result = subprocess.run(
                     ["git", "add", "-A"],
                     capture_output=True,
                     text=True,
                     timeout=30,
                     cwd=str(repo),
-                    check=True,
                 )
+                if add_result.returncode != 0:
+                    log.warning(
+                        "vcs.multi_repo_add_failed",
+                        task_label=task.label,
+                        repo=repo.name,
+                        stderr=add_result.stderr[:200],
+                    )
+                    continue
 
                 # Commit
                 result = subprocess.run(
