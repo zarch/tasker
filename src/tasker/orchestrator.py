@@ -810,6 +810,29 @@ class Orchestrator:
 
         self._current_scope_key = scope_key
 
+    @staticmethod
+    def _qa_has_real_question(qa_response: QAResponse) -> bool:
+        """Check whether QA actually has a specific question for the user.
+
+        QA sometimes emits ``needs_user_input`` with a vacuous feedback like
+        "Review in progress" and no ``user_question``.  Opening the
+        interactive chat loop in that case is useless — the user sees an
+        empty prompt and has no idea what to answer.
+
+        Returns True only when there is a concrete, non-trivial question.
+        """
+        question = (qa_response.user_question or "").strip()
+        feedback = (qa_response.feedback or "").strip()
+
+        if question and len(question) >= 10:
+            return True
+
+        # If feedback itself looks like a question (ends with '?')
+        if feedback.endswith("?") and len(feedback) >= 15:
+            return True
+
+        return False
+
     def _interactive_chat_loop(
         self,
         task: Task,
@@ -3076,6 +3099,25 @@ class Orchestrator:
                 self.ui.add_iteration(qa_blocked_entry)
 
                 if qa_response.decision == "needs_user_input":
+                    if not self._qa_has_real_question(qa_response):
+                        # Vacuous question — downgrade to reject so dev retries
+                        log.warning(
+                            "qa.needs_user_input_downgraded",
+                            task_label=task.label,
+                            feedback=qa_response.feedback[:100],
+                        )
+                        self.ui.print_warning(
+                            f"[{task.label}] QA requested user input but "
+                            f"provided no question — treating as reject"
+                        )
+                        feedback = (
+                            f"## QA Feedback\n\n{qa_response.feedback}\n\n"
+                            f"QA indicated it needs user input but did not "
+                            f"formulate a specific question. Please review "
+                            f"and address the feedback above.\n"
+                        )
+                        continue
+
                     log.info(
                         "qa.needs_user_input",
                         task_label=task.label,
@@ -3196,6 +3238,31 @@ class Orchestrator:
                 return
 
             elif qa_response.decision == "needs_user_input":
+                if not self._qa_has_real_question(qa_response):
+                    # Vacuous question — downgrade to reject so dev retries
+                    log.warning(
+                        "qa.needs_user_input_downgraded",
+                        task_label=task.label,
+                        feedback=qa_response.feedback[:100],
+                    )
+                    self.ui.print_warning(
+                        f"[{work_label}] QA requested user input but "
+                        f"provided no question — treating as reject"
+                    )
+                    self._iterations_without_approval += 1
+                    feedback = (
+                        f"## QA Feedback (no specific question)\n\n"
+                        f"{qa_response.feedback}\n\n"
+                        f"QA indicated it needs user input but did not "
+                        f"formulate a specific question. Please review "
+                        f"and address the feedback above, then try again.\n"
+                    )
+                    if qa_response.concerns:
+                        feedback += "\n### Concerns\n"
+                        for c in qa_response.concerns:
+                            feedback += f"- {c}\n"
+                    continue
+
                 resolved = self._interactive_chat_loop(
                     task=task,
                     phase=phase,
