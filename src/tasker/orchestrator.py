@@ -1221,10 +1221,38 @@ class Orchestrator:
                 return "", ""
             diff_lines = diff.count("\n") + 1
             diff_bytes = len(diff.encode("utf-8", errors="replace"))
+
+            MAX_DIFF_SIZE = 100_000  # 100 KB — same as single-repo path
+
+            if diff_bytes <= MAX_DIFF_SIZE:
+                project_context = (
+                    f"## VCS Diff (multi-repo, task changes)\n```\n{diff}\n```"
+                )
+                size_note = f"({diff_lines} lines, {diff_bytes / 1024:.0f} KB)"
+                return project_context, size_note
+
+            # Diff too large — truncate to last 80 KB (recent changes most relevant)
+            import tempfile
+
+            truncated = diff[-80_000:] if diff_bytes > 80_000 else diff
+            trunc_lines = truncated.count("\n") + 1
             project_context = (
-                f"## VCS Diff (multi-repo, task changes)\n```\n{diff}\n```"
+                f"## VCS Diff (multi-repo, TRUNCATED)\n"
+                f"Full diff: {diff_lines} lines, {diff_bytes / 1024:.0f} KB. "
+                f"Showing last {trunc_lines} lines (most recent changes).\n\n"
+                f"```\n{truncated}\n```"
             )
-            size_note = f"({diff_lines} lines, {diff_bytes / 1024:.0f} KB)"
+            size_note = (
+                f"({diff_lines} lines, {diff_bytes / 1024:.0f} KB → "
+                f"truncated to {trunc_lines} lines)"
+            )
+            log.warning(
+                "vcs.multi_repo_diff_truncated",
+                task_label=task.label,
+                diff_bytes=diff_bytes,
+                diff_lines=diff_lines,
+                truncated_to=80_000,
+            )
             return project_context, size_note
 
         # ── Single-repo mode ──
