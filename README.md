@@ -182,6 +182,42 @@ uv run tasker --dev recipes/recipe-dev.yaml \
 | `--no-monitor-log` | *(off)* | Disable the monitor log file (console/stderr logging still active) |
 | `--log-level` | `WARNING` | Minimum level for console (stderr) output: `debug`, `info`, `warning`, `error`, `critical` |
 | `--file-log-level` | `DEBUG` | Minimum level for the monitor log file: `debug`, `info`, `warning`, `error`, `critical` |
+| `--no-rate-limit` | *(off)* | Disable automatic exponential backoff on transient connection/rate-limit errors |
+| `--rate-limit-base-delay` | `30` | Base delay (seconds) for exponential backoff on connection errors |
+| `--rate-limit-max-delay` | `300` | Maximum backoff delay (seconds) |
+| `--rate-limit-max-retries` | `5` | Max retries on transient errors before trying the fallback model |
+| `--max-consecutive-empty` | `3` | Max consecutive empty-output goose calls before a task is marked permanently failed `[~]` |
+| `--fallback-dev-provider` | *(env-derived)* | Fallback provider for the DEV role (see [Fallback models](#fallback-models)) |
+| `--fallback-dev-model` | *(env-derived)* | Fallback model for the DEV role |
+| `--fallback-qa-provider` | *(env-derived)* | Fallback provider for the QA role |
+| `--fallback-qa-model` | *(env-derived)* | Fallback model for the QA role |
+| `--no-anthropic-fallback` | *(off)* | Disable the automatic Anthropic fallback derived from `ANTHROPIC_API_KEY` |
+| `--anthropic-fallback-model` | `claude-sonnet-4` | Model to use for the automatic Anthropic fallback |
+
+## Fallback models
+
+When the primary model/provider hits transient errors (rate limits, connection drops, silent crashes), tasker retries with exponential backoff. After the retries are exhausted, it transparently switches to a **fallback model** so the pipeline keeps making progress. The fallback is tried once per goose call — the next orchestrator turn goes back to the primary.
+
+Fallbacks are resolved per role (DEV and QA can fall back to different models) with the following precedence:
+
+1. **Explicit CLI flags** — `--fallback-{role}-provider` together with `--fallback-{role}-model`. If both are given they always win.
+2. **Automatic Anthropic fallback** — if the environment variable `ANTHROPIC_API_KEY` is set, an Anthropic fallback (`provider=anthropic`, `model=claude-sonnet-4` by default) is configured automatically. Override the model with `--anthropic-fallback-model`.
+3. **None** — no fallback (the pipeline returns the failure to the orchestrator's recovery logic).
+
+The automatic Anthropic fallback is **skipped** when the primary provider is itself `anthropic` (falling back from a failing provider to the same provider is pointless). It can also be disabled entirely with `--no-anthropic-fallback`.
+
+```bash
+# Automatic: ANTHROPIC_API_KEY is set in the environment
+export ANTHROPIC_API_KEY=sk-ant-...
+uv run tasker --dev recipes/recipe-dev.yaml --qa recipes/recipe-qa.yaml tasks.md
+
+# Explicit fallback (overrides the env-derived default)
+uv run tasker ... --fallback-dev-provider ollama --fallback-dev-model qwen3.5:9b \
+                  --fallback-qa-provider anthropic --fallback-qa-model claude-sonnet-4
+
+# Disable the automatic Anthropic fallback
+uv run tasker ... --no-anthropic-fallback
+```
 
 ## Version control integration
 

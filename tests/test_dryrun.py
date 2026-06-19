@@ -1,8 +1,10 @@
 """End-to-end dry-run test — mocks goose subprocess to test the full pipeline."""
 
 import json
+import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 # Add src to path so we can import tasker
@@ -11,6 +13,39 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from tasker.parser import parse_task_file, find_next_task, update_markdown
 from tasker.log import IterationLog
 from tasker.models import IterationEntry, Actor, TaskStatus
+
+
+@contextmanager
+def _env(*, remove: tuple[str, ...] = (), **set_vars: str):
+    """Temporarily set/unset environment variables for a test.
+
+    Usage::
+
+        with _env(ANTHROPIC_API_KEY="sk-test"):
+            ...
+
+        with _env(remove=("ANTHROPIC_API_KEY",)):
+            ...   # ANTHROPIC_API_KEY guaranteed absent
+
+    Original values are restored on exit.
+    """
+    saved: dict[str, str] = {}
+    for key in remove:
+        if key in os.environ:
+            saved[key] = os.environ[key]
+        os.environ.pop(key, None)
+    for key, val in set_vars.items():
+        if key in os.environ:
+            saved[key] = os.environ[key]
+        os.environ[key] = val
+    try:
+        yield
+    finally:
+        for key, val in saved.items():
+            os.environ[key] = val
+        for key in set(remove) | set(set_vars):
+            if key not in saved:
+                os.environ.pop(key, None)
 
 
 # ── 1. Test parser ────────────────────────────────────────────────
@@ -5569,6 +5604,28 @@ def test_is_silent_crash_whitespace_only():
     assert is_silent_crash(result) is True
 
 
+def test_is_silent_crash_rc0_empty_output():
+    """rc=0 + success=False + empty stdout/stderr → silent crash.
+
+    This is the most common silent-crash pattern in production: goose
+    exits cleanly (rc=0) but produces zero assistant text (empty output
+    envelope).  Before the fix, is_silent_crash required rc!=0 so these
+    were NOT retried with backoff, burning through all recovery stages
+    at 2-second intervals (297 silent crashes in one run).
+    """
+    from tasker.goose import GooseRunResult, is_silent_crash
+
+    result = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="",
+        return_code=0,
+        duration_secs=1.8,
+        empty_output=True,
+    )
+    assert is_silent_crash(result) is True
+
+
 def test_backoff_retries_on_silent_crash():
     """Silent crash triggers backoff retry (same as connection error)."""
     from unittest.mock import patch
@@ -5851,6 +5908,122 @@ def test_fallback_model_selection_per_actor():
         f"Expected anthropic fallback for QA, got calls: {calls}"
     )
     assert calls["anthropic"] == "claude-sonnet-4"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P11b — Anthropic fallback auto-detection from ANTHROPIC_API_KEY
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_resolve_fallback_explicit_flags_win():
+    """Explicit CLI flags take precedence over env-derived Anthropic fallback."""
+    from tasker.main import _resolve_fallback
+    from tasker.models import FallbackModel
+
+    with _env(ANTHROPIC_API_KEY="sk-test-123"):
+        fb = _resolve_fallback(
+            explicit_provider="ollama",
+            explicit_model="qwen3.5:9b",
+            primary_provider="openai",
+            no_anthropic_fallback=False,
+            anthropic_fallback_model=None,
+        )
+    assert fb == FallbackModel(provider="ollama", model="qwen3.5:9b")
+
+
+def test_resolve_fallback_anthropic_from_env():
+    """When ANTHROPIC_API_KEY is set, an Anthropic fallback is synthesised."""
+    from tasker.main import _resolve_fallback
+    from tasker.models import FallbackModel
+
+    with _env(ANTHROPIC_API_KEY="sk-test-123"):
+        fb = _resolve_fallback(
+            explicit_provider=None,
+            explicit_model=None,
+            primary_provider="openai",
+            no_anthropic_fallback=False,
+            anthropic_fallback_model=None,
+        )
+    assert fb == FallbackModel(provider="anthropic", model="claude-sonnet-4")
+
+
+def test_resolve_fallback_no_env_returns_none():
+    """Without ANTHROPIC_API_KEY and without explicit flags → None."""
+    from tasker.main import _resolve_fallback
+
+    with _env(remove=("ANTHROPIC_API_KEY",)):
+        fb = _resolve_fallback(
+            explicit_provider=None,
+            explicit_model=None,
+            primary_provider="openai",
+            no_anthropic_fallback=False,
+            anthropic_fallback_model=None,
+        )
+    assert fb is None
+
+
+def test_resolve_fallback_disabled_flag():
+    """--no-anthropic-fallback suppresses the env-derived fallback."""
+    from tasker.main import _resolve_fallback
+
+    with _env(ANTHROPIC_API_KEY="sk-test-123"):
+        fb = _resolve_fallback(
+            explicit_provider=None,
+            explicit_model=None,
+            primary_provider="openai",
+            no_anthropic_fallback=True,
+            anthropic_fallback_model=None,
+        )
+    assert fb is None
+
+
+def test_resolve_fallback_skipped_when_primary_is_anthropic():
+    """No Anthropic fallback when the primary provider is itself anthropic."""
+    from tasker.main import _resolve_fallback
+
+    with _env(ANTHROPIC_API_KEY="sk-test-123"):
+        fb = _resolve_fallback(
+            explicit_provider=None,
+            explicit_model=None,
+            primary_provider="anthropic",
+            no_anthropic_fallback=False,
+            anthropic_fallback_model=None,
+        )
+    assert fb is None
+
+
+def test_resolve_fallback_custom_anthropic_model():
+    """--anthropic-fallback-model overrides the default model name."""
+    from tasker.main import _resolve_fallback
+    from tasker.models import FallbackModel
+
+    with _env(ANTHROPIC_API_KEY="sk-test-123"):
+        fb = _resolve_fallback(
+            explicit_provider=None,
+            explicit_model=None,
+            primary_provider="openai",
+            no_anthropic_fallback=False,
+            anthropic_fallback_model="claude-opus-4",
+        )
+    assert fb == FallbackModel(provider="anthropic", model="claude-opus-4")
+
+
+def test_resolve_fallback_partial_explicit_flags_ignored():
+    """Only one of provider/model being set does NOT trigger explicit path;
+    env-derived Anthropic fallback can still kick in."""
+    from tasker.main import _resolve_fallback
+    from tasker.models import FallbackModel
+
+    with _env(ANTHROPIC_API_KEY="sk-test-123"):
+        # Only provider set, no model
+        fb = _resolve_fallback(
+            explicit_provider="ollama",
+            explicit_model=None,
+            primary_provider="openai",
+            no_anthropic_fallback=False,
+            anthropic_fallback_model=None,
+        )
+    assert fb == FallbackModel(provider="anthropic", model="claude-sonnet-4")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6452,6 +6625,7 @@ if __name__ == "__main__":
     test_is_silent_crash_success()
     test_is_silent_crash_timeout()
     test_is_silent_crash_whitespace_only()
+    test_is_silent_crash_rc0_empty_output()
     test_backoff_retries_on_silent_crash()
     test_backoff_no_retry_on_nonempty_stderr()
     test_backoff_fallback_model()

@@ -44,6 +44,46 @@ def _resolve_path(path: str) -> Path:
     return p
 
 
+def _resolve_fallback(
+    *,
+    explicit_provider: str | None,
+    explicit_model: str | None,
+    primary_provider: str | None,
+    no_anthropic_fallback: bool,
+    anthropic_fallback_model: str | None,
+) -> FallbackModel | None:
+    """Resolve a per-role fallback model.
+
+    Precedence (highest → lowest):
+
+    1. **Explicit CLI flags** — ``--fallback-{role}-provider`` together with
+       ``--fallback-{role}-model``.  If both are given they always win.
+    2. **Environment-derived Anthropic fallback** — when the env var
+       ``ANTHROPIC_API_KEY`` is set (and the user has not passed
+       ``--no-anthropic-fallback``), an :class:`FallbackModel` with
+       ``provider="anthropic"`` is synthesised automatically.  The model
+       defaults to ``claude-sonnet-4`` but can be overridden via
+       ``--anthropic-fallback-model``.
+    3. **None** — no fallback.
+
+    The Anthropic auto-fallback is **skipped** when the primary provider is
+    itself ``anthropic`` — falling back from a failing provider to the same
+    provider is pointless.
+    """
+    # 1. Explicit CLI flags take precedence.
+    if explicit_provider and explicit_model:
+        return FallbackModel(provider=explicit_provider, model=explicit_model)
+
+    # 2. Auto-configure Anthropic fallback from the environment.
+    if not no_anthropic_fallback and primary_provider != "anthropic":
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            model = anthropic_fallback_model or "claude-sonnet-4"
+            return FallbackModel(provider="anthropic", model=model)
+
+    # 3. No fallback.
+    return None
+
+
 @app.command()
 def main(
     dev: Path = typer.Option(
@@ -171,6 +211,16 @@ def main(
         "--fallback-qa-provider",
         help="Fallback provider for QA role (e.g. anthropic). Requires --fallback-qa-model.",
     ),
+    no_anthropic_fallback: bool = typer.Option(
+        False,
+        "--no-anthropic-fallback",
+        help="Disable automatic Anthropic fallback when ANTHROPIC_API_KEY is set in the environment.",
+    ),
+    anthropic_fallback_model: str | None = typer.Option(
+        None,
+        "--anthropic-fallback-model",
+        help="Model to use for the automatic Anthropic fallback. Default: claude-sonnet-4.",
+    ),
     monitor_log: Path = typer.Option(
         None,
         "--monitor-log",
@@ -289,15 +339,19 @@ def main(
             base_delay_secs=rate_limit_base_delay,
             max_delay_secs=rate_limit_max_delay,
             max_retries=rate_limit_max_retries,
-            fallback_dev=(
-                FallbackModel(provider=fallback_dev_provider, model=fallback_dev_model)
-                if fallback_dev_provider and fallback_dev_model
-                else None
+            fallback_dev=_resolve_fallback(
+                explicit_provider=fallback_dev_provider,
+                explicit_model=fallback_dev_model,
+                primary_provider=provider,
+                no_anthropic_fallback=no_anthropic_fallback,
+                anthropic_fallback_model=anthropic_fallback_model,
             ),
-            fallback_qa=(
-                FallbackModel(provider=fallback_qa_provider, model=fallback_qa_model)
-                if fallback_qa_provider and fallback_qa_model
-                else None
+            fallback_qa=_resolve_fallback(
+                explicit_provider=fallback_qa_provider,
+                explicit_model=fallback_qa_model,
+                primary_provider=provider,
+                no_anthropic_fallback=no_anthropic_fallback,
+                anthropic_fallback_model=anthropic_fallback_model,
             ),
         ),
         decompose_recipe=str(decompose.resolve()) if decompose else None,
