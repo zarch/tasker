@@ -1477,12 +1477,13 @@ class Orchestrator:
                 result = subprocess.run(
                     ["git", "diff", "HEAD"],
                     capture_output=True,
-                    text=True,
+                    text=False,
                     timeout=30,
                     cwd=str(repo),
                 )
                 if result.returncode == 0 and result.stdout.strip():
-                    parts.append(f"### {repo.name}/\n{result.stdout}")
+                    decoded = result.stdout.decode("utf-8", errors="replace")
+                    parts.append(f"### {repo.name}/\n{decoded}")
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 pass
         return "\n\n".join(parts)
