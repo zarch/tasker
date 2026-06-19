@@ -55,20 +55,22 @@ def is_connection_error(stderr: str, return_code: int | None = None) -> bool:
 
 
 def is_silent_crash(result: GooseRunResult) -> bool:
-    """Return True if goose crashed with no output at all.
+    """Return True if goose produced no usable output at all.
 
     This happens when the LLM provider rate-limits or refuses the request
-    but goose exits without printing anything to stderr.  These are
+    but goose exits without printing anything to stderr — sometimes with
+    rc!=0, sometimes with rc=0 but completely empty output.  These are
     transient errors that should be retried with backoff, not burned
     through the recovery-stage budget.
 
-    The heuristic: rc!=0 AND empty stdout AND empty stderr AND not a
-    timeout (timeouts have their own handling path).
+    The heuristic: success=False AND no timeout AND empty stdout AND
+    empty stderr.  We intentionally do NOT require rc!=0 because goose
+    can exit rc=0 while producing zero assistant text (e.g. session
+    resume that immediately hits a provider error).
     """
     return (
         not result.success
         and not result.timed_out
-        and result.return_code != 0
         and not result.raw_stdout.strip()
         and not result.raw_stderr.strip()
     )
