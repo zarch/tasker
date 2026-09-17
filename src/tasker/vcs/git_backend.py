@@ -200,12 +200,26 @@ class GitBackend:
         if not commit:
             raise RuntimeError("Could not determine current HEAD commit.")
 
-        # Verify working tree is clean — we don't want to lose uncommitted work
+        # Dirty tree: commit a baseline so per-task feature branches and
+        # commit-on-approval keep working in an existing repository. Without
+        # this, init raised and VCS was silently disabled — QA approvals
+        # then never produced commits (silent divergence).
         if not _is_clean_working_tree(cwd=cwd):
-            raise RuntimeError(
-                "Working tree has uncommitted changes. Please commit or stash "
-                "them before running tasker with --vcs git."
+            logger.warning(
+                "Working tree has uncommitted changes — creating tasker "
+                "baseline commit so VCS integration stays enabled."
             )
+            _run_git(["add", "-A"], cwd=cwd)
+            baseline = _run_git(
+                ["commit", "-m", "chore: tasker baseline (pre-existing changes)"],
+                cwd=cwd,
+            )
+            if not baseline.success or not _is_clean_working_tree(cwd=cwd):
+                raise RuntimeError(
+                    "Working tree has uncommitted changes and the automatic "
+                    "baseline commit failed. Commit or stash manually before "
+                    "running tasker with --vcs git."
+                )
 
         self._base_branch = branch
         self._base_commit = commit
