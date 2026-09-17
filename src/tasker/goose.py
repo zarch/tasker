@@ -9,7 +9,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import structlog
@@ -96,6 +96,57 @@ class GooseRunResult:
     assistant_turns: int = 0  # count of messages with role="assistant"
     total_turns: int = 0  # total message count in the envelope
     output_chars: int = 0  # len of assistant_text
+    retry_history: list[dict] = field(
+        default_factory=list
+    )  # transient-error retries + fallback attempts
+
+
+def goose_run_evidence(result: GooseRunResult) -> dict:
+    """Post-mortem evidence for iteration-log entries.
+
+    Makes the JSONL ledger self-sufficient for reconstructing *why* a run
+    was classified the way it was (return code, timeout, duration, turn
+    counts, last envelope message role, empty-output reason) plus any
+    backoff/fallback retries that happened inside run_goose_with_backoff.
+    """
+    reason = ""
+    last_role = ""
+    try:
+        env = json.loads(result.raw_envelope or result.raw_stdout)
+        msgs = env.get("messages", []) if isinstance(env, dict) else []
+        if result.empty_output:
+            if not msgs:
+                reason = "no_messages"
+            elif not any(m.get("role") == "assistant" for m in msgs):
+                reason = "no_assistant_messages"
+            else:
+                reason = "extraction_discarded_all"
+        if msgs:
+            m = msgs[-1]
+            ctypes = {
+                c.get("type") for c in m.get("content", []) if isinstance(c, dict)
+            }
+            last_role = (
+                "user(toolResponse)" if "toolResponse" in ctypes else str(m.get("role"))
+            )
+    except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
+        if result.empty_output:
+            reason = "envelope_unparseable"
+    ev = {
+        "return_code": result.return_code,
+        "timed_out": result.timed_out,
+        "duration_secs": round(result.duration_secs, 1),
+        "assistant_turns": result.assistant_turns,
+        "total_turns": result.total_turns,
+        "last_message_role": last_role,
+        "stdout_chars": len(result.raw_stdout),
+        "stderr_chars": len(result.raw_stderr),
+    }
+    if reason:
+        ev["empty_output_reason"] = reason
+    if result.retry_history:
+        ev["retries"] = result.retry_history
+    return ev
 
 
 def _extract_json_blocks(text: str) -> list[dict]:
@@ -274,15 +325,28 @@ def _extract_last_assistant_text(raw_stdout: str) -> tuple[str, bool, int, int]:
             messages = envelope["messages"]
             total_turns = len(messages)
 
+            def _is_tool_response(msg: dict) -> bool:
+                # goose envelopes mark tool results as role "user" with
+                # content type "toolResponse".  They are NOT new user
+                # prompts: a run that hits the turn cap mid-tool-call ends
+                # its envelope on one, and treating it as the "last user
+                # message" wrongly discards every assistant message of the
+                # run (empty_output=True -> silent_crash misclassification).
+                return any(
+                    isinstance(c, dict) and c.get("type") == "toolResponse"
+                    for c in msg.get("content", [])
+                )
+
             # Count assistant messages
             assistant_turns = sum(
                 1 for msg in messages if msg.get("role") == "assistant"
             )
 
-            # Find index of the last user message
+            # Find index of the last genuine user prompt (tool responses
+            # excluded — see _is_tool_response).
             last_user_idx = -1
             for i, msg in enumerate(messages):
-                if msg.get("role") == "user":
+                if msg.get("role") == "user" and not _is_tool_response(msg):
                     last_user_idx = i
 
             if last_user_idx == -1:
@@ -698,12 +762,23 @@ def run_goose(
             json_blocks_found = len(blocks)
             parsed = blocks[-1] if blocks else None
 
+            # ── Validation gate ──
+            # A parsed block is only useful if it looks like a tasker
+            # response (has ``status`` or ``decision``).  The brace-pair
+            # scanner can match incidental ``{}`` in the assistant's
+            # prose — e.g. ``dict[str, X] = {}`` in a code description —
+            # producing a valid-but-empty dict that blocks the tool-
+            # response fallback below.
+            parsed_is_useful = parsed is not None and (
+                "status" in parsed or "decision" in parsed
+            )
+
             # ── Fallback: scan tool responses for tasker.respond JSON ──
             # When the agent executes ``python3 -m tasker.respond`` via the
             # shell tool, the validated JSON appears in a toolResponse
             # message — not in the assistant's final text.  If the cascade
-            # found nothing in assistant text, check tool responses.
-            if parsed is None:
+            # found nothing useful in assistant text, check tool responses.
+            if not parsed_is_useful:
                 tool_json = _extract_tool_response_json(stdout)
                 if tool_json is not None:
                     parsed = tool_json
@@ -961,6 +1036,16 @@ def run_goose_with_backoff(
             error_kind=error_kind,
             stderr=result.raw_stderr[:200],
         )
+        result.retry_history.append(
+            {
+                "attempt": attempt,
+                "error_kind": error_kind,
+                "delay_secs": round(delay, 1),
+                "return_code": result.return_code,
+                "total_turns": result.total_turns,
+                "stderr": result.raw_stderr[:200],
+            }
+        )
         time.sleep(delay)
 
     # ── Fallback model ──────────────────────────────────────────
@@ -1001,6 +1086,15 @@ def run_goose_with_backoff(
             fallback_model=fallback_model,
             fallback_provider=fallback_provider,
             return_code=fallback_result.return_code,
+        )
+        fallback_result.retry_history.append(
+            {
+                "attempt": "fallback",
+                "error_kind": "fallback_failed",
+                "fallback_model": fallback_model,
+                "fallback_provider": fallback_provider,
+                "return_code": fallback_result.return_code,
+            }
         )
         return fallback_result
 

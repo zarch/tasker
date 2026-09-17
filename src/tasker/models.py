@@ -244,6 +244,9 @@ class IterationEntry:
     status: TaskStatus
     payload: dict[str, Any] | None = None
     raw_output: str | None = None
+    evidence: dict[str, Any] | None = (
+        None  # run post-mortem (return_code, turns, retries...)
+    )
     checkpoint: bool = False
     json_blocks_found: int = 0
     json_blocks_cascade: bool = False
@@ -263,6 +266,8 @@ class IterationEntry:
             d["payload"] = self.payload
         if self.raw_output is not None:
             d["raw_output"] = self.raw_output
+        if self.evidence is not None:
+            d["evidence"] = self.evidence
         if self.checkpoint:
             d["checkpoint"] = True
         if self.json_blocks_found:

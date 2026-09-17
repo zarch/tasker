@@ -6282,6 +6282,35 @@ def test_tool_response_fallback_in_goose_result():
     assert result["files_modified"] == ["test.py"]
 
 
+def test_empty_dict_in_prose_does_not_block_tool_response():
+    """Regression: ``{}`` in assistant prose (e.g. ``dict[str, X] = {}``)
+    was matched by the brace-pair scanner and set ``parsed = {}``.
+    Since ``parsed is not None``, the tool-response fallback never ran,
+    causing an infinite malformed_output loop even though the agent had
+    correctly executed ``python3 -m tasker.respond``.
+
+    The fix: only treat a cascade block as "useful" if it has a
+    ``status`` or ``decision`` key.  Otherwise fall through to the
+    tool-response scanner.
+    """
+    from tasker.goose import _extract_json_blocks
+
+    # Simulate assistant prose that mentions `{}` in a code description
+    prose = (
+        "Task complete. The `Settings(BaseModel)` has "
+        "`role_overrides: dict[str, RoleMcpConfig] = {}` — all good."
+    )
+    blocks = _extract_json_blocks(prose)
+    assert blocks == [{}], "Precondition: brace scanner matches the literal {}"
+
+    # An empty dict is not a useful tasker response
+    parsed = blocks[-1] if blocks else None
+    parsed_is_useful = parsed is not None and (
+        "status" in parsed or "decision" in parsed
+    )
+    assert not parsed_is_useful, "Empty dict must not block tool-response fallback"
+
+
 # ═══════════════════════════════════════════════════════════════════
 # P13 — Multi-repo VCS commit
 # ═══════════════════════════════════════════════════════════════════

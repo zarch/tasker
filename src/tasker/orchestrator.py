@@ -10,7 +10,7 @@ from pathlib import Path
 
 import structlog
 
-from .goose import GooseRunResult, run_goose_with_backoff
+from .goose import GooseRunResult, goose_run_evidence, run_goose_with_backoff
 from .log import IterationLog
 from .mem import MemorySnapshot, delta, format_snapshot_human, snapshot
 from .models import (
@@ -2190,7 +2190,8 @@ class Orchestrator:
                     task_label=task.label,
                     status=TaskStatus.ERROR,
                     payload={"error": "subprocess_failed", "stage": stage.value},
-                    raw_output=dev_result.raw_stderr[:500],
+                    raw_output=(dev_result.raw_stderr or dev_result.raw_stdout)[:500],
+                    evidence=goose_run_evidence(dev_result),
                     json_blocks_found=dev_result.json_blocks_found,
                     json_blocks_cascade=dev_result.json_blocks_cascade,
                     assistant_turns=dev_result.assistant_turns,
@@ -2273,6 +2274,7 @@ class Orchestrator:
                     else TaskStatus.IN_PROGRESS,
                     payload=dev_response.to_dict(),
                     raw_output=dev_result.raw_stdout[:500],
+                    evidence=goose_run_evidence(dev_result),
                     json_blocks_found=dev_result.json_blocks_found,
                     json_blocks_cascade=dev_result.json_blocks_cascade,
                     assistant_turns=dev_result.assistant_turns,
@@ -2692,6 +2694,7 @@ class Orchestrator:
                     ),
                     payload=qa_response.to_dict(),
                     raw_output=qa_result.raw_stdout[:500],
+                    evidence=goose_run_evidence(qa_result),
                     json_blocks_found=qa_result.json_blocks_found,
                     json_blocks_cascade=qa_result.json_blocks_cascade,
                     assistant_turns=qa_result.assistant_turns,
