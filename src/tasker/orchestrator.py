@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
@@ -1356,7 +1358,11 @@ class Orchestrator:
             self.ui.print_info(f"[{task.label}] VCS: task committed")
         except RuntimeError as exc:
             log.error("vcs.commit_failed", task_label=task.label, error=str(exc))
-            self.ui.print_warning(f"[{task.label}] VCS: failed to commit task: {exc}")
+            self.ui.print_error(f"[{task.label}] VCS: failed to commit task: {exc}")
+            # Re-raise: a task whose commit failed must NOT be treated as
+            # finalized — continuing silently was the root cause of eight
+            # tasks' work riding along uncommitted.
+            raise
 
     # ── Multi-repo VCS helpers ────────────────────────────────────
 
@@ -1487,6 +1493,107 @@ class Orchestrator:
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 pass
         return "\n\n".join(parts)
+
+    # ── Pre-commit hook gate ─────────────────────────────────────
+    _HOOK_GATE_TIMEOUT_SECS = 900
+
+    def _run_hook_gate(self, task: Task) -> str | None:
+        """Run pre-commit hooks (prek) as a deterministic commit-readiness gate.
+
+        Runs AFTER QA approval and BEFORE finalization, mirroring the exact
+        commit-time environment (``git add -A`` + hooks on the staged set).
+        Hook failures mean the developer still has work to do — the task is
+        NOT finalized and the failure is routed back to DEV as feedback.
+        Returns ``None`` when clean; DEV feedback text otherwise.
+        Repositories without ``.pre-commit-config.yaml`` (or without the
+        ``prek``/``pre-commit`` binary) skip the gate.
+        """
+        runner = shutil.which("prek") or shutil.which("pre-commit")
+        if runner is None:
+            return None
+        repos = (
+            list(self._git_repos)
+            if self._git_repos
+            else ([self.cwd] if self.cwd else [])
+        )
+        repos = [r for r in repos if (r / ".pre-commit-config.yaml").exists()]
+        if not repos:
+            return None
+
+        failures: list[str] = []
+        for repo in repos:
+            # Stage everything exactly like commit_task() will, so the
+            # hook set matches what the real commit would send.
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+            )
+            try:
+                proc = subprocess.run(
+                    [runner, "run", "--color", "never"],
+                    cwd=str(repo),
+                    capture_output=True,
+                    text=True,
+                    timeout=self._HOOK_GATE_TIMEOUT_SECS,
+                )
+            except subprocess.TimeoutExpired:
+                failures.append(
+                    f"### repo `{repo.name}`\n\n"
+                    f"Hook gate TIMED OUT after {self._HOOK_GATE_TIMEOUT_SECS}s."
+                )
+                continue
+            if proc.returncode != 0:
+                output = (proc.stdout + "\n" + proc.stderr).strip()
+                failures.append(f"### repo `{repo.name}`\n\n```\n{output[:8000]}\n```")
+
+        if not failures:
+            log.info("hook_gate.passed", task_label=task.label)
+            self.ui.print_info(f"[{task.label}] ✓ Pre-commit hook gate: clean")
+            return None
+
+        log.warning(
+            "hook_gate.failed", task_label=task.label, repos=[r.name for r in repos]
+        )
+        self.ui.print_warning(
+            f"[{task.label}] ⚠ Pre-commit hook gate FAILED — routing back to DEV"
+        )
+        entry = IterationEntry(
+            timestamp=_now_iso(),
+            iteration=self.global_iteration,
+            actor=Actor.QA,
+            task_label=task.label,
+            status=TaskStatus.FEEDBACK,
+            payload={
+                "hook_gate": "failed",
+                "decision": "reject",
+                "feedback": "pre-commit hooks failed; commit blocked until clean",
+            },
+            json_blocks_found=0,
+            json_blocks_cascade=False,
+            assistant_turns=0,
+            total_turns=0,
+            output_chars=0,
+        )
+        self.log.append(entry)
+        self.ui.add_iteration(entry)
+        return (
+            "## ⚠️ Pre-commit hook gate FAILED — the task is NOT committed\n\n"
+            "QA approved the change, but `prek run` — the exact hooks that "
+            "run at commit time — reports problems below. You still have "
+            "work to do before this task can be committed.\n\n"
+            + "\n\n".join(failures)
+            + "\n\n**What to do:**\n"
+            "1. Fix every failing hook (prefer real fixes over suppressions).\n"
+            "2. WARNING: fixer hooks may have auto-modified files. Review "
+            "`git diff` before re-staging — if an auto-fix is WRONG (e.g. "
+            "typos 'correcting' base64/hex/fixture blobs), revert that edit "
+            "and use an inline `# typos: off` ... `# typos: on` fence or "
+            "extend the project's exclusion config instead.\n"
+            "3. Re-run `prek run` yourself until it is clean, then report "
+            "done. The task will only be committed when the gate is clean.\n"
+        )
 
     def _finalize_task(self, phase: Phase, task: Task) -> None:
         """Mark a task as done, update the markdown file, then VCS-commit.
@@ -3181,6 +3288,11 @@ class Orchestrator:
                     self.ui.print_success(
                         f"[{work_label}] QA approved blocked task: {qa_response.feedback[:100]}"
                     )
+                    gate_feedback = self._run_hook_gate(task)
+                    if gate_feedback is not None:
+                        self._iterations_without_approval += 1
+                        feedback = gate_feedback
+                        continue
                     self._finalize_task(phase, task)
                     return  # Bug Fix 5: exit immediately — no further code must run
 
@@ -3266,6 +3378,11 @@ class Orchestrator:
                 self.ui.print_success(
                     f"[{work_label}] ✓ APPROVED by QA: {qa_response.feedback[:100]}"
                 )
+                gate_feedback = self._run_hook_gate(task)
+                if gate_feedback is not None:
+                    self._iterations_without_approval += 1
+                    feedback = gate_feedback
+                    continue
                 self._finalize_task(phase, task)
                 return
 

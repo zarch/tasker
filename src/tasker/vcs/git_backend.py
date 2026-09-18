@@ -308,19 +308,38 @@ class GitBackend:
         # calling commit_task.  We must fold those changes into the feature
         # branch so they survive the upcoming ``git checkout`` of the base.
         status = _run_git(["status", "--porcelain"], cwd=cwd)
-        if status.success and status.stdout.strip():
+        had_dirty_tree = status.success and bool(status.stdout.strip())
+        if had_dirty_tree:
             # There are uncommitted changes — stage them
-            _run_git(["add", "-A"], cwd=cwd)
+            add_result = _run_git(["add", "-A"], cwd=cwd)
             # If the developer made commits on this branch, amend the last
             # one.  Otherwise (HEAD == base_commit) a regular commit is
             # needed to avoid amending the base and creating divergent history.
             head = _get_commit_hash("HEAD", cwd=cwd)
             if head and head != self._base_commit:
-                _run_git(["commit", "--amend", "--no-edit"], cwd=cwd)
+                commit_result = _run_git(["commit", "--amend", "--no-edit"], cwd=cwd)
             else:
-                _run_git(
+                commit_result = _run_git(
                     ["commit", "-m", task.vcs_description],
                     cwd=cwd,
+                )
+            # A failure here (pre-commit hook rejection is the usual cause)
+            # must be loud: silently continuing made the branch appear
+            # unchanged, which the skip path below then misread as an
+            # empty task and deleted the branch WITH the uncommitted work.
+            if not add_result.success or not commit_result.success:
+                log.error(
+                    "commit.capture_failed",
+                    feature_branch=feature_branch,
+                    add_rc=add_result.return_code,
+                    commit_rc=commit_result.return_code,
+                    stderr=(commit_result.stderr or add_result.stderr)[:400],
+                )
+                raise RuntimeError(
+                    f"Failed to capture working-tree changes on "
+                    f"{feature_branch} (add rc={add_result.return_code}, "
+                    f"commit rc={commit_result.return_code}): "
+                    f"{commit_result.stderr or add_result.stderr}"
                 )
 
         # Check if there are any changes to merge
@@ -333,6 +352,17 @@ class GitBackend:
         )  # git diff --quiet returns 1 if there are diffs
 
         if not has_changes:
+            # Contradiction guard: a dirty tree that produced a successful
+            # commit MUST show a branch diff.  "Dirty before, no diff now"
+            # can only mean the Step-0 commit failed (e.g. hook rejection)
+            # — treat as an error, never as an empty task.
+            if had_dirty_tree:
+                raise RuntimeError(
+                    f"Contradiction on {feature_branch}: working tree was "
+                    f"dirty before capture, but branch has no diff vs base "
+                    f"— the capture commit failed silently. Refusing to "
+                    f"delete the branch; investigate hook failures."
+                )
             logger.info(
                 "No changes on feature branch %s — skipping merge.", feature_branch
             )
