@@ -310,7 +310,10 @@ def _extract_last_assistant_text(raw_stdout: str) -> tuple[str, bool, int, int]:
       either the envelope has zero assistant messages at all, or ALL
       assistant messages are stale (none appear after the last user
       message, meaning goose replayed old history but produced no new
-      response).
+      response).  An envelope whose new assistant turns carry only
+      non-text content (thinking / tool calls) is NOT empty — the run did
+      fresh work and its structured payload may live in a toolResponse
+      (see _extract_tool_response_json).
     - *assistant_turns* is the count of messages with role ``"assistant"``.
     - *total_turns* is ``len(messages)``.
 
@@ -360,8 +363,10 @@ def _extract_last_assistant_text(raw_stdout: str) -> tuple[str, bool, int, int]:
             # Collect only assistant messages that appear after the last
             # user message — these are the *new* responses from this call.
             new_assistant_texts: list[str] = []
+            has_new_assistant_activity = False
             for msg in messages[last_user_idx + 1 :]:
                 if msg.get("role") == "assistant":
+                    has_new_assistant_activity = True
                     for content in msg.get("content", []):
                         if content.get("type") == "text" and content.get("text"):
                             new_assistant_texts.append(content["text"])
@@ -373,6 +378,19 @@ def _extract_last_assistant_text(raw_stdout: str) -> tuple[str, bool, int, int]:
                     assistant_turns,
                     total_turns,
                 )
+
+            # Assistant turns exist after the last genuine user prompt but
+            # none carried *text* content.  This is the signature of an
+            # agentic run that works purely through thinking + tool calls
+            # and reports via ``tasker.respond`` (the structured payload
+            # lives in a toolResponse, recovered separately by
+            # _extract_tool_response_json).  The session demonstrably did
+            # fresh work after the prompt: it is NOT stale replay and NOT
+            # a silent crash.  Return empty text but empty_flag=False so
+            # the orchestrator's checkpoint-only / recovery handling (not
+            # the provider-error backoff loop) drives the retry.
+            if has_new_assistant_activity:
+                return "", False, assistant_turns, total_turns
 
             # No new assistant messages after last user message.
             # If there are assistant messages at all, this is stale output.

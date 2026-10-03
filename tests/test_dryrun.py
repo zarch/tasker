@@ -612,6 +612,136 @@ def test_envelope_extraction():
     print("✓ Envelope extraction tests passed")
 
 
+def test_envelope_toolcall_only_run_not_silent_crash():
+    """Regression: agentic runs that work purely via thinking + tool calls.
+
+    Real-world shape observed 2026-10-03 (deduco Detection.T1, glm-5.3 via
+    z.ai): the dev agent produces assistant turns containing ONLY thinking +
+    toolRequest content (never ``type: "text"``), reports status via the
+    ``tasker.respond`` toolResponse, and the run ends on a toolResponse
+    (goose exits rc=0 when the provider hiccups mid-loop).  The old code
+    returned empty_output=True for these — burning 5 exponential-backoff
+    retries as "silent_crash" and discarding a parsed payload it had
+    already recovered via the tool-response fallback.
+
+    Expected now: empty text (there is none), but empty_flag=False and the
+    real assistant_turns count — the orchestrator's checkpoint-only /
+    recovery handling drives the retry instead of the provider-error loop.
+    """
+    from tasker.goose import _extract_last_assistant_text
+
+    envelope = json.dumps(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "task prompt"}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "<turn-context>..."}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "start by reporting"},
+                        {
+                            "type": "toolRequest",
+                            "id": "call_1",
+                            "toolCall": {
+                                "status": "success",
+                                "value": {
+                                    "name": "shell",
+                                    "arguments": {
+                                        "command": "python3 -m tasker.respond dev started"
+                                    },
+                                },
+                            },
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "toolResponse",
+                            "id": "call_1",
+                            "toolResult": {"status": "success", "value": {}},
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "now run the tests"},
+                        {
+                            "type": "toolRequest",
+                            "id": "call_2",
+                            "toolCall": {
+                                "status": "success",
+                                "value": {
+                                    "name": "shell",
+                                    "arguments": {"command": "cargo test"},
+                                },
+                            },
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "toolResponse",
+                            "id": "call_2",
+                            "toolResult": {"status": "success", "value": {}},
+                        }
+                    ],
+                },
+            ]
+        }
+    )
+    result, empty, asst_turns, total_turns = _extract_last_assistant_text(envelope)
+    assert result == "", "No text content exists — result must be empty string"
+    assert not empty, (
+        "Tool-call-only runs are fresh work, not stale/empty: "
+        "must NOT be flagged empty (was misclassified silent_crash)"
+    )
+    assert asst_turns == 2, "Real assistant turn count must be reported"
+    assert total_turns == 6
+
+    # Companion shape: run ends on a toolResponse AFTER text-bearing
+    # assistants — the 2026-09-17 fix — text must survive, not be discarded.
+    envelope_text_then_tool = json.dumps(
+        {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "go"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": '{"status": "done"}'}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "toolResponse",
+                            "id": "call_x",
+                            "toolResult": {"status": "success", "value": {}},
+                        }
+                    ],
+                },
+            ]
+        }
+    )
+    result_t, empty_t, asst_t, total_t = _extract_last_assistant_text(
+        envelope_text_then_tool
+    )
+    assert not empty_t
+    assert '{"status": "done"}' in result_t
+    assert asst_t == 1
+    assert total_t == 3
+    print("✓ Tool-call-only envelope tests passed")
+
+
 # ── 9. Test JJ module ────────────────────────────────────────────
 
 
