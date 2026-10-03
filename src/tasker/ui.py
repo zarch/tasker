@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedColumn
+from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 from rich.layout import Layout
@@ -356,16 +357,18 @@ class TaskerUI:
         )
 
     def print_error(self, msg: str) -> None:
-        self.console.print(f"[bold red]ERROR:[/bold red] {msg}")
+        # msg may embed arbitrary task text (e.g. "/api/v1/labels/{id}") —
+        # escape it or Rich parses "[/{id}]" as a markup close tag (MarkupError).
+        self.console.print(f"[bold red]ERROR:[/bold red] {escape(msg)}")
 
     def print_success(self, msg: str) -> None:
-        self.console.print(f"[bold green]✓[/bold green] {msg}")
+        self.console.print(f"[bold green]✓[/bold green] {escape(msg)}")
 
     def print_info(self, msg: str) -> None:
-        self.console.print(f"[blue]ℹ[/blue] {msg}")
+        self.console.print(f"[blue]ℹ[/blue] {escape(msg)}")
 
     def print_warning(self, msg: str) -> None:
-        self.console.print(f"[yellow]⚠[/yellow] {msg}")
+        self.console.print(f"[yellow]⚠[/yellow] {escape(msg)}")
 
     # ── Interactive chat mode ────────────────────────────────────
 

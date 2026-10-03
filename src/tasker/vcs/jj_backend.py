@@ -133,14 +133,43 @@ class JJBackend:
             return result.stdout.strip()
         return ""
 
+    def checkpoint_task(self, task: Task, cwd: Path | None = None) -> bool:
+        """Commit the working copy mid-task (crash safety).
+
+        Snapshots @ as a ``[checkpoint]`` commit; jj then creates a
+        fresh empty working copy @ for continued work. task.task_ref is
+        updated to the new @ so get_diff/commit_task keep tracking it.
+        """
+        if not task.base_ref:
+            return False
+        # Only checkpoint when the working copy @ itself has new content
+        # (diff of @ vs its parent); ancestor checkpoint commits don't count.
+        working = _run_jj(["diff"], cwd=cwd)
+        if working.success and not working.stdout.strip():
+            return False
+        result = _run_jj(
+            ["commit", "-m", f"{task.vcs_description} [checkpoint]"], cwd=cwd
+        )
+        if not result.success:
+            raise RuntimeError(f"jj commit (checkpoint) failed: {result.stderr}")
+        new_ref = _jj_get_current_change_id(cwd=cwd)
+        if new_ref:
+            task.task_ref = new_ref
+        logger.info("Checkpointed task: %s -> %s", task.vcs_description[:60], new_ref)
+        return True
+
     def commit_task(self, task: Task, cwd: Path | None = None) -> None:
         """Commit the current working-copy change (finalize task on QA approval)."""
+        # Capture @ BEFORE committing: with mid-task checkpoints, task.task_ref
+        # points at the newest (possibly empty) working change, and the commit
+        # finalizes whatever @ currently is.
+        current = _jj_get_current_change_id(cwd=cwd) or task.task_ref
         result = _run_jj(["commit", "-m", task.vcs_description], cwd=cwd)
 
         if result.success:
             # After `jj commit`, the committed change is the parent of @.
             # Update _last_committed_change_id so the next task branches from here.
-            self._last_committed_change_id = task.task_ref
+            self._last_committed_change_id = current
             logger.info("Committed task: %s", task.vcs_description[:60])
         else:
             logger.error("Failed to commit task: %s", result.stderr)

@@ -56,6 +56,15 @@ class VCSBackend(Protocol):
         """
         ...
 
+    def checkpoint_task(self, task: Task, cwd: Path | None = None) -> bool:
+        """Commit mid-task work as a checkpoint (crash safety).
+
+        Called by the orchestrator after dev turns so accumulated
+        work survives crashes. Returns True when a checkpoint commit
+        was created, False when there was nothing to commit.
+        """
+        ...
+
     def init_subdir(self, subdir: Path) -> None:
         """Auto-init git in a subdirectory if it's not already a repo.
 

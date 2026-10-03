@@ -282,6 +282,38 @@ class GitBackend:
 
         return ""
 
+    def checkpoint_task(self, task: Task, cwd: Path | None = None) -> bool:
+        """Commit mid-task work on the feature branch (crash safety).
+
+        Snapshots the working tree as a ``[checkpoint]`` commit directly
+        on the feature branch.  These are collapsed into the single
+        squash-merge at commit_task, so intermediate history is throwaway.
+        Returns True when a checkpoint commit was created.
+        """
+        if not task.task_ref:
+            return False
+        if _is_clean_working_tree(cwd=cwd):
+            return False
+        add_result = _run_git(["add", "-A"], cwd=cwd)
+        # --no-verify: checkpoints are internal snapshots on a throwaway
+        # branch — pre-commit hooks (fmt/lint gates) must only gate the
+        # final squash-merge in commit_task, not mid-task state.
+        commit_result = _run_git(
+            ["commit", "--no-verify", "-m", f"{task.vcs_description} [checkpoint]"],
+            cwd=cwd,
+        )
+        if not add_result.success or not commit_result.success:
+            log.error(
+                "checkpoint_failed",
+                feature_branch=task.task_ref,
+                stderr=commit_result.stderr[:400],
+            )
+            raise RuntimeError(
+                f"Failed to checkpoint working tree on {task.task_ref}: "
+                f"{commit_result.stderr or add_result.stderr}"
+            )
+        return True
+
     def commit_task(self, task: Task, cwd: Path | None = None) -> None:
         """Squash-merge the feature branch onto the base branch.
 

@@ -1342,6 +1342,25 @@ class Orchestrator:
         )
         return project_context, size_note
 
+    def _vcs_checkpoint_task(self, task: Task) -> None:
+        """Snapshot mid-task work as a checkpoint commit (crash safety).
+
+        Called after dev turns. No-op when the working tree is clean.
+        Failures are logged but never fatal — checkpointing must not
+        kill a run; the work still reaches commit_task at approval.
+        """
+        if self._git_repos or self.vcs is None:
+            return
+        try:
+            created = self.vcs.checkpoint_task(task, cwd=self.cwd)
+            if created:
+                log.info("vcs.task_checkpointed", task_label=task.label)
+        except RuntimeError as exc:
+            log.warning("vcs.checkpoint_failed", task_label=task.label, error=str(exc))
+            self.ui.print_warning(
+                f"[{task.label}] VCS: checkpoint failed (continuing): {exc}"
+            )
+
     def _vcs_commit_task(self, task: Task) -> None:
         """Commit the task's changes as a single clean commit.
 
@@ -3129,6 +3148,10 @@ class Orchestrator:
                         files_modified=[],
                         notes="Auto-downgraded from 'done' due to empty VCS diff.",
                     )
+
+            # ── Checkpoint: persist mid-task work to VCS (crash safety) ──
+            # No-op when clean; failures warn but never kill the run.
+            self._vcs_checkpoint_task(task)
 
             # ── Handle dev started (checkpoint-only response) ──
             # When the agent emitted only the checkpoint JSON and ran out of

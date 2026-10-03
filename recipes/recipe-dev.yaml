@@ -98,6 +98,18 @@ instructions: |
   - Do NOT run `cargo clean` — the target directory is huge and will take forever to rebuild.
   - Do NOT override `CARGO_BUILD_JOBS` — it is set to 2 for memory safety.
 
+  ## Version Control Rules — CRITICAL (editor hangs)
+  The default editor in this environment is an interactive terminal editor (`hx`).
+  Any VCS command that opens it will HANG your headless session forever.
+  - You do NOT need to run version control commands — the orchestrator tracks and
+    commits your changes automatically.
+  - **IF** you run a commit/describe anyway, you MUST pass the message inline with `-m`:
+    - `jj commit -m "message"` — NEVER bare `jj commit`
+    - `jj describe -m "message"` — NEVER bare `jj describe`
+    - `git commit -m "message"` — NEVER bare `git commit`
+  - Without `-m` these commands open an interactive editor and wedge the whole
+    automation run. There is no timeout that saves you.
+
   ## Rules
   - Your FIRST and LAST action must be running `python3 -m tasker.respond`.
   - Address EVERY QA feedback concern. Don't skip any.
@@ -191,5 +203,7 @@ prompt: |
       python3 -m tasker.respond dev done --summary "What you did" --files path/to/file1 path/to/file2
 
   **Note**: You are working within a version-controlled change. All file modifications
-  are automatically tracked. You do NOT need to run `git add`, `git commit`, or any
-  version control commands — just write code and run the respond command.
+  are automatically tracked — you do NOT need to run `git add`, `git commit`, or any
+  version control commands. If you do run a VCS command anyway, ALWAYS pass the
+  message inline: `jj commit -m "..."` / `git commit -m "..."` — bare commit/describe
+  opens an interactive editor and hangs the session.
