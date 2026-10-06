@@ -7,14 +7,17 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import structlog
 
 from .models import RateLimitConfig
+from .respond import RESPONSE_FILE_ENV
 
 log = structlog.get_logger(__name__)
 
@@ -404,6 +407,27 @@ def _extract_last_assistant_text(raw_stdout: str) -> tuple[str, bool, int, int]:
     return raw_stdout, False, 0, 0
 
 
+def _new_response_file_path() -> Path:
+    """Return a fresh, not-yet-existing path for tasker.respond's side channel."""
+    return Path(tempfile.gettempdir()) / f"tasker-response-{uuid.uuid4().hex}.json"
+
+
+def _read_response_file(path: Path) -> dict | None:
+    """Read the JSON that ``tasker.respond`` wrote to *path*.
+
+    Returns the dict only when it looks like a tasker response (has a
+    ``status`` or ``decision`` key); a missing, unreadable or malformed
+    file yields *None*.
+    """
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(obj, dict) and ("status" in obj or "decision" in obj):
+        return obj
+    return None
+
+
 def _extract_tool_response_json(raw_stdout: str) -> dict | None:
     """Scan goose envelope for tasker.respond JSON inside tool responses.
 
@@ -741,6 +765,10 @@ def run_goose(
         "goose.pythonpath_injected", tasker_src=tasker_src, pythonpath=env["PYTHONPATH"]
     )
 
+    # Per-call side channel for tasker.respond (see _read_response_file).
+    response_file = _new_response_file_path()
+    env[RESPONSE_FILE_ENV] = str(response_file)
+
     start = time.monotonic()
 
     # Start heartbeat thread for monitor-log liveness
@@ -806,6 +834,19 @@ def run_goose(
                         session=session_name,
                         keys=list(tool_json.keys()),
                     )
+                else:
+                    # Providers with their own tool loop (claude-code) never
+                    # surface tool responses in the envelope; tasker.respond
+                    # also wrote its JSON to the per-call response file.
+                    file_json = _read_response_file(response_file)
+                    if file_json is not None:
+                        parsed = file_json
+                        json_blocks_found = 1
+                        log.info(
+                            "goose.response_file_fallback",
+                            session=session_name,
+                            keys=list(file_json.keys()),
+                        )
 
             # Detect cascade: is there a malformed candidate after the last
             # valid block?
@@ -943,6 +984,7 @@ def run_goose(
         # Always stop the heartbeat thread
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=2)
+        response_file.unlink(missing_ok=True)
 
 
 def run_goose_with_backoff(
@@ -958,6 +1000,7 @@ def run_goose_with_backoff(
     memory_limit: str | None = None,
     fallback_model: str | None = None,
     fallback_provider: str | None = None,
+    fallback_timeout_secs: int | None = None,
 ) -> GooseRunResult:
     """Run goose with automatic retry on transient connection errors.
 
@@ -977,7 +1020,8 @@ def run_goose_with_backoff(
        orchestrator keep making progress — e.g. dev falls back to a local
        Ollama model while QA falls back to a different cloud provider.
        The fallback is per-call only; the next orchestrator turn reuses
-       the primary model.
+       the primary model.  It runs with *fallback_timeout_secs* when
+       given, otherwise with the primary's *timeout_secs*.
 
     *memory_limit* is forwarded to :func:`run_goose`.  See its docstring
     for details.
@@ -1019,9 +1063,15 @@ def run_goose_with_backoff(
         if result.success:
             return result
 
-        # --- Timeout: return immediately (has its own handling) ---
+        # --- Timeout: no primary retry; hand over to the fallback model (if
+        # any) since the primary could not finish the task in time ---
         if result.timed_out:
-            return result
+            log.warning(
+                "goose.timeout.try_fallback",
+                session=session_name,
+                has_fallback=bool(fallback_model and fallback_provider),
+            )
+            break
 
         # --- Is this a transient error we should retry? ---
         is_conn_err = is_connection_error(result.raw_stderr, result.return_code)
@@ -1067,13 +1117,16 @@ def run_goose_with_backoff(
         time.sleep(delay)
 
     # ── Fallback model ──────────────────────────────────────────
-    # Primary model exhausted its retries.  Try the fallback model
-    # if one is configured — this keeps progress going even when the
-    # primary provider is down for an extended period.
+    # Primary model exhausted its retries or timed out.  Try the
+    # fallback model if one is configured — this keeps progress going
+    # even when the primary provider is down for an extended period.
+    # It gets its own session: resuming the primary's history under a
+    # different provider is not supported reliably.
     if fallback_model and fallback_provider:
+        fallback_session = f"{session_name}_fallback"
         log.warning(
             "goose.fallback.attempt",
-            session=session_name,
+            session=fallback_session,
             primary_model=model,
             primary_provider=provider,
             fallback_model=fallback_model,
@@ -1081,10 +1134,10 @@ def run_goose_with_backoff(
         )
         fallback_result = run_goose(
             recipe_path=recipe_path,
-            session_name=session_name,
+            session_name=fallback_session,
             params=params,
             max_turns=max_turns,
-            timeout_secs=timeout_secs,
+            timeout_secs=fallback_timeout_secs or timeout_secs,
             model=fallback_model,
             provider=fallback_provider,
             cwd=cwd,
@@ -1093,14 +1146,14 @@ def run_goose_with_backoff(
         if fallback_result.success:
             log.info(
                 "goose.fallback.success",
-                session=session_name,
+                session=fallback_session,
                 fallback_model=fallback_model,
                 fallback_provider=fallback_provider,
             )
             return fallback_result
         log.warning(
             "goose.fallback.failed",
-            session=session_name,
+            session=fallback_session,
             fallback_model=fallback_model,
             fallback_provider=fallback_provider,
             return_code=fallback_result.return_code,

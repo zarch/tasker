@@ -182,9 +182,36 @@ class FallbackModel:
     goes back to the primary model.
     """
 
-    provider: str  # e.g. "ollama", "anthropic"
-    model: str  # e.g. "qwen3.5:9b", "claude-sonnet-4"
+    provider: str  # e.g. "ollama", "claude-code"
+    model: str  # e.g. "qwen3.5:9b", "sonnet"
     max_attempts: int = 2  # how many times to try the fallback before giving up
+    timeout_secs: int | None = None  # None → same timeout as the primary call
+
+
+# goose provider that drives the local `claude` CLI (Claude subscription,
+# no API key).  Default backend for the automatic fallback and escalation.
+CLAUDE_CODE_PROVIDER = "claude-code"
+CLAUDE_CODE_DEFAULT_MODEL = "sonnet"
+
+# Escalated calls run the hardest tasks on a slower, stronger model.
+ESCALATION_DEFAULT_TIMEOUT_SECS = 1800
+
+
+@dataclass
+class EscalationConfig:
+    """Stronger model used once a task is flagged as stuck.
+
+    Unlike :class:`FallbackModel` (provider unreachable, one call), the
+    escalation is sticky: from the moment the stuckness check fires, every
+    call of an escalated role for that task uses this model, until the
+    orchestrator moves on to another task.  The ARCH role, which only runs
+    for stuck tasks, always uses it when listed in *roles*.
+    """
+
+    provider: str  # e.g. "claude-code"
+    model: str  # e.g. "opus"
+    roles: frozenset[Actor] = frozenset({Actor.ARCH, Actor.DEV})
+    timeout_secs: int = ESCALATION_DEFAULT_TIMEOUT_SECS  # replaces --timeout
 
 
 @dataclass

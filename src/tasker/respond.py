@@ -14,18 +14,30 @@ Usage from inside a goose agent session (PYTHONPATH is pre-injected):
 The output is a single JSON line printed to stdout, wrapped in a code block
 so the orchestrator's cascade extraction picks it up.  All arguments are
 validated through Pydantic models — impossible to produce malformed JSON.
+
+When ``TASKER_RESPONSE_FILE`` is set, the same JSON is also written to that
+path (last call wins).  This is the channel for providers that run their own
+tool loop (e.g. goose's ``claude-code`` provider), whose tool responses never
+appear in the goose envelope.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
+
+RESPONSE_FILE_ENV = "TASKER_RESPONSE_FILE"
 
 
 def _emit(obj: dict) -> None:
     """Print the JSON wrapped in a markdown code block for cascade extraction."""
     text = json.dumps(obj, ensure_ascii=False)
     print(f"```json\n{text}\n```")
+    response_file = os.environ.get(RESPONSE_FILE_ENV)
+    if response_file:
+        Path(response_file).write_text(text, encoding="utf-8")
 
 
 def cmd_dev(args: argparse.Namespace) -> None:

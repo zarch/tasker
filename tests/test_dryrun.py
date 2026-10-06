@@ -6041,119 +6041,639 @@ def test_fallback_model_selection_per_actor():
 
 
 # ═══════════════════════════════════════════════════════════════════
-# P11b — Anthropic fallback auto-detection from ANTHROPIC_API_KEY
+# P11b — Automatic claude-code fallback + flag-pair validation
 # ═══════════════════════════════════════════════════════════════════
 
 
-def test_resolve_fallback_explicit_flags_win():
-    """Explicit CLI flags take precedence over env-derived Anthropic fallback."""
+def _resolve_fb(**overrides):
+    """Call _resolve_fallback with neutral defaults, overridable per test."""
     from tasker.main import _resolve_fallback
+
+    kwargs: dict = {
+        "explicit_provider": None,
+        "explicit_model": None,
+        "primary_provider": "custom_z.ai",
+        "no_auto_fallback": False,
+        "auto_fallback_model": None,
+        "role": "dev",
+    }
+    kwargs.update(overrides)
+    return _resolve_fallback(**kwargs)
+
+
+def test_resolve_fallback_explicit_flags_win():
+    """Explicit CLI flags take precedence over the automatic fallback."""
+    from unittest.mock import patch
+
     from tasker.models import FallbackModel
 
-    with _env(ANTHROPIC_API_KEY="sk-test-123"):
-        fb = _resolve_fallback(
-            explicit_provider="ollama",
-            explicit_model="qwen3.5:9b",
-            primary_provider="openai",
-            no_anthropic_fallback=False,
-            anthropic_fallback_model=None,
-        )
+    with patch("tasker.main.shutil.which", return_value="/usr/bin/claude"):
+        fb = _resolve_fb(explicit_provider="ollama", explicit_model="qwen3.5:9b")
     assert fb == FallbackModel(provider="ollama", model="qwen3.5:9b")
 
 
-def test_resolve_fallback_anthropic_from_env():
-    """When ANTHROPIC_API_KEY is set, an Anthropic fallback is synthesised."""
-    from tasker.main import _resolve_fallback
+def test_resolve_fallback_claude_code_when_cli_installed():
+    """With the claude CLI on PATH, a claude-code/sonnet fallback is synthesised."""
+    from unittest.mock import patch
+
     from tasker.models import FallbackModel
 
-    with _env(ANTHROPIC_API_KEY="sk-test-123"):
-        fb = _resolve_fallback(
-            explicit_provider=None,
-            explicit_model=None,
-            primary_provider="openai",
-            no_anthropic_fallback=False,
-            anthropic_fallback_model=None,
-        )
-    assert fb == FallbackModel(provider="anthropic", model="claude-sonnet-4")
+    with patch("tasker.main.shutil.which", return_value="/usr/bin/claude"):
+        fb = _resolve_fb()
+    assert fb == FallbackModel(provider="claude-code", model="sonnet")
 
 
-def test_resolve_fallback_no_env_returns_none():
-    """Without ANTHROPIC_API_KEY and without explicit flags → None."""
-    from tasker.main import _resolve_fallback
+def test_resolve_fallback_no_cli_returns_none():
+    """Without the claude CLI and without explicit flags → None."""
+    from unittest.mock import patch
 
-    with _env(remove=("ANTHROPIC_API_KEY",)):
-        fb = _resolve_fallback(
-            explicit_provider=None,
-            explicit_model=None,
-            primary_provider="openai",
-            no_anthropic_fallback=False,
-            anthropic_fallback_model=None,
-        )
-    assert fb is None
+    with patch("tasker.main.shutil.which", return_value=None):
+        assert _resolve_fb() is None
 
 
 def test_resolve_fallback_disabled_flag():
-    """--no-anthropic-fallback suppresses the env-derived fallback."""
-    from tasker.main import _resolve_fallback
+    """--no-auto-fallback suppresses the automatic fallback."""
+    from unittest.mock import patch
 
-    with _env(ANTHROPIC_API_KEY="sk-test-123"):
-        fb = _resolve_fallback(
-            explicit_provider=None,
-            explicit_model=None,
-            primary_provider="openai",
-            no_anthropic_fallback=True,
-            anthropic_fallback_model=None,
-        )
-    assert fb is None
+    with patch("tasker.main.shutil.which", return_value="/usr/bin/claude"):
+        assert _resolve_fb(no_auto_fallback=True) is None
 
 
-def test_resolve_fallback_skipped_when_primary_is_anthropic():
-    """No Anthropic fallback when the primary provider is itself anthropic."""
-    from tasker.main import _resolve_fallback
+def test_resolve_fallback_skipped_when_primary_is_claude_code():
+    """No automatic fallback when the primary provider is itself claude-code."""
+    from unittest.mock import patch
 
-    with _env(ANTHROPIC_API_KEY="sk-test-123"):
-        fb = _resolve_fallback(
-            explicit_provider=None,
-            explicit_model=None,
-            primary_provider="anthropic",
-            no_anthropic_fallback=False,
-            anthropic_fallback_model=None,
-        )
-    assert fb is None
+    with patch("tasker.main.shutil.which", return_value="/usr/bin/claude"):
+        assert _resolve_fb(primary_provider="claude-code") is None
 
 
-def test_resolve_fallback_custom_anthropic_model():
-    """--anthropic-fallback-model overrides the default model name."""
-    from tasker.main import _resolve_fallback
+def test_resolve_fallback_custom_auto_model():
+    """--auto-fallback-model overrides the default model name."""
+    from unittest.mock import patch
+
     from tasker.models import FallbackModel
 
-    with _env(ANTHROPIC_API_KEY="sk-test-123"):
-        fb = _resolve_fallback(
-            explicit_provider=None,
-            explicit_model=None,
-            primary_provider="openai",
-            no_anthropic_fallback=False,
-            anthropic_fallback_model="claude-opus-4",
+    with patch("tasker.main.shutil.which", return_value="/usr/bin/claude"):
+        fb = _resolve_fb(auto_fallback_model="opus")
+    assert fb == FallbackModel(provider="claude-code", model="opus")
+
+
+def test_resolve_fallback_partial_explicit_flags_rejected():
+    """Only one of provider/model is an error naming the role's flags."""
+    from tasker.main import FlagPairError
+
+    for partial in (
+        {"explicit_provider": "ollama"},
+        {"explicit_model": "qwen3.5:9b"},
+    ):
+        try:
+            _resolve_fb(role="qa", **partial)
+        except FlagPairError as exc:
+            assert "--fallback-qa-provider" in str(exc)
+        else:
+            raise AssertionError(f"partial flags accepted: {partial}")
+
+
+def test_cli_partial_fallback_flags_exit_with_error():
+    """The CLI exits 1 with a clear message on a half-given flag pair."""
+    from typer.testing import CliRunner
+
+    from tasker.main import app
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        task_file = Path(tmpdir) / "tasks.md"
+        task_file.write_text("# Phase 1\n## P1\n- [ ] T1 do something\n")
+        result = CliRunner().invoke(
+            app,
+            [
+                "main",
+                str(task_file),
+                "--no-monitor-log",
+                "--fallback-dev-provider",
+                "ollama",
+            ],
         )
-    assert fb == FallbackModel(provider="anthropic", model="claude-opus-4")
+    assert result.exit_code == 1
+    assert "--fallback-dev-model" in result.output
 
 
-def test_resolve_fallback_partial_explicit_flags_ignored():
-    """Only one of provider/model being set does NOT trigger explicit path;
-    env-derived Anthropic fallback can still kick in."""
-    from tasker.main import _resolve_fallback
+def test_resolve_escalation_disabled_by_default():
+    """No --escalate* flag → no escalation."""
+    from tasker.main import _resolve_escalation
+
+    assert (
+        _resolve_escalation(enabled=False, provider=None, model=None, roles="arch,dev")
+        is None
+    )
+
+
+def test_resolve_escalation_defaults_and_implied():
+    """--escalate uses claude-code/sonnet; a lone --escalate-model implies it."""
+    from tasker.main import _resolve_escalation
+    from tasker.models import Actor, EscalationConfig
+
+    esc = _resolve_escalation(enabled=True, provider=None, model=None, roles="arch,dev")
+    assert esc == EscalationConfig(
+        provider="claude-code",
+        model="sonnet",
+        roles=frozenset({Actor.ARCH, Actor.DEV}),
+    )
+    esc = _resolve_escalation(enabled=False, provider=None, model="opus", roles="QA")
+    assert esc is not None
+    assert (esc.provider, esc.model, esc.roles) == (
+        "claude-code",
+        "opus",
+        frozenset({Actor.QA}),
+    )
+
+
+def test_resolve_escalation_rejects_unknown_roles():
+    """--escalate-roles accepts only a non-empty subset of arch,dev,qa."""
+    from tasker.main import _resolve_escalation
+
+    for roles in ("dev,system", ""):
+        try:
+            _resolve_escalation(enabled=True, provider=None, model=None, roles=roles)
+        except ValueError as exc:
+            assert "--escalate-roles" in str(exc)
+        else:
+            raise AssertionError(f"roles accepted: {roles!r}")
+
+
+def test_warn_goose_mode_only_for_claude_code_without_auto():
+    """The GOOSE_MODE warning fires only for claude-code with a non-auto mode."""
+    from unittest.mock import patch
+
+    from tasker.main import _warn_goose_mode
     from tasker.models import FallbackModel
 
-    with _env(ANTHROPIC_API_KEY="sk-test-123"):
-        # Only provider set, no model
-        fb = _resolve_fallback(
-            explicit_provider="ollama",
-            explicit_model=None,
-            primary_provider="openai",
-            no_anthropic_fallback=False,
-            anthropic_fallback_model=None,
+    cc = FallbackModel(provider="claude-code", model="sonnet")
+    other = FallbackModel(provider="ollama", model="qwen3.5:9b")
+    cases = [
+        ((cc,), {"GOOSE_MODE": "smart_approve"}, True),
+        ((cc,), {}, True),
+        ((cc,), {"GOOSE_MODE": "auto"}, False),
+        ((other, None), {}, False),
+    ]
+    for models, env, expect_warning in cases:
+        with (
+            _env(remove=("GOOSE_MODE",), **env),
+            patch("tasker.main.console.print") as printed,
+        ):
+            _warn_goose_mode(*models)
+        assert printed.called is expect_warning, (models, env)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P11c — Response-file side channel (providers with their own tool loop)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_respond_writes_response_file_when_env_set():
+    """tasker.respond mirrors its JSON into TASKER_RESPONSE_FILE (last wins)."""
+    import json
+
+    from tasker.respond import _emit
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        target = Path(tmpdir) / "resp.json"
+        with _env(TASKER_RESPONSE_FILE=str(target)):
+            _emit({"status": "started", "summary": "a"})
+            _emit({"status": "done", "summary": "b"})
+        assert json.loads(target.read_text()) == {"status": "done", "summary": "b"}
+
+
+def test_respond_no_response_file_without_env():
+    """Without TASKER_RESPONSE_FILE, tasker.respond only prints (old behaviour)."""
+    from tasker.respond import _emit
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with _env(remove=("TASKER_RESPONSE_FILE",)):
+            cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                _emit({"status": "done", "summary": "x"})
+            finally:
+                os.chdir(cwd)
+        assert list(Path(tmpdir).iterdir()) == []
+
+
+def test_read_response_file_validation():
+    """Only a dict with status/decision is accepted; anything else → None."""
+    from tasker.goose import _read_response_file
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        f = Path(tmpdir) / "r.json"
+        assert _read_response_file(f) is None  # missing
+        f.write_text("{not json")
+        assert _read_response_file(f) is None
+        f.write_text('["status"]')
+        assert _read_response_file(f) is None
+        f.write_text('{"summary": "no status"}')
+        assert _read_response_file(f) is None
+        f.write_text('{"decision": "approve", "feedback": "ok"}')
+        assert _read_response_file(f) == {"decision": "approve", "feedback": "ok"}
+
+
+def _claude_code_like_popen(response: dict | None, seen_files: list[str]):
+    """Fake Popen: an envelope with only prose (no JSON, no toolResponse),
+    while the agent's tasker.respond call wrote *response* to the file."""
+    import json
+    from unittest.mock import MagicMock
+
+    envelope = json.dumps(
+        {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "task"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Implemented it."}],
+                },
+            ]
+        }
+    )
+
+    def fake_popen(cmd, **kwargs):
+        path = kwargs["env"]["TASKER_RESPONSE_FILE"]
+        seen_files.append(path)
+        if response is not None:
+            Path(path).write_text(json.dumps(response))
+        proc = MagicMock()
+        proc.communicate.return_value = (envelope, "")
+        proc.returncode = 0
+        return proc
+
+    return fake_popen
+
+
+def test_run_goose_reads_response_file_fallback():
+    """Prose-only envelope + response file → parsed_json from the file,
+    and the per-call file is removed afterwards."""
+    from unittest.mock import patch
+
+    from tasker.goose import run_goose
+
+    seen: list[str] = []
+    resp = {"status": "done", "summary": "Implemented it.", "files_modified": []}
+    with patch(
+        "tasker.goose.subprocess.Popen",
+        side_effect=_claude_code_like_popen(resp, seen),
+    ):
+        result = run_goose("/dev/null", "s1", memory_limit="")
+        run_goose("/dev/null", "s2", memory_limit="")
+
+    assert result.success is True
+    assert result.parsed_json == resp
+    assert result.json_blocks_found == 1
+    assert len(set(seen)) == 2, "each call must get its own response file"
+    assert not any(Path(p).exists() for p in seen), "response files not cleaned up"
+
+
+def test_run_goose_without_response_file_stays_unparsed():
+    """No JSON anywhere and no response file → parsed_json is None (unchanged)."""
+    from unittest.mock import patch
+
+    from tasker.goose import run_goose
+
+    with patch(
+        "tasker.goose.subprocess.Popen",
+        side_effect=_claude_code_like_popen(None, []),
+    ):
+        result = run_goose("/dev/null", "s1", memory_limit="")
+    assert result.parsed_json is None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P11d — Timeout → fallback; fallback runs in its own session
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_backoff_timeout_goes_to_fallback_in_own_session():
+    """A primary timeout is not retried: the fallback runs at once, in a
+    separate goose session."""
+    from unittest.mock import patch
+
+    from tasker.goose import GooseRunResult, run_goose_with_backoff
+    from tasker.models import RateLimitConfig
+
+    timeout = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="TIMEOUT",
+        return_code=-1,
+        timed_out=True,
+    )
+    ok = GooseRunResult(success=True, raw_stdout="ok", raw_stderr="", return_code=0)
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_run_goose(**kwargs):
+        calls.append((kwargs["session_name"], kwargs["provider"]))
+        return timeout if kwargs["provider"] == "custom_z.ai" else ok
+
+    with (
+        patch("tasker.goose.run_goose", side_effect=fake_run_goose),
+        patch("tasker.goose.time.sleep") as sleep,
+    ):
+        result = run_goose_with_backoff(
+            recipe_path="/tmp/recipe.yaml",
+            session_name="dev-1",
+            model="glm-5.3",
+            provider="custom_z.ai",
+            rate_limit=RateLimitConfig(enabled=True, max_retries=5),
+            fallback_model="sonnet",
+            fallback_provider="claude-code",
         )
-    assert fb == FallbackModel(provider="anthropic", model="claude-sonnet-4")
+
+    assert result is ok
+    assert calls == [("dev-1", "custom_z.ai"), ("dev-1_fallback", "claude-code")]
+    sleep.assert_not_called()
+
+
+def test_backoff_timeout_without_fallback_returns_timeout():
+    """Without a fallback, a timeout is returned as before (no retries)."""
+    from unittest.mock import patch
+
+    from tasker.goose import GooseRunResult, run_goose_with_backoff
+    from tasker.models import RateLimitConfig
+
+    timeout = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="TIMEOUT",
+        return_code=-1,
+        timed_out=True,
+    )
+    with patch("tasker.goose.run_goose", return_value=timeout) as rg:
+        result = run_goose_with_backoff(
+            recipe_path="/tmp/recipe.yaml",
+            session_name="dev-1",
+            rate_limit=RateLimitConfig(enabled=True, max_retries=5),
+        )
+    assert result is timeout
+    assert rg.call_count == 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P11e — Stuck-task escalation
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _escalation_orchestrator(tmpdir: str, **kwargs):
+    from tasker.orchestrator import Orchestrator
+
+    task_file = Path(tmpdir) / "tasks.md"
+    task_file.write_text("# Phase 1\n## P1\n- [ ] T1 do something\n")
+    return Orchestrator(
+        task_file=task_file,
+        dev_recipe=Path("/tmp/dev.yaml"),
+        qa_recipe=Path("/tmp/qa.yaml"),
+        log_file=Path(tmpdir) / "log.jsonl",
+        model="glm-5.3",
+        provider="custom_z.ai",
+        **kwargs,
+    )
+
+
+def _capture_goose_calls(orch, calls_spec):
+    """Run _run_goose_with_ui for each (actor, label) and capture kwargs."""
+    from unittest.mock import patch
+
+    from tasker.goose import GooseRunResult
+
+    captured: list[dict] = []
+
+    def mock_backoff(**kwargs):
+        captured.append(kwargs)
+        return GooseRunResult(success=True, raw_stdout="", raw_stderr="", return_code=0)
+
+    with patch("tasker.orchestrator.run_goose_with_backoff", side_effect=mock_backoff):
+        for actor, label in calls_spec:
+            orch._run_goose_with_ui(
+                actor,
+                label,
+                recipe_path="/tmp/r.yaml",
+                session_name="s",
+                model=orch.model,
+                provider=orch.provider,
+            )
+    return [(c["provider"], c["model"]) for c in captured], captured
+
+
+def test_escalation_only_after_stuck_and_only_for_that_task():
+    """DEV runs on the primary until _escalate(task); then on the escalation
+    model for that task only. QA (not in roles) stays on the primary."""
+    from tasker.models import Actor, EscalationConfig, Task
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orch = _escalation_orchestrator(
+            tmpdir, escalation=EscalationConfig(provider="claude-code", model="opus")
+        )
+        before, _ = _capture_goose_calls(orch, [(Actor.DEV, "T1")])
+        task = Task(phase_index=0, task_index=0, text="T1 do something")
+        orch._escalate(task)
+        after, _ = _capture_goose_calls(
+            orch, [(Actor.DEV, task.label), (Actor.QA, task.label), (Actor.DEV, "T2")]
+        )
+
+    assert before == [("custom_z.ai", "glm-5.3")]
+    assert after == [
+        ("claude-code", "opus"),
+        ("custom_z.ai", "glm-5.3"),
+        ("custom_z.ai", "glm-5.3"),
+    ]
+
+
+def test_escalation_arch_always_escalated_when_in_roles():
+    """ARCH only runs for stuck tasks → escalated without _escalate()."""
+    from tasker.models import Actor, EscalationConfig
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orch = _escalation_orchestrator(
+            tmpdir, escalation=EscalationConfig(provider="claude-code", model="opus")
+        )
+        calls, _ = _capture_goose_calls(orch, [(Actor.ARCH, "T1")])
+        orch_no_arch = _escalation_orchestrator(
+            tmpdir,
+            escalation=EscalationConfig(
+                provider="claude-code", model="opus", roles=frozenset({Actor.DEV})
+            ),
+        )
+        calls_no_arch, _ = _capture_goose_calls(orch_no_arch, [(Actor.ARCH, "T1")])
+
+    assert calls == [("claude-code", "opus")]
+    assert calls_no_arch == [("custom_z.ai", "glm-5.3")]
+
+
+def test_escalate_rotates_sessions_once_and_noop_without_config():
+    """_escalate rotates DEV/QA sessions on the first switch only; without an
+    escalation config it does nothing."""
+    from tasker.models import EscalationConfig, Task
+
+    task = Task(phase_index=0, task_index=0, text="T1 do something")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orch = _escalation_orchestrator(
+            tmpdir, escalation=EscalationConfig(provider="claude-code", model="opus")
+        )
+        s0 = (orch.dev_session_name, orch.qa_session_name)
+        orch._escalate(task)
+        s1 = (orch.dev_session_name, orch.qa_session_name)
+        orch._escalate(task)
+        s2 = (orch.dev_session_name, orch.qa_session_name)
+
+        plain = _escalation_orchestrator(tmpdir)
+        p0 = (plain.dev_session_name, plain.qa_session_name)
+        plain._escalate(task)
+
+    assert s1[0] != s0[0] and s1[1] != s0[1]
+    assert s2 == s1
+    assert (plain.dev_session_name, plain.qa_session_name) == p0
+    assert plain._escalated_task_label == ""
+
+
+def test_fallback_dropped_when_identical_to_escalation():
+    """An escalated call already on the fallback backend gets no fallback."""
+    from tasker.models import (
+        Actor,
+        EscalationConfig,
+        FallbackModel,
+        RateLimitConfig,
+        Task,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orch = _escalation_orchestrator(
+            tmpdir,
+            escalation=EscalationConfig(provider="claude-code", model="sonnet"),
+            rate_limit=RateLimitConfig(
+                fallback_dev=FallbackModel(provider="claude-code", model="sonnet")
+            ),
+        )
+        task = Task(phase_index=0, task_index=0, text="T1 do something")
+        _, before = _capture_goose_calls(orch, [(Actor.DEV, task.label)])
+        orch._escalate(task)
+        _, after = _capture_goose_calls(orch, [(Actor.DEV, task.label)])
+
+    assert before[0]["fallback_provider"] == "claude-code"
+    assert after[0]["fallback_provider"] is None
+    assert after[0]["fallback_model"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P11f — Separate timeouts for fallback and escalated calls
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_backoff_fallback_timeout_override_and_default():
+    """The fallback call uses fallback_timeout_secs, else the primary's."""
+    from unittest.mock import patch
+
+    from tasker.goose import GooseRunResult, run_goose_with_backoff
+    from tasker.models import RateLimitConfig
+
+    timeout = GooseRunResult(
+        success=False,
+        raw_stdout="",
+        raw_stderr="TIMEOUT",
+        return_code=-1,
+        timed_out=True,
+    )
+    timeouts: list[int] = []
+
+    def fake_run_goose(**kwargs):
+        timeouts.append(kwargs["timeout_secs"])
+        return timeout
+
+    for fb_timeout, expected in ((2400, 2400), (None, 600)):
+        timeouts.clear()
+        with patch("tasker.goose.run_goose", side_effect=fake_run_goose):
+            run_goose_with_backoff(
+                recipe_path="/tmp/recipe.yaml",
+                session_name="dev-1",
+                timeout_secs=600,
+                provider="custom_z.ai",
+                rate_limit=RateLimitConfig(enabled=True),
+                fallback_model="sonnet",
+                fallback_provider="claude-code",
+                fallback_timeout_secs=fb_timeout,
+            )
+        assert timeouts == [600, expected], (fb_timeout, timeouts)
+
+
+def test_escalated_call_uses_escalation_timeout():
+    """Escalated calls use EscalationConfig.timeout_secs; others keep the
+    caller's timeout; the fallback timeout is forwarded."""
+    from unittest.mock import patch
+
+    from tasker.goose import GooseRunResult
+    from tasker.models import (
+        Actor,
+        EscalationConfig,
+        FallbackModel,
+        RateLimitConfig,
+        Task,
+    )
+
+    captured: list[dict] = []
+
+    def mock_backoff(**kwargs):
+        captured.append(kwargs)
+        return GooseRunResult(success=True, raw_stdout="", raw_stderr="", return_code=0)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        orch = _escalation_orchestrator(
+            tmpdir,
+            escalation=EscalationConfig(provider="claude-code", model="opus"),
+            rate_limit=RateLimitConfig(
+                fallback_dev=FallbackModel(
+                    provider="claude-code", model="sonnet", timeout_secs=1500
+                )
+            ),
+        )
+        task = Task(phase_index=0, task_index=0, text="T1 do something")
+        with patch(
+            "tasker.orchestrator.run_goose_with_backoff", side_effect=mock_backoff
+        ):
+            for escalate in (False, True):
+                if escalate:
+                    orch._escalate(task)
+                orch._run_goose_with_ui(
+                    Actor.DEV,
+                    task.label,
+                    recipe_path="/tmp/r.yaml",
+                    session_name="s",
+                    timeout_secs=600,
+                    model=orch.model,
+                    provider=orch.provider,
+                )
+
+    assert [c["timeout_secs"] for c in captured] == [600, 1800]
+    assert [c["fallback_timeout_secs"] for c in captured] == [1500, 1500]
+
+
+def test_resolvers_carry_timeouts():
+    """--fallback-timeout reaches both fallback kinds; --escalate-timeout
+    defaults to 1800 and can be overridden."""
+    from unittest.mock import patch
+
+    from tasker.main import _resolve_escalation
+
+    with patch("tasker.main.shutil.which", return_value="/usr/bin/claude"):
+        auto = _resolve_fb(timeout_secs=2400)
+    explicit = _resolve_fb(
+        explicit_provider="ollama", explicit_model="qwen3.5:9b", timeout_secs=900
+    )
+    assert auto is not None and auto.timeout_secs == 2400
+    assert explicit is not None and explicit.timeout_secs == 900
+    assert _resolve_fb(no_auto_fallback=True) is None
+
+    default = _resolve_escalation(
+        enabled=True, provider=None, model=None, roles="arch,dev"
+    )
+    custom = _resolve_escalation(
+        enabled=True, provider=None, model=None, roles="arch,dev", timeout_secs=2700
+    )
+    assert default is not None and default.timeout_secs == 1800
+    assert custom is not None and custom.timeout_secs == 2700
 
 
 # ═══════════════════════════════════════════════════════════════════

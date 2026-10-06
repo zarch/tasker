@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import typer
@@ -15,7 +16,16 @@ from rich.console import Console
 
 from .monitoring import setup_monitoring
 from .orchestrator import Orchestrator
-from .models import FallbackModel, RateLimitConfig, SessionScope
+from .models import (
+    CLAUDE_CODE_DEFAULT_MODEL,
+    CLAUDE_CODE_PROVIDER,
+    ESCALATION_DEFAULT_TIMEOUT_SECS,
+    Actor,
+    EscalationConfig,
+    FallbackModel,
+    RateLimitConfig,
+    SessionScope,
+)
 
 # Default recipes shipped with tasker, resolved relative to this file.
 _RECIPES_DIR = Path(__file__).resolve().parent.parent.parent / "recipes"
@@ -44,44 +54,119 @@ def _resolve_path(path: str) -> Path:
     return p
 
 
+class FlagPairError(ValueError):
+    """A provider/model CLI flag pair was only half given."""
+
+
+def _check_pair(flag: str, provider: str | None, model: str | None) -> None:
+    """Reject ``--{flag}-provider`` without ``--{flag}-model`` or vice versa."""
+    if bool(provider) != bool(model):
+        raise FlagPairError(
+            f"--{flag}-provider and --{flag}-model must be given together "
+            f"(got provider={provider!r}, model={model!r})."
+        )
+
+
 def _resolve_fallback(
     *,
     explicit_provider: str | None,
     explicit_model: str | None,
     primary_provider: str | None,
-    no_anthropic_fallback: bool,
-    anthropic_fallback_model: str | None,
+    no_auto_fallback: bool,
+    auto_fallback_model: str | None,
+    role: str,
+    timeout_secs: int | None = None,
 ) -> FallbackModel | None:
     """Resolve a per-role fallback model.
 
     Precedence (highest → lowest):
 
     1. **Explicit CLI flags** — ``--fallback-{role}-provider`` together with
-       ``--fallback-{role}-model``.  If both are given they always win.
-    2. **Environment-derived Anthropic fallback** — when the env var
-       ``ANTHROPIC_API_KEY`` is set (and the user has not passed
-       ``--no-anthropic-fallback``), an :class:`FallbackModel` with
-       ``provider="anthropic"`` is synthesised automatically.  The model
-       defaults to ``claude-sonnet-4`` but can be overridden via
-       ``--anthropic-fallback-model``.
+       ``--fallback-{role}-model``.  Giving only one of the two is an error
+       (:class:`FlagPairError`).
+    2. **Automatic claude-code fallback** — when the ``claude`` CLI is on
+       ``PATH`` (and the user has not passed ``--no-auto-fallback``), a
+       :class:`FallbackModel` with ``provider="claude-code"`` is synthesised.
+       It runs on the Claude subscription, no API key needed.  The model
+       defaults to ``sonnet`` and can be overridden via
+       ``--auto-fallback-model``.
     3. **None** — no fallback.
 
-    The Anthropic auto-fallback is **skipped** when the primary provider is
-    itself ``anthropic`` — falling back from a failing provider to the same
-    provider is pointless.
+    The automatic fallback is **skipped** when the primary provider is
+    itself ``claude-code`` — falling back to the same provider is pointless.
+
+    *timeout_secs* (``--fallback-timeout``) applies to either fallback;
+    ``None`` keeps the primary call's ``--timeout``.
     """
+    _check_pair(f"fallback-{role}", explicit_provider, explicit_model)
+
     # 1. Explicit CLI flags take precedence.
     if explicit_provider and explicit_model:
-        return FallbackModel(provider=explicit_provider, model=explicit_model)
+        return FallbackModel(
+            provider=explicit_provider, model=explicit_model, timeout_secs=timeout_secs
+        )
 
-    # 2. Auto-configure Anthropic fallback from the environment.
-    if not no_anthropic_fallback and primary_provider != "anthropic":
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            model = anthropic_fallback_model or "claude-sonnet-4"
-            return FallbackModel(provider="anthropic", model=model)
+    # 2. Auto-configure the claude-code fallback when the CLI is installed.
+    if not no_auto_fallback and primary_provider != CLAUDE_CODE_PROVIDER:
+        if shutil.which("claude"):
+            model = auto_fallback_model or CLAUDE_CODE_DEFAULT_MODEL
+            return FallbackModel(
+                provider=CLAUDE_CODE_PROVIDER, model=model, timeout_secs=timeout_secs
+            )
 
     # 3. No fallback.
     return None
+
+
+def _resolve_escalation(
+    *,
+    enabled: bool,
+    provider: str | None,
+    model: str | None,
+    roles: str,
+    timeout_secs: int = ESCALATION_DEFAULT_TIMEOUT_SECS,
+) -> EscalationConfig | None:
+    """Build the escalation config for stuck tasks, or None when disabled.
+
+    Escalation is on when ``--escalate`` is passed or when either
+    ``--escalate-provider`` / ``--escalate-model`` is given; the missing
+    half defaults to ``claude-code`` / ``sonnet``.  *roles* is a
+    comma-separated subset of ``arch,dev,qa``.  Escalated calls use
+    *timeout_secs* (``--escalate-timeout``) instead of ``--timeout``.
+    """
+    if not (enabled or provider or model):
+        return None
+    valid = {Actor.ARCH.value, Actor.DEV.value, Actor.QA.value}
+    names = {r.strip().lower() for r in roles.split(",") if r.strip()}
+    if not names or not names <= valid:
+        raise ValueError(
+            f"Invalid --escalate-roles {roles!r}: "
+            f"use a comma-separated subset of {', '.join(sorted(valid))}."
+        )
+    return EscalationConfig(
+        provider=provider or CLAUDE_CODE_PROVIDER,
+        model=model or CLAUDE_CODE_DEFAULT_MODEL,
+        roles=frozenset(Actor(n) for n in names),
+        timeout_secs=timeout_secs,
+    )
+
+
+def _warn_goose_mode(*models: FallbackModel | EscalationConfig | None) -> None:
+    """Warn when claude-code is configured but GOOSE_MODE is not ``auto``.
+
+    goose's approve / smart_approve modes refuse every tool call of the
+    headless claude-code provider.  tasker does not change the approval
+    mode itself; set ``GOOSE_MODE=auto`` (environment or goose config).
+    """
+    uses_claude_code = any(
+        m is not None and m.provider == CLAUDE_CODE_PROVIDER for m in models
+    )
+    if uses_claude_code and os.environ.get("GOOSE_MODE", "").lower() != "auto":
+        console.print(
+            "[yellow]Warning:[/yellow] the claude-code fallback/escalation needs "
+            "GOOSE_MODE=auto; with approve/smart_approve goose rejects its tool "
+            "calls. Export GOOSE_MODE=auto (or set it in the goose config)."
+        )
 
 
 @app.command()
@@ -211,15 +296,53 @@ def main(
         "--fallback-qa-provider",
         help="Fallback provider for QA role (e.g. anthropic). Requires --fallback-qa-model.",
     ),
-    no_anthropic_fallback: bool = typer.Option(
+    no_auto_fallback: bool = typer.Option(
         False,
+        "--no-auto-fallback",
         "--no-anthropic-fallback",
-        help="Disable automatic Anthropic fallback when ANTHROPIC_API_KEY is set in the environment.",
+        help="Disable the automatic claude-code fallback (used when the `claude` CLI is on PATH).",
     ),
-    anthropic_fallback_model: str | None = typer.Option(
+    auto_fallback_model: str | None = typer.Option(
         None,
+        "--auto-fallback-model",
         "--anthropic-fallback-model",
-        help="Model to use for the automatic Anthropic fallback. Default: claude-sonnet-4.",
+        help="Model for the automatic claude-code fallback. Default: sonnet.",
+    ),
+    escalate: bool = typer.Option(
+        False,
+        "--escalate",
+        help=(
+            "When a task is flagged as stuck, switch its ARCH/DEV calls (see "
+            "--escalate-roles) to a stronger model until the task changes. "
+            "Default model: claude-code/sonnet."
+        ),
+    ),
+    escalate_provider: str | None = typer.Option(
+        None,
+        "--escalate-provider",
+        help="Provider for stuck-task escalation (implies --escalate). Default: claude-code.",
+    ),
+    escalate_model: str | None = typer.Option(
+        None,
+        "--escalate-model",
+        help="Model for stuck-task escalation (implies --escalate), e.g. opus. Default: sonnet.",
+    ),
+    escalate_roles: str = typer.Option(
+        "arch,dev",
+        "--escalate-roles",
+        help="Comma-separated roles that run escalated: subset of arch,dev,qa. Default: arch,dev.",
+    ),
+    escalate_timeout: int = typer.Option(
+        ESCALATION_DEFAULT_TIMEOUT_SECS,
+        "--escalate-timeout",
+        min=1,
+        help="Timeout in seconds for each escalated goose call (replaces --timeout). Default: 1800.",
+    ),
+    fallback_timeout: int | None = typer.Option(
+        None,
+        "--fallback-timeout",
+        min=1,
+        help="Timeout in seconds for each fallback goose call. Default: same as --timeout.",
     ),
     monitor_log: Path = typer.Option(
         None,
@@ -310,6 +433,38 @@ def main(
             raise typer.Exit(1)
         arch_abs = arch.resolve()
 
+    # Resolve fallback / escalation models (validates the flag pairs)
+    try:
+        fallback_dev = _resolve_fallback(
+            explicit_provider=fallback_dev_provider,
+            explicit_model=fallback_dev_model,
+            primary_provider=provider,
+            no_auto_fallback=no_auto_fallback,
+            auto_fallback_model=auto_fallback_model,
+            role="dev",
+            timeout_secs=fallback_timeout,
+        )
+        fallback_qa = _resolve_fallback(
+            explicit_provider=fallback_qa_provider,
+            explicit_model=fallback_qa_model,
+            primary_provider=provider,
+            no_auto_fallback=no_auto_fallback,
+            auto_fallback_model=auto_fallback_model,
+            role="qa",
+            timeout_secs=fallback_timeout,
+        )
+        escalation = _resolve_escalation(
+            enabled=escalate,
+            provider=escalate_provider,
+            model=escalate_model,
+            roles=escalate_roles,
+            timeout_secs=escalate_timeout,
+        )
+    except ValueError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(1)
+    _warn_goose_mode(fallback_dev, fallback_qa, escalation)
+
     # Resolve VCS backend
     from .vcs import create_backend
 
@@ -339,24 +494,13 @@ def main(
             base_delay_secs=rate_limit_base_delay,
             max_delay_secs=rate_limit_max_delay,
             max_retries=rate_limit_max_retries,
-            fallback_dev=_resolve_fallback(
-                explicit_provider=fallback_dev_provider,
-                explicit_model=fallback_dev_model,
-                primary_provider=provider,
-                no_anthropic_fallback=no_anthropic_fallback,
-                anthropic_fallback_model=anthropic_fallback_model,
-            ),
-            fallback_qa=_resolve_fallback(
-                explicit_provider=fallback_qa_provider,
-                explicit_model=fallback_qa_model,
-                primary_provider=provider,
-                no_anthropic_fallback=no_anthropic_fallback,
-                anthropic_fallback_model=anthropic_fallback_model,
-            ),
+            fallback_dev=fallback_dev,
+            fallback_qa=fallback_qa,
         ),
         decompose_recipe=str(decompose.resolve()) if decompose else None,
         arch_recipe=arch_abs,
         max_consecutive_empty=max_consecutive_empty,
+        escalation=escalation,
     )
 
     orchestrator.run()

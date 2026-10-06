@@ -23,6 +23,7 @@ from .models import (
     DecomposeResponse,
     DevRequest,
     DevResponse,
+    EscalationConfig,
     FallbackModel,
     IterationEntry,
     Phase,
@@ -420,6 +421,7 @@ class Orchestrator:
         decompose_recipe: str | Path | None = None,
         arch_recipe: str | Path | None = None,
         max_consecutive_empty: int = 3,
+        escalation: EscalationConfig | None = None,
     ) -> None:
         self.task_file = Path(task_file).resolve()
         self.dev_recipe = Path(dev_recipe)
@@ -469,6 +471,10 @@ class Orchestrator:
         self._consecutive_exhaustions: int = 0
         self._iterations_without_approval: int = 0
         self._pending_arch_check: bool = False
+
+        # Escalation — stronger model for the task flagged as stuck
+        self.escalation = escalation
+        self._escalated_task_label: str = ""
 
         # Memory tracking — snapshots around goose subprocesses
         self._last_memory_snapshot: MemorySnapshot | None = None
@@ -992,6 +998,62 @@ class Orchestrator:
 
     # ── Goose subprocess UI wrapper ────────────────────────────
 
+    def _escalation_for(self, actor: Actor, task_label: str) -> EscalationConfig | None:
+        """Return the escalation model if *actor* runs escalated on *task_label*.
+
+        ARCH only runs for stuck tasks, so it is escalated whenever listed in
+        the roles; DEV/QA only once :meth:`_escalate` flagged this task.
+        """
+        esc = self.escalation
+        if esc is None or actor not in esc.roles:
+            return None
+        if actor == Actor.ARCH or self._escalated_task_label == task_label:
+            return esc
+        return None
+
+    def _fallback_for(
+        self, actor: Actor, *, model: str | None, provider: str | None
+    ) -> FallbackModel | None:
+        """Per-role fallback (DEV → fallback_dev, QA → fallback_qa).
+
+        Dropped when it is the very model about to run (e.g. an escalated
+        call already on the fallback backend): retrying it is pointless.
+        """
+        fb: FallbackModel | None = None
+        if actor == Actor.DEV:
+            fb = self.rate_limit.fallback_dev
+        elif actor == Actor.QA:
+            fb = self.rate_limit.fallback_qa
+        if fb is not None and (fb.provider, fb.model) == (provider, model):
+            return None
+        return fb
+
+    def _escalate(self, task: Task) -> None:
+        """Switch the stuck *task* to the escalation model (sticky per task).
+
+        Rotates the DEV/QA sessions on the first switch: goose cannot
+        reliably resume a session created under a different provider.
+        """
+        if self.escalation is None or self._escalated_task_label == task.label:
+            return
+        self._escalated_task_label = task.label
+        self.dev_session_name = _generate_session_id("dev")
+        self.qa_session_name = _generate_session_id("qa")
+        log.warning(
+            "escalation.activated",
+            task_label=task.label,
+            provider=self.escalation.provider,
+            model=self.escalation.model,
+            roles=sorted(r.value for r in self.escalation.roles),
+            dev_session=self.dev_session_name,
+            qa_session=self.qa_session_name,
+        )
+        self.ui.print_warning(
+            f"[{task.label}] ⬆ Escalating to "
+            f"{self.escalation.provider}/{self.escalation.model} "
+            f"({', '.join(sorted(r.value for r in self.escalation.roles))})"
+        )
+
     def _run_goose_with_ui(
         self,
         actor: Actor,
@@ -1023,16 +1085,16 @@ class Orchestrator:
         if detail:
             label += f"  ({detail})"
 
-        # Resolve fallback model based on actor role:
-        #   DEV → fallback_dev (e.g. local ollama for coding)
-        #   QA  → fallback_qa  (e.g. different cloud for reviews)
-        fb: FallbackModel | None = None
-        if actor == Actor.DEV:
-            fb = self.rate_limit.fallback_dev
-        elif actor == Actor.QA:
-            fb = self.rate_limit.fallback_qa
+        esc = self._escalation_for(actor, task_label)
+        if esc is not None:
+            model, provider = esc.model, esc.provider
+            timeout_secs = esc.timeout_secs
+            label += f"  [⬆ {provider}/{model}]"
+
+        fb = self._fallback_for(actor, model=model, provider=provider)
         fallback_model = fb.model if fb else None
         fallback_provider = fb.provider if fb else None
+        fallback_timeout_secs = fb.timeout_secs if fb else None
 
         # Take a memory snapshot before launching goose
         snap_before = snapshot()
@@ -1055,6 +1117,7 @@ class Orchestrator:
                 memory_limit=None,  # auto-detect from /proc/meminfo
                 fallback_model=fallback_model,
                 fallback_provider=fallback_provider,
+                fallback_timeout_secs=fallback_timeout_secs,
             )
         finally:
             self.ui.clear_pending_iteration()
@@ -3341,6 +3404,7 @@ class Orchestrator:
                     # ── Evaluate stuckness after counters updated ──
                     if self._is_task_stuck(task):
                         self._pending_arch_check = True
+                        self._escalate(task)
                     continue  # back to top of iteration loop → dev retry
 
             self.ui.print_info(
@@ -3482,6 +3546,7 @@ class Orchestrator:
                 # ── Evaluate stuckness after counters updated ──
                 if self._is_task_stuck(task):
                     self._pending_arch_check = True
+                    self._escalate(task)
 
         # Max iterations reached without QA approval — consult ARCH before giving up
         log.error(

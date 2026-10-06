@@ -187,36 +187,64 @@ uv run tasker --dev recipes/recipe-dev.yaml \
 | `--rate-limit-max-delay` | `300` | Maximum backoff delay (seconds) |
 | `--rate-limit-max-retries` | `5` | Max retries on transient errors before trying the fallback model |
 | `--max-consecutive-empty` | `3` | Max consecutive empty-output goose calls before a task is marked permanently failed `[~]` |
-| `--fallback-dev-provider` | *(env-derived)* | Fallback provider for the DEV role (see [Fallback models](#fallback-models)) |
-| `--fallback-dev-model` | *(env-derived)* | Fallback model for the DEV role |
-| `--fallback-qa-provider` | *(env-derived)* | Fallback provider for the QA role |
-| `--fallback-qa-model` | *(env-derived)* | Fallback model for the QA role |
-| `--no-anthropic-fallback` | *(off)* | Disable the automatic Anthropic fallback derived from `ANTHROPIC_API_KEY` |
-| `--anthropic-fallback-model` | `claude-sonnet-4` | Model to use for the automatic Anthropic fallback |
+| `--fallback-dev-provider` | *(auto)* | Fallback provider for the DEV role (see [Fallback models](#fallback-models)); needs `--fallback-dev-model` |
+| `--fallback-dev-model` | *(auto)* | Fallback model for the DEV role; needs `--fallback-dev-provider` |
+| `--fallback-qa-provider` | *(auto)* | Fallback provider for the QA role; needs `--fallback-qa-model` |
+| `--fallback-qa-model` | *(auto)* | Fallback model for the QA role; needs `--fallback-qa-provider` |
+| `--no-auto-fallback` | *(off)* | Disable the automatic `claude-code` fallback (alias: `--no-anthropic-fallback`) |
+| `--auto-fallback-model` | `sonnet` | Model for the automatic `claude-code` fallback (alias: `--anthropic-fallback-model`) |
+| `--escalate` | *(off)* | Escalate stuck tasks to a stronger model (see [Stuck-task escalation](#stuck-task-escalation)) |
+| `--escalate-provider` | `claude-code` | Provider for escalation (implies `--escalate`) |
+| `--escalate-model` | `sonnet` | Model for escalation, e.g. `opus` (implies `--escalate`) |
+| `--escalate-roles` | `arch,dev` | Roles that run escalated: subset of `arch,dev,qa` |
+| `--escalate-timeout` | `1800` | Timeout (seconds) for each escalated goose call; replaces `--timeout` for those calls |
+| `--fallback-timeout` | *(= `--timeout`)* | Timeout (seconds) for each fallback goose call |
 
 ## Fallback models
 
-When the primary model/provider hits transient errors (rate limits, connection drops, silent crashes), tasker retries with exponential backoff. After the retries are exhausted, it transparently switches to a **fallback model** so the pipeline keeps making progress. The fallback is tried once per goose call — the next orchestrator turn goes back to the primary.
+When the primary model/provider hits transient errors (rate limits, connection drops, silent crashes) tasker retries with exponential backoff; after the retries are exhausted — or right away when the call **timed out** — it switches to a **fallback model** so the pipeline keeps making progress. The fallback runs in its own goose session (`<session>_fallback`), with `--fallback-timeout` if given (otherwise `--timeout`), and only for that call — the next orchestrator turn goes back to the primary. With a timeout-triggered fallback a single call can take up to `--timeout` + `--fallback-timeout`.
 
 Fallbacks are resolved per role (DEV and QA can fall back to different models) with the following precedence:
 
-1. **Explicit CLI flags** — `--fallback-{role}-provider` together with `--fallback-{role}-model`. If both are given they always win.
-2. **Automatic Anthropic fallback** — if the environment variable `ANTHROPIC_API_KEY` is set, an Anthropic fallback (`provider=anthropic`, `model=claude-sonnet-4` by default) is configured automatically. Override the model with `--anthropic-fallback-model`.
+1. **Explicit CLI flags** — `--fallback-{role}-provider` together with `--fallback-{role}-model`. Giving only one of the two is an error.
+2. **Automatic claude-code fallback** — if the `claude` CLI is on `PATH`, goose's `claude-code` provider (model `sonnet` by default) is configured automatically. It runs on the Claude subscription, no API key needed. Override the model with `--auto-fallback-model`.
 3. **None** — no fallback (the pipeline returns the failure to the orchestrator's recovery logic).
 
-The automatic Anthropic fallback is **skipped** when the primary provider is itself `anthropic` (falling back from a failing provider to the same provider is pointless). It can also be disabled entirely with `--no-anthropic-fallback`.
+The automatic fallback is **skipped** when the primary provider is itself `claude-code`, and can be disabled with `--no-auto-fallback`.
 
 ```bash
-# Automatic: ANTHROPIC_API_KEY is set in the environment
-export ANTHROPIC_API_KEY=sk-ant-...
+# Automatic: the claude CLI is installed
+export GOOSE_MODE=auto   # required by claude-code, see below
 uv run tasker --dev recipes/recipe-dev.yaml --qa recipes/recipe-qa.yaml tasks.md
 
-# Explicit fallback (overrides the env-derived default)
+# Explicit fallback (overrides the automatic default)
 uv run tasker ... --fallback-dev-provider ollama --fallback-dev-model qwen3.5:9b \
-                  --fallback-qa-provider anthropic --fallback-qa-model claude-sonnet-4
+                  --fallback-qa-provider claude-code --fallback-qa-model sonnet
 
-# Disable the automatic Anthropic fallback
-uv run tasker ... --no-anthropic-fallback
+# Disable the automatic fallback
+uv run tasker ... --no-auto-fallback
+```
+
+### The claude-code provider
+
+goose's `claude-code` provider drives the local `claude` CLI as a subprocess: goose sends its system prompt and the recipe, Claude Code does the work with **its own** tools and its own `~/.claude` configuration (settings, `CLAUDE.md`, MCP servers). Consequences:
+
+- **`GOOSE_MODE=auto` is required.** With `approve` / `smart_approve` goose rejects every tool call of this headless provider (`Tool approval required in non-interactive mode`). tasker does not change the approval mode on its own — export `GOOSE_MODE=auto` or set it in the goose config; tasker prints a warning at start-up when it is missing.
+- **Results arrive through a side channel.** Claude Code's tool calls never appear in the goose envelope, so the `tasker.respond` output cannot be found in tool responses. `tasker.respond` therefore also writes its JSON to the per-call file named by `TASKER_RESPONSE_FILE`, which tasker reads as the last fallback.
+- **Turn counts are not comparable.** One goose turn can contain a whole Claude Code session, so `--max-turns` and the turn counters say little; `--timeout` is the effective limit.
+
+## Stuck-task escalation
+
+With `--escalate` (or `--escalate-provider` / `--escalate-model`), a task that the stuckness check flags (repeated recovery exhaustions or too many iterations without QA approval) switches to the escalation model: from that point every call of an escalated role for **that task** uses it, until the orchestrator moves on to another task. The first switch starts fresh DEV/QA goose sessions, because a session is not resumed across providers. The Architect only runs for stuck tasks, so it always uses the escalation model when `arch` is in `--escalate-roles`. Escalated calls use `--escalate-timeout` (default 1800 s) instead of `--timeout`: stronger models are slower and the escalated tasks are the hard ones.
+
+```bash
+# Stuck tasks: Architect + Developer on Claude Opus via the subscription
+export GOOSE_MODE=auto
+uv run tasker ... --escalate --escalate-model opus
+
+# Give up on a hung primary sooner, give the stronger models more time
+uv run tasker ... --timeout 1200 --fallback-timeout 1800 \
+                  --escalate --escalate-model opus --escalate-timeout 2400
 ```
 
 ## Version control integration
