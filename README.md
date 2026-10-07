@@ -233,6 +233,55 @@ goose's `claude-code` provider drives the local `claude` CLI as a subprocess: go
 - **Results arrive through a side channel.** Claude Code's tool calls never appear in the goose envelope, so the `tasker.respond` output cannot be found in tool responses. `tasker.respond` therefore also writes its JSON to the per-call file named by `TASKER_RESPONSE_FILE`, which tasker reads as the last fallback.
 - **Turn counts are not comparable.** One goose turn can contain a whole Claude Code session, so `--max-turns` and the turn counters say little; `--timeout` is the effective limit.
 
+## Watchdog — supervising a run
+
+`tasker main` runs can die (OOM, wedged model client, orphaned stdout) or get
+duplicated (two supervisors relaunching in parallel). The integrated watchdog
+supervises a run without an external bash script:
+
+```bash
+# Start the run as usual — it writes a run manifest next to the task file
+uv run tasker main specs/99-todo.md --vcs jj ...
+
+# Then supervise it (single verdict, or loop hourly)
+uv run tasker watchdog specs/99-todo.md --dry-run
+uv run tasker watchdog specs/99-todo.md --interval 3600
+```
+
+The orchestrator side is three best-effort hooks (never fatal to the run): a
+run manifest `<stem>.tasker-run.json` (argv, pid, cwd, ledger path) at start,
+a heartbeat file at every `task.starting`, and `done: true` on backlog
+completion. The watchdog replays the recorded argv verbatim on relaunch —
+flags can never drift the way hand-written bash relaunchers do.
+
+One verdict per tick:
+
+| Verdict | Action |
+|---|---|
+| `OK` | one run process alive |
+| `DOWN` | no process → relaunch from the manifest argv (process-group isolated, output appended to `<stem>.tasker-relaunch.out`) |
+| `DUP` | multiple runs racing → keep the oldest (pid starttime, not age-of-pid), kill the rest |
+| `STALE` | process alive but heartbeat **and** iteration ledger older than `--stale-secs` (default 4000) → kill; relaunch happens on the next tick |
+| `DONE` | manifest says the backlog completed → loop exits 0 |
+| `BREAKER` | `--max-crashes` consecutive relaunches died before reaching `run()` → give up, exit 1; delete `<stem>.tasker-crashcount.json` to reset |
+
+Design notes, all learned from real incidents:
+
+- **Freshness is the freshest of the signals**, not the log: a live run can
+  freeze stdout on a deleted inode while its ledger keeps moving (this exact
+  false kill murdered a healthy run on 2026-10-07).
+- **Process matching is argv-exact** (`main` subcommand + task-file path from
+  `/proc/*/cmdline`), immune to the `pgrep -f` substring self-match that once
+  killed a supervisor's own shell.
+- **Breaker evidence is structural**: a spawn that never rewrote the manifest
+  (`manifest.pid` ≠ spawned pid) died before starting. A run that started and
+  died mid-flight is ordinary recovery, not crash-loop evidence.
+- A run without a manifest (old code, someone else's run) is reported
+  `OK … unmanaged` and never killed — the watchdog only acts on runs it can
+  measure. Cold start: launch the run first, then the watchdog.
+- The relaunch inherits the watchdog's environment — run the watchdog with
+  whatever `PATH`/env the run needs.
+
 ## Stuck-task escalation
 
 With `--escalate` (or `--escalate-provider` / `--escalate-model`), a task that the stuckness check flags (repeated recovery exhaustions or too many iterations without QA approval) switches to the escalation model: from that point every call of an escalated role for **that task** uses it, until the orchestrator moves on to another task. The first switch starts fresh DEV/QA goose sessions, because a session is not resumed across providers. The Architect only runs for stuck tasks, so it always uses the escalation model when `arch` is in `--escalate-roles`. Escalated calls use `--escalate-timeout` (default 1800 s) instead of `--timeout`: stronger models are slower and the escalated tasks are the hard ones.

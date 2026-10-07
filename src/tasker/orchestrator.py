@@ -53,6 +53,7 @@ from .parser import (
     mark_task_failed,
 )
 from .ui import TaskerUI
+from .watchdog import mark_run_done, write_heartbeat, write_run_manifest
 from .vcs import VCSBackend
 
 
@@ -498,6 +499,15 @@ class Orchestrator:
             arch="enabled" if self.arch_recipe else "disabled",
         )
 
+        # Watchdog bookkeeping — defines the supervised run for `tasker
+        # watchdog`. Best-effort by design: never break the run.
+        try:
+            write_run_manifest(
+                self.task_file, ledger_path=self.log._path, cwd=self.cwd or Path.cwd()
+            )
+        except Exception as exc:  # noqa: BLE001 - defensive by contract
+            log.debug("watchdog.manifest_failed", error=str(exc))
+
         # Log initial memory state
         initial_snap = snapshot()
         if initial_snap is not None:
@@ -720,6 +730,10 @@ class Orchestrator:
             pair = find_next_task(self.phases)
             if pair is None:
                 log.info("all_tasks.complete")
+                try:
+                    mark_run_done(self.task_file)
+                except Exception as exc:  # noqa: BLE001 - defensive by contract
+                    log.debug("watchdog.done_failed", error=str(exc))
                 self.ui.update_actor(Actor.QA, "—", "All tasks complete! 🎉")
                 time.sleep(1)
                 break
@@ -746,6 +760,12 @@ class Orchestrator:
                 phase_progress=f"{phase.completed}/{phase.total}",
                 global_iteration=self.global_iteration,
             )
+
+            # Watchdog heartbeat — freshness signal at every task boundary.
+            try:
+                write_heartbeat(self.task_file, task.label)
+            except Exception as exc:  # noqa: BLE001 - defensive by contract
+                log.debug("watchdog.heartbeat_failed", error=str(exc))
 
             # Log memory at task start
             task_snap = snapshot()

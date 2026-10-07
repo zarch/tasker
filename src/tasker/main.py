@@ -46,6 +46,68 @@ from .prepare import prepare_app  # noqa: E402
 app.add_typer(prepare_app, name="prepare")
 
 
+@app.command()
+def watchdog(
+    task_file: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        help="Task file the `tasker main` run is working on (md or .tasks.jsonl).",
+    ),
+    interval: float = typer.Option(
+        0.0,
+        "--interval",
+        min=0.0,
+        help="Loop mode: one verdict every N seconds (0 = single shot). "
+        "Stops on DONE or BREAKER.",
+    ),
+    stale_secs: float = typer.Option(
+        4000.0,
+        "--stale-secs",
+        help="Kill the run when heartbeat AND ledger are older than this. "
+        "Must exceed the longest legitimate dev-run silence "
+        "(--timeout of the supervised run).",
+    ),
+    max_crashes: int = typer.Option(
+        3,
+        "--max-crashes",
+        help="Circuit breaker: stop relaunching after N consecutive "
+        "relaunches that die before starting.",
+    ),
+    kill_grace: float = typer.Option(
+        20.0,
+        "--kill-grace",
+        help="Seconds between SIGTERM and SIGKILL when killing.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the verdict only — never kill, never relaunch.",
+    ),
+) -> None:
+    """Supervise a `tasker main` run: relaunch it when down, deduplicate it,
+    kill it when frozen, stop when the backlog is done.
+
+    Freshness = freshest of heartbeat and iteration ledger, so a run whose
+    stdout froze (deleted inode, rotation) is not murdered while it is still
+    writing its ledger. The relaunch replays the argv recorded in the run
+    manifest and inherits THIS process's environment — launch the watchdog
+    with the env the run needs.
+    """
+    from .watchdog import run_watchdog
+
+    raise typer.Exit(
+        run_watchdog(
+            task_file,
+            interval=interval,
+            stale_secs=stale_secs,
+            max_crashes=max_crashes,
+            kill_grace=kill_grace,
+            dry_run=dry_run,
+        )
+    )
+
+
 def _resolve_path(path: str) -> Path:
     p = Path(path)
     if not p.exists():
