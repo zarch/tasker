@@ -176,6 +176,19 @@ def example_cmd() -> None:
     )
     console.print("[dim]  2. tasker prepare validate 99-todo.tasks.jsonl[/dim]")
     console.print("[dim]  3. tasker prepare to-md 99-todo.tasks.jsonl[/dim]")
+    console.print("[dim]  4. Launch the run: tasker main 99-todo.tasks.jsonl …[/dim]")
+    console.print(
+        "[dim]  5. Supervise it: tasker watchdog 99-todo.tasks.jsonl --interval 3600[/dim]"
+    )
+    console.print(
+        "[dim]     (start the run FIRST — it writes the manifest the watchdog"
+    )
+    console.print(
+        "[dim]      reads; the watchdog relaunches it when down, kills frozen[/dim]"
+    )
+    console.print(
+        "[dim]      or duplicated runs, and exits when the backlog is done)[/dim]"
+    )
 
 
 # ── validate ──────────────────────────────────────────────────────
